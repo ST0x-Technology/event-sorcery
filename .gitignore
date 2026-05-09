@@ -1,0 +1,10 @@
+.direnv/
+.sqlx/
+.tmp/
+target/
+.env
+.pre-commit-config.yaml
+*.db
+*.db-shm
+*.db-wal
+*.log
