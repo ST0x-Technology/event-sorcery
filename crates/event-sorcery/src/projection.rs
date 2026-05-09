@@ -1,9 +1,9 @@
 //! Backend-agnostic projection for loading entity state from
 //! materialized views.
 //!
-//! Generic over the view repository implementation, allowing any
-//! backend (SQLite, Postgres, in-memory) that implements
-//! `ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>`.
+//! Generic over a [`ViewBackend`](crate::ViewBackend) — see the
+//! [`view_backend`](crate::view_backend) module for the trait and
+//! default [`SqliteViewBackend`](crate::SqliteViewBackend).
 
 use async_trait::async_trait;
 use cqrs_es::Aggregate;
@@ -22,6 +22,7 @@ use crate::EventSourced;
 use crate::dependency::{Cons, Dependent, EntityList, Nil};
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::reactor::Reactor;
+use crate::view_backend::{SqliteViewBackend, ViewBackend};
 
 /// A materialized view table name.
 ///
@@ -102,60 +103,19 @@ impl<Entity: EventSourced> From<LifecycleError<Entity>> for ProjectionError<Enti
     }
 }
 
-/// SQLite view repository that hides [`Lifecycle`] from
-/// Projection's public type signature.
-///
-/// Without this newtype, the default `Repo` parameter would be
-/// `SqliteViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>`,
-/// leaking the `pub(crate)` `Lifecycle` type to external
-/// consumers. This wraps the underlying repository so that
-/// `Projection<Position>` expands to
-/// `Projection<Position, SqliteProjectionRepo<Position>>` - no
-/// `Lifecycle` visible.
-pub struct SqliteProjectionRepo<Entity: EventSourced> {
-    inner: SqliteViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>,
-}
-
-#[async_trait]
-impl<Entity: EventSourced> ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>
-    for SqliteProjectionRepo<Entity>
-{
-    async fn load(
-        &self,
-        aggregate_id: &str,
-    ) -> Result<Option<Lifecycle<Entity>>, PersistenceError> {
-        self.inner.load(aggregate_id).await
-    }
-
-    async fn load_with_context(
-        &self,
-        aggregate_id: &str,
-    ) -> Result<Option<(Lifecycle<Entity>, ViewContext)>, PersistenceError> {
-        self.inner.load_with_context(aggregate_id).await
-    }
-
-    async fn update_view(
-        &self,
-        view: Lifecycle<Entity>,
-        context: ViewContext,
-    ) -> Result<(), PersistenceError> {
-        self.inner.update_view(view, context).await
-    }
-}
-
 /// Materialized view of an event-sourced entity.
 ///
 /// Provides [`load`](Self::load) to retrieve a single entity by
 /// ID, [`load_all`](Self::load_all) to retrieve all live
 /// entities, and [`filter`](Self::filter) for typed
 /// column-filtered queries. Backed by SQLite in production; the
-/// `Repo` parameter defaults to [`SqliteProjectionRepo`] so
+/// `Backend` parameter defaults to [`SqliteViewBackend`] so
 /// consumers write `Projection<Position>`.
 ///
 /// Constructed via [`sqlite`](Self::sqlite) during wiring or
 /// directly in CLI/test code.
-pub struct Projection<Entity: EventSourced, Repo = SqliteProjectionRepo<Entity>> {
-    repo: Arc<Repo>,
+pub struct Projection<Entity: EventSourced, Backend: ViewBackend = SqliteViewBackend> {
+    repo: Arc<Backend::Repo<Lifecycle<Entity>, Lifecycle<Entity>>>,
     pool: Option<SqlitePool>,
     table_name: Option<String>,
     _entity: PhantomData<Entity>,
@@ -170,12 +130,12 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
     /// view.
     pub fn sqlite(pool: SqlitePool) -> Self {
         let Table(table) = Entity::PROJECTION;
-        let repo = Arc::new(SqliteProjectionRepo {
-            inner: SqliteViewRepository::<Lifecycle<Entity>, Lifecycle<Entity>>::new(
+        let repo = Arc::new(
+            SqliteViewRepository::<Lifecycle<Entity>, Lifecycle<Entity>>::new(
                 pool.clone(),
                 table.to_string(),
             ),
-        });
+        );
 
         Self {
             repo,
@@ -475,21 +435,9 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
     }
 }
 
-// TODO: Projection's Repo parameter ideally encodes a
-// higher-kinded type - `Repo<Lifecycle<Entity>, Lifecycle<Entity>>`
-// - so the struct definition captures the relationship between
-// Repo and Entity without naming Lifecycle in bounds. Rust lacks
-// native HKT support, but GAT-based workarounds (e.g., a
-// `RepoFamily` trait with `type Repo<V, A>`) can emulate this.
-// For now we suppress the warning; proper decoupling deferred to
-// when this crate is extracted from the workspace.
-#[allow(private_bounds)]
-impl<Entity: EventSourced, Repo> Projection<Entity, Repo>
-where
-    Repo: ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>,
-{
+impl<Entity: EventSourced, Backend: ViewBackend> Projection<Entity, Backend> {
     #[cfg(test)]
-    pub(crate) fn new(repo: Arc<Repo>) -> Self {
+    pub(crate) fn new(repo: Arc<Backend::Repo<Lifecycle<Entity>, Lifecycle<Entity>>>) -> Self {
         Self {
             repo,
             pool: None,
@@ -516,7 +464,7 @@ where
     }
 }
 
-impl<Entity: EventSourced, Repo> Clone for Projection<Entity, Repo> {
+impl<Entity: EventSourced, Backend: ViewBackend> Clone for Projection<Entity, Backend> {
     fn clone(&self) -> Self {
         Self {
             repo: Arc::clone(&self.repo),
@@ -527,23 +475,19 @@ impl<Entity: EventSourced, Repo> Clone for Projection<Entity, Repo> {
     }
 }
 
-// Same private_bounds suppression as above -- see HKD TODO.
-#[allow(private_bounds)]
-impl<Entity, Repo> Dependent for Projection<Entity, Repo>
+impl<Entity, Backend> Dependent for Projection<Entity, Backend>
 where
     Entity: EventSourced + 'static,
-    Repo: ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>> + Send + Sync,
+    Backend: ViewBackend,
 {
     type Dependencies = Cons<Entity, Nil>;
 }
 
-// Same private_bounds suppression as above -- see HKD TODO.
 #[async_trait]
-#[allow(private_bounds)]
-impl<Entity, Repo> Reactor for Projection<Entity, Repo>
+impl<Entity, Backend> Reactor for Projection<Entity, Backend>
 where
     Entity: EventSourced + 'static,
-    Repo: ViewRepository<Lifecycle<Entity>, Lifecycle<Entity>> + Send + Sync,
+    Backend: ViewBackend,
 {
     type Error = Never;
 
@@ -725,45 +669,56 @@ mod tests {
     }
 
     /// In-memory view repository for testing Projection::load.
-    struct InMemoryRepo {
-        views: RwLock<HashMap<String, Lifecycle<TestEntity>>>,
+    struct InMemoryRepo<View, Agg>
+    where
+        View: cqrs_es::View<Agg>,
+        Agg: cqrs_es::Aggregate,
+    {
+        views: RwLock<HashMap<String, View>>,
+        _phantom: PhantomData<Agg>,
     }
 
-    impl InMemoryRepo {
-        fn with(entries: Vec<(&str, Lifecycle<TestEntity>)>) -> Self {
+    impl<View, Agg> InMemoryRepo<View, Agg>
+    where
+        View: cqrs_es::View<Agg> + Clone,
+        Agg: cqrs_es::Aggregate,
+    {
+        fn with(entries: Vec<(&str, View)>) -> Self {
             let mut views = HashMap::new();
-            for (aggregate_id, lifecycle) in entries {
-                views.insert(aggregate_id.to_string(), lifecycle);
+            for (aggregate_id, view) in entries {
+                views.insert(aggregate_id.to_string(), view);
             }
             Self {
                 views: RwLock::new(views),
+                _phantom: PhantomData,
             }
         }
     }
 
     #[async_trait]
-    impl ViewRepository<Lifecycle<TestEntity>, Lifecycle<TestEntity>> for InMemoryRepo {
-        async fn load(
-            &self,
-            aggregate_id: &str,
-        ) -> Result<Option<Lifecycle<TestEntity>>, PersistenceError> {
+    impl<View, Agg> ViewRepository<View, Agg> for InMemoryRepo<View, Agg>
+    where
+        View: cqrs_es::View<Agg> + Clone,
+        Agg: cqrs_es::Aggregate,
+    {
+        async fn load(&self, aggregate_id: &str) -> Result<Option<View>, PersistenceError> {
             Ok(self.views.read().await.get(aggregate_id).cloned())
         }
 
         async fn load_with_context(
             &self,
             aggregate_id: &str,
-        ) -> Result<Option<(Lifecycle<TestEntity>, ViewContext)>, PersistenceError> {
+        ) -> Result<Option<(View, ViewContext)>, PersistenceError> {
             let view = self.views.read().await.get(aggregate_id).cloned();
-            Ok(view.map(|lifecycle| {
+            Ok(view.map(|view| {
                 let context = ViewContext::new(aggregate_id.to_string(), 0);
-                (lifecycle, context)
+                (view, context)
             }))
         }
 
         async fn update_view(
             &self,
-            view: Lifecycle<TestEntity>,
+            view: View,
             context: ViewContext,
         ) -> Result<(), PersistenceError> {
             self.views
@@ -774,6 +729,20 @@ mod tests {
         }
     }
 
+    /// `ViewBackend` whose `Repo<V, A>` is `InMemoryRepo<V, A>`.
+    struct InMemoryViewBackend;
+
+    impl ViewBackend for InMemoryViewBackend {
+        type Repo<View, Agg>
+            = InMemoryRepo<View, Agg>
+        where
+            View: cqrs_es::View<Agg> + Clone + 'static,
+            Agg: cqrs_es::Aggregate + 'static;
+    }
+
+    type TestInMemoryRepo = InMemoryRepo<Lifecycle<TestEntity>, Lifecycle<TestEntity>>;
+    type TestProjection = Projection<TestEntity, InMemoryViewBackend>;
+
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use crate::dependency::OneOf;
@@ -781,22 +750,32 @@ mod tests {
 
     /// In-memory view repository that returns `OptimisticLockError`
     /// a configurable number of times before succeeding.
-    struct ConflictingRepo {
-        views: RwLock<HashMap<String, (Lifecycle<TestEntity>, i64)>>,
+    struct ConflictingRepo<View, Agg>
+    where
+        View: cqrs_es::View<Agg>,
+        Agg: cqrs_es::Aggregate,
+    {
+        views: RwLock<HashMap<String, (View, i64)>>,
         remaining_conflicts: AtomicU32,
+        _phantom: PhantomData<Agg>,
     }
 
-    impl ConflictingRepo {
+    impl<View, Agg> ConflictingRepo<View, Agg>
+    where
+        View: cqrs_es::View<Agg>,
+        Agg: cqrs_es::Aggregate,
+    {
         fn new(conflicts: u32) -> Self {
             Self {
                 views: RwLock::new(HashMap::new()),
                 remaining_conflicts: AtomicU32::new(conflicts),
+                _phantom: PhantomData,
             }
         }
 
-        fn with_entity(self, aggregate_id: &str, entity: TestEntity) -> Self {
+        fn with_view(self, aggregate_id: &str, view: View) -> Self {
             let mut views = self.views.into_inner();
-            views.insert(aggregate_id.to_string(), (Lifecycle::Live(entity), 1));
+            views.insert(aggregate_id.to_string(), (view, 1));
             Self {
                 views: RwLock::new(views),
                 ..self
@@ -805,33 +784,34 @@ mod tests {
     }
 
     #[async_trait]
-    impl ViewRepository<Lifecycle<TestEntity>, Lifecycle<TestEntity>> for ConflictingRepo {
-        async fn load(
-            &self,
-            aggregate_id: &str,
-        ) -> Result<Option<Lifecycle<TestEntity>>, PersistenceError> {
+    impl<View, Agg> ViewRepository<View, Agg> for ConflictingRepo<View, Agg>
+    where
+        View: cqrs_es::View<Agg> + Clone,
+        Agg: cqrs_es::Aggregate,
+    {
+        async fn load(&self, aggregate_id: &str) -> Result<Option<View>, PersistenceError> {
             Ok(self
                 .views
                 .read()
                 .await
                 .get(aggregate_id)
-                .map(|(lifecycle, _version)| lifecycle.clone()))
+                .map(|(view, _version)| view.clone()))
         }
 
         async fn load_with_context(
             &self,
             aggregate_id: &str,
-        ) -> Result<Option<(Lifecycle<TestEntity>, ViewContext)>, PersistenceError> {
+        ) -> Result<Option<(View, ViewContext)>, PersistenceError> {
             let guard = self.views.read().await;
-            Ok(guard.get(aggregate_id).map(|(lifecycle, version)| {
+            Ok(guard.get(aggregate_id).map(|(view, version)| {
                 let context = ViewContext::new(aggregate_id.to_string(), *version);
-                (lifecycle.clone(), context)
+                (view.clone(), context)
             }))
         }
 
         async fn update_view(
             &self,
-            view: Lifecycle<TestEntity>,
+            view: View,
             context: ViewContext,
         ) -> Result<(), PersistenceError> {
             let remaining = self.remaining_conflicts.load(Ordering::SeqCst);
@@ -852,13 +832,28 @@ mod tests {
         }
     }
 
+    /// `ViewBackend` whose `Repo<V, A>` is `ConflictingRepo<V, A>`.
+    struct ConflictingViewBackend;
+
+    impl ViewBackend for ConflictingViewBackend {
+        type Repo<View, Agg>
+            = ConflictingRepo<View, Agg>
+        where
+            View: cqrs_es::View<Agg> + Clone + 'static,
+            Agg: cqrs_es::Aggregate + 'static;
+    }
+
+    type TestConflictingRepo = ConflictingRepo<Lifecycle<TestEntity>, Lifecycle<TestEntity>>;
+    type TestConflictingProjection = Projection<TestEntity, ConflictingViewBackend>;
+
     #[tokio::test]
     async fn react_retries_on_optimistic_lock_conflict() {
         let entity = TestEntity {
             name: "original".to_string(),
         };
-        let repo = ConflictingRepo::new(2).with_entity("id-1", entity);
-        let projection = Projection::new(Arc::new(repo));
+        let repo: TestConflictingRepo =
+            ConflictingRepo::new(2).with_view("id-1", Lifecycle::Live(entity));
+        let projection: TestConflictingProjection = Projection::new(Arc::new(repo));
 
         let event: OneOf<(String, TestEvent), Never> = OneOf::Here(("id-1".to_string(), TestEvent));
 
@@ -880,8 +875,9 @@ mod tests {
         let entity = TestEntity {
             name: "original".to_string(),
         };
-        let repo = Arc::new(ConflictingRepo::new(11).with_entity("id-1", entity.clone()));
-        let projection = Projection::new(Arc::clone(&repo));
+        let repo: Arc<TestConflictingRepo> =
+            Arc::new(ConflictingRepo::new(11).with_view("id-1", Lifecycle::Live(entity.clone())));
+        let projection: TestConflictingProjection = Projection::new(Arc::clone(&repo));
 
         let event: OneOf<(String, TestEvent), Never> = OneOf::Here(("id-1".to_string(), TestEvent));
 
@@ -901,8 +897,9 @@ mod tests {
         let entity = TestEntity {
             name: "original".to_string(),
         };
-        let repo = ConflictingRepo::new(0).with_entity("id-1", entity);
-        let projection = Projection::new(Arc::new(repo));
+        let repo: TestConflictingRepo =
+            ConflictingRepo::new(0).with_view("id-1", Lifecycle::Live(entity));
+        let projection: TestConflictingProjection = Projection::new(Arc::new(repo));
 
         let event: OneOf<(String, TestEvent), Never> = OneOf::Here(("id-1".to_string(), TestEvent));
 
@@ -922,8 +919,9 @@ mod tests {
         let entity = TestEntity {
             name: "alice".to_string(),
         };
-        let repo = InMemoryRepo::with(vec![("id-1", Lifecycle::Live(entity.clone()))]);
-        let projection = Projection::new(Arc::new(repo));
+        let repo: TestInMemoryRepo =
+            InMemoryRepo::with(vec![("id-1", Lifecycle::Live(entity.clone()))]);
+        let projection: TestProjection = Projection::new(Arc::new(repo));
 
         let result = projection.load(&"id-1".to_string()).await.unwrap();
 
@@ -932,8 +930,8 @@ mod tests {
 
     #[tokio::test]
     async fn load_missing_view_returns_none() {
-        let repo = InMemoryRepo::with(vec![]);
-        let projection = Projection::new(Arc::new(repo));
+        let repo: TestInMemoryRepo = InMemoryRepo::with(vec![]);
+        let projection: TestProjection = Projection::new(Arc::new(repo));
 
         let result = projection.load(&"nonexistent".to_string()).await.unwrap();
 
@@ -942,8 +940,8 @@ mod tests {
 
     #[tokio::test]
     async fn load_uninitialized_returns_none() {
-        let repo = InMemoryRepo::with(vec![("id-1", Lifecycle::Uninitialized)]);
-        let projection = Projection::new(Arc::new(repo));
+        let repo: TestInMemoryRepo = InMemoryRepo::with(vec![("id-1", Lifecycle::Uninitialized)]);
+        let projection: TestProjection = Projection::new(Arc::new(repo));
 
         let result = projection.load(&"id-1".to_string()).await.unwrap();
 
@@ -953,14 +951,14 @@ mod tests {
     #[tokio::test]
     async fn load_failed_returns_error() {
         let error = LifecycleError::EventCantOriginate { event: TestEvent };
-        let repo = InMemoryRepo::with(vec![(
+        let repo: TestInMemoryRepo = InMemoryRepo::with(vec![(
             "id-1",
             Lifecycle::Failed {
                 error: error.clone(),
                 last_valid_entity: None,
             },
         )]);
-        let projection = Projection::new(Arc::new(repo));
+        let projection: TestProjection = Projection::new(Arc::new(repo));
 
         let result = projection.load(&"id-1".to_string()).await;
 
