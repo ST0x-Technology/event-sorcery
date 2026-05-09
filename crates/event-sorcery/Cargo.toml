@@ -24,5 +24,9 @@ test-support = []
 name = "basic_entity"
 path = "../../examples/basic_entity/main.rs"
 
+[[example]]
+name = "projection"
+path = "../../examples/projection/main.rs"
+
 [lints]
 workspace = true
