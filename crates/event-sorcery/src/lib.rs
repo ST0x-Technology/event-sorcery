@@ -83,6 +83,7 @@ mod schema_registry;
 mod sqlite_event_repository;
 #[cfg(any(test, feature = "test-support"))]
 mod testing;
+mod view_backend;
 mod wire;
 
 use async_trait::async_trait;
@@ -103,7 +104,7 @@ pub use dependency::Nil;
 pub use dependency::{Dependent, EntityList, Fold, HasEntity, OneOf};
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
-pub use projection::{Column, Projection, ProjectionError, SqliteProjectionRepo, Table};
+pub use projection::{Column, Projection, ProjectionError, Table};
 pub use reactor::Reactor;
 pub use schema_registry::{ReconcileError, Reconciler, SchemaRegistry};
 use sqlite_event_repository::SqliteEventRepository;
@@ -111,6 +112,7 @@ use sqlite_event_repository::SqliteEventRepository;
 pub use testing::{
     ReactorHarness, SpyReactor, TestHarness, TestResult, TestStore, replay, test_store,
 };
+pub use view_backend::{SqliteViewBackend, ViewBackend};
 pub use wire::StoreBuilder;
 
 pub(crate) type SqliteCqrs<Entity> =
@@ -186,7 +188,9 @@ pub enum CompactionPolicy {
 ///   Receives `&self` (the domain type, not `Lifecycle`), so
 ///   the handler only deals with live state.
 #[async_trait]
-pub trait EventSourced: Clone + Debug + Send + Sync + Sized + Serialize + DeserializeOwned {
+pub trait EventSourced:
+    Clone + Debug + Send + Sync + Sized + Serialize + DeserializeOwned + 'static
+{
     /// Aggregate identity type, used as the key in the event store.
     type Id: Debug + Display + FromStr + Clone + Send + Sync;
     /// Domain event type emitted by commands and applied during replay.
