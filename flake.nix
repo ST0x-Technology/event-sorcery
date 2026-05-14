@@ -26,6 +26,7 @@
               sqlx-cli
               cargo-expand
               cargo-nextest
+              nushell
             ]
             ++ rainix.devShells.${system}.default.buildInputs;
         };
