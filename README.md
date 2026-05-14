@@ -23,6 +23,13 @@ Extracted from internal services
 standalone so they can share the implementation. External users are welcome but
 the API surface is still in flux.
 
+## Examples
+
+Runnable end-to-end examples live under [`examples/`](examples/) — one directory
+per concept (`basic_entity`, `projection`, `reactor`), each with its own README
+explaining what it covers. Run any of them with
+`cargo run -p event-sorcery --example <name>`.
+
 ## Documentation
 
 - [`docs/domain.md`](docs/domain.md) — domain terminology and naming

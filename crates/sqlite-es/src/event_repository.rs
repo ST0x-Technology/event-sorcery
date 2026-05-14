@@ -429,7 +429,9 @@ mod tests {
             metadata: serde_json::json!({}),
         };
 
-        repo.insert_events(std::slice::from_ref(&event)).await.unwrap();
+        repo.insert_events(std::slice::from_ref(&event))
+            .await
+            .unwrap();
 
         let loaded = repo.load_events::<TestAggregate>("test-123").await.unwrap();
 
@@ -454,7 +456,9 @@ mod tests {
             metadata: serde_json::json!({}),
         };
 
-        repo.insert_events(std::slice::from_ref(&event)).await.unwrap();
+        repo.insert_events(std::slice::from_ref(&event))
+            .await
+            .unwrap();
 
         let result = repo.insert_events(&[event]).await;
 

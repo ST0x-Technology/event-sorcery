@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/sqlite-es", "crates/event-sorcery"]
+exclude = ["examples/simple", "examples/complex"]
 resolver = "2"
 
 [workspace.package]

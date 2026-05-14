@@ -44,7 +44,7 @@ use crate::reactor::Reactor;
 ///
 /// Failed { .. } ---- any event ------> Failed { AlreadyFailed }
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 // Override serde's inferred bounds. Without this, serde derives
 // `Entity: Serialize + Deserialize` bounds, but Entity's serde
 // impls are already guaranteed by the EventSourced supertrait.
@@ -52,6 +52,7 @@ use crate::reactor::Reactor;
 // compiler when Entity has complex associated types.
 #[serde(bound = "")]
 pub(crate) enum Lifecycle<Entity: EventSourced> {
+    #[default]
     Uninitialized,
     Live(Entity),
     Failed {
@@ -67,12 +68,6 @@ impl<Entity: EventSourced> Lifecycle<Entity> {
             Self::Uninitialized => Ok(None),
             Self::Failed { error, .. } => Err(error),
         }
-    }
-}
-
-impl<Entity: EventSourced> Default for Lifecycle<Entity> {
-    fn default() -> Self {
-        Self::Uninitialized
     }
 }
 
