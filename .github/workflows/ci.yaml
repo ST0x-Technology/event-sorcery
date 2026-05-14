@@ -23,13 +23,15 @@ jobs:
       matrix:
         include:
           - name: check
-            command: cargo check --workspace
+            command: cargo check --workspace --all-targets --all-features
           - name: test
-            command: cargo nextest run --workspace --all-features
+            command: cargo nextest run --workspace --all-features --all-targets
           - name: clippy
             command: cargo clippy --workspace --all-targets --all-features
           - name: fmt
             command: cargo fmt --all -- --check
+          - name: examples
+            command: nu scripts/check-examples.nu
 
     env:
       CARGO_INCREMENTAL: "0"
