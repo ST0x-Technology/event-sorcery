@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches-ignore:
+      - "graphite-base/**"
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+permissions:
+  contents: read
+
+jobs:
+  cargo:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: check
+            command: cargo check --workspace --all-targets --all-features
+          - name: test
+            command: cargo nextest run --workspace --all-features --all-targets
+          - name: clippy
+            command: cargo clippy --workspace --all-targets --all-features
+          - name: fmt
+            command: cargo fmt --all -- --check
+          - name: examples
+            command: nu scripts/check-examples.nu
+
+    env:
+      CARGO_INCREMENTAL: "0"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@b6e4494ddccc51b56de1189099089a3514a69245
+        with:
+          extra-conf: |
+            accept-flake-config = true
+            fallback = true
+
+      - uses: DeterminateSystems/magic-nix-cache-action@5626df0a8b8f16cb060538f6d3041500a2d10cb0
+
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/git/db/
+            ~/.cargo/registry/cache/
+            ~/.cargo/registry/index/
+            target/
+          key: cargo-${{ runner.os }}-${{ matrix.name }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'flake.lock', 'flake.nix') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ matrix.name }}-
+
+      - name: ${{ matrix.name }}
+        run: nix develop -c ${{ matrix.command }}
+
+  hooks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@b6e4494ddccc51b56de1189099089a3514a69245
+        with:
+          extra-conf: |
+            accept-flake-config = true
+            fallback = true
+
+      - uses: DeterminateSystems/magic-nix-cache-action@5626df0a8b8f16cb060538f6d3041500a2d10cb0
+
+      - name: pre-commit hooks
+        run: nix develop -c pre-commit run --all-files
