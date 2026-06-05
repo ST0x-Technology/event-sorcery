@@ -112,6 +112,8 @@ use std::str::FromStr;
 pub use dependency::Cons;
 pub use dependency::Nil;
 pub use dependency::{Dependent, EntityList, Fold, HasEntity, OneOf};
+#[cfg(any(test, feature = "test-support"))]
+pub use job::FailureInjector;
 #[doc(hidden)]
 pub use job::{
     ExponentialBackoff, FAIL_STOP_RECOVERY_TIMEOUT, RETRY_BACKOFF, Storage, on_terminal_failure,
