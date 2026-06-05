@@ -255,6 +255,55 @@ pub fn on_terminal_failure(
     }
 }
 
+/// Builds a supervised apalis worker for a [`Job`] type, applying the
+/// library's standard concurrency, retry policy, circuit breaker, and
+/// terminal-failure handling.
+///
+/// Pass `::<JobType>`, a worker index, the job's [`JobBackend`], an
+/// `Arc<JobType::Input>`, a
+/// [`CircuitBreakerConfig`](crate::CircuitBreakerConfig), and an
+/// `Arc<tokio::sync::Notify>` signalled on terminal failure. Under
+/// `test-support`, also pass a [`FailureInjector`]. Register the
+/// returned worker with a [`Monitor`](crate::Monitor).
+#[macro_export]
+macro_rules! build_supervised_worker {
+    (
+        ::<$job:ty>,
+        $index:expr,
+        $backend:expr,
+        $input:expr,
+        $fail_stop:expr,
+        $failure_notify:expr
+        $(, $failure_injector:expr)? $(,)?
+    ) => {{
+        use $crate::__apalis::{
+            CircuitBreaker, EventListenerExt, RetryPolicy, WorkerBuilder, WorkerBuilderExt,
+        };
+
+        let builder = WorkerBuilder::new(::std::format!(
+            "{}-{}",
+            <$job as $crate::Job>::WORKER_NAME,
+            $index,
+        ))
+        .backend($backend.into_storage())
+        .data($input);
+
+        $(
+            let builder = builder.data($failure_injector);
+        )?
+
+        builder
+            .concurrency(1)
+            .retry(RetryPolicy::retries(3).with_backoff($crate::RETRY_BACKOFF.clone()))
+            .break_circuit_with($fail_stop)
+            .on_event($crate::on_terminal_failure(
+                $failure_notify,
+                <$job as $crate::Job>::TERMINAL_FAILURE_MSG,
+            ))
+            .build($crate::work::<$job>)
+    }};
+}
+
 fn build_poll_config<J: Job>() -> Config {
     let strategy = StrategyBuilder::new()
         .apply(
@@ -449,5 +498,29 @@ mod tests {
         );
 
         injector.perform(&reminder, &(), 1).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn build_supervised_worker_constructs_a_worker() {
+        let pool = apalis_sqlite::SqlitePool::connect(":memory:")
+            .await
+            .unwrap();
+        let backend = JobBackend::<SendEmail>::new(&pool);
+
+        let input = Arc::new(());
+        let fail_stop = crate::CircuitBreakerConfig::default()
+            .with_recovery_timeout(FAIL_STOP_RECOVERY_TIMEOUT);
+        let failure_notify = Arc::new(tokio::sync::Notify::new());
+        let injector = FailureInjector::new();
+
+        let _worker = crate::build_supervised_worker!(
+            ::<SendEmail>,
+            0,
+            backend,
+            input,
+            fail_stop,
+            failure_notify,
+            injector,
+        );
     }
 }
