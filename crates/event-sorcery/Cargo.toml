@@ -6,6 +6,10 @@ license.workspace = true
 homepage.workspace = true
 
 [dependencies]
+apalis.workspace = true
+apalis-codec.workspace = true
+apalis-core.workspace = true
+apalis-sqlite.workspace = true
 async-trait.workspace = true
 cqrs-es.workspace = true
 sqlite-es.workspace = true
@@ -15,6 +19,8 @@ sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+chrono = { version = "0.4.45", features = ["serde"] }
+ulid = "1.2.1"
 
 [features]
 test-support = []
