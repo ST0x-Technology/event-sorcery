@@ -1,6 +1,6 @@
-//! `SupportTicket` aggregate: an `Open -> Pending -> Closed` state machine with
-//! a materialized view that exposes `status` as a generated column for filtered
-//! queries.
+//! `SupportTicket` aggregate: an `Open -> Pending -> Closed` state machine
+//! whose commands carry their own timestamp and a materialized view that
+//! exposes `status` as a generated column for filtered queries.
 
 use std::fmt::{self, Display};
 use std::str::FromStr;
@@ -84,9 +84,16 @@ impl DomainEvent for SupportTicketEvent {
 
 #[derive(Debug, Clone)]
 pub enum SupportTicketCommand {
-    Open { subject: String },
-    AwaitCustomer,
-    Close,
+    Open {
+        subject: String,
+        at: chrono::DateTime<chrono::Utc>,
+    },
+    AwaitCustomer {
+        at: chrono::DateTime<chrono::Utc>,
+    },
+    Close {
+        at: chrono::DateTime<chrono::Utc>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -97,18 +104,6 @@ pub enum SupportTicketError {
     NotOpen,
     #[error("ticket is already closed")]
     AlreadyClosed,
-}
-
-#[cfg(test)]
-fn now() -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc)
-}
-
-#[cfg(not(test))]
-fn now() -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now()
 }
 
 impl EventSourced for SupportTicket {
@@ -158,10 +153,10 @@ impl EventSourced for SupportTicket {
         _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<SupportTicketEvent>, SupportTicketError> {
         match command {
-            SupportTicketCommand::Open { subject } => {
-                Ok(vec![SupportTicketEvent::Opened { subject, at: now() }])
+            SupportTicketCommand::Open { subject, at } => {
+                Ok(vec![SupportTicketEvent::Opened { subject, at }])
             }
-            SupportTicketCommand::AwaitCustomer | SupportTicketCommand::Close => {
+            SupportTicketCommand::AwaitCustomer { .. } | SupportTicketCommand::Close { .. } => {
                 Err(SupportTicketError::NotOpen)
             }
         }
@@ -174,17 +169,15 @@ impl EventSourced for SupportTicket {
     ) -> Result<Vec<SupportTicketEvent>, SupportTicketError> {
         match command {
             SupportTicketCommand::Open { .. } => Err(SupportTicketError::AlreadyOpen),
-            SupportTicketCommand::AwaitCustomer => match self.status {
+            SupportTicketCommand::AwaitCustomer { at } => match self.status {
                 Status::Closed => Err(SupportTicketError::AlreadyClosed),
                 Status::Open | Status::Pending => {
-                    Ok(vec![SupportTicketEvent::AwaitingCustomer { at: now() }])
+                    Ok(vec![SupportTicketEvent::AwaitingCustomer { at }])
                 }
             },
-            SupportTicketCommand::Close => match self.status {
+            SupportTicketCommand::Close { at } => match self.status {
                 Status::Closed => Err(SupportTicketError::AlreadyClosed),
-                Status::Open | Status::Pending => {
-                    Ok(vec![SupportTicketEvent::Closed { at: now() }])
-                }
+                Status::Open | Status::Pending => Ok(vec![SupportTicketEvent::Closed { at }]),
             },
         }
     }
@@ -241,7 +234,9 @@ mod tests {
                 subject: "login broken".to_string(),
                 at: fixed_instant(),
             }])
-            .when(SupportTicketCommand::Close)
+            .when(SupportTicketCommand::Close {
+                at: fixed_instant(),
+            })
             .await
             .then_expect_events(&[SupportTicketEvent::Closed {
                 at: fixed_instant(),
@@ -260,7 +255,9 @@ mod tests {
                     at: fixed_instant(),
                 },
             ])
-            .when(SupportTicketCommand::Close)
+            .when(SupportTicketCommand::Close {
+                at: fixed_instant(),
+            })
             .await
             .then_expect_error();
 
@@ -280,12 +277,18 @@ mod tests {
                 &id,
                 SupportTicketCommand::Open {
                     subject: "x".to_string(),
+                    at: fixed_instant(),
                 },
             )
             .await
             .unwrap();
         store
-            .send(&id, SupportTicketCommand::AwaitCustomer)
+            .send(
+                &id,
+                SupportTicketCommand::AwaitCustomer {
+                    at: fixed_instant(),
+                },
+            )
             .await
             .unwrap();
 
@@ -313,13 +316,19 @@ mod tests {
                     &id,
                     SupportTicketCommand::Open {
                         subject: "x".to_string(),
+                        at: fixed_instant(),
                     },
                 )
                 .await
                 .unwrap();
         }
         store
-            .send(&bravo, SupportTicketCommand::Close)
+            .send(
+                &bravo,
+                SupportTicketCommand::Close {
+                    at: fixed_instant(),
+                },
+            )
             .await
             .unwrap();
 
@@ -349,12 +358,18 @@ mod tests {
                 &alpha,
                 SupportTicketCommand::Open {
                     subject: "x".to_string(),
+                    at: fixed_instant(),
                 },
             )
             .await
             .unwrap();
         store
-            .send(&alpha, SupportTicketCommand::AwaitCustomer)
+            .send(
+                &alpha,
+                SupportTicketCommand::AwaitCustomer {
+                    at: fixed_instant(),
+                },
+            )
             .await
             .unwrap();
 
