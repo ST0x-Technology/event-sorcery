@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use cqrs_es::Aggregate;
 use cqrs_es::persist::{PersistenceError, ViewContext, ViewRepository};
 use sqlite_es::SqliteViewRepository;
+use sqlx::AssertSqlSafe;
 use sqlx::SqlitePool;
 use sqlx::sqlite::Sqlite;
 use std::fmt::Debug;
@@ -162,7 +163,8 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
              ORDER BY view_id ASC"
         );
 
-        let rows: Vec<(String, String)> = sqlx::query_as(&query).fetch_all(pool).await?;
+        let rows: Vec<(String, String)> =
+            sqlx::query_as(AssertSqlSafe(query)).fetch_all(pool).await?;
 
         Ok(Self::parse_rows(rows))
     }
@@ -202,8 +204,10 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
              ORDER BY view_id ASC"
         );
 
-        let rows: Vec<(String, String)> =
-            sqlx::query_as(&query).bind(value).fetch_all(pool).await?;
+        let rows: Vec<(String, String)> = sqlx::query_as(AssertSqlSafe(query))
+            .bind(value)
+            .fetch_all(pool)
+            .await?;
 
         Ok(Self::parse_rows(rows))
     }
@@ -224,8 +228,9 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
         // Drive from events table (LEFT JOIN) so we also detect aggregates
         // with persisted events but no view row (crash before initial view write).
         // view_version is NULL when the view row is missing.
-        let stale_aggregates: Vec<(String, Option<i64>, i64)> = sqlx::query_as(&format!(
-            "SELECT e.aggregate_id, v.version, e.max_seq \
+        let stale_aggregates: Vec<(String, Option<i64>, i64)> =
+            sqlx::query_as(AssertSqlSafe(format!(
+                "SELECT e.aggregate_id, v.version, e.max_seq \
              FROM ( \
                  SELECT aggregate_id, MAX(sequence) as max_seq \
                  FROM events \
@@ -234,10 +239,10 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
              ) e \
              LEFT JOIN {table} v ON v.view_id = e.aggregate_id \
              WHERE v.version IS NULL OR e.max_seq > v.version"
-        ))
-        .bind(&aggregate_type)
-        .fetch_all(pool)
-        .await?;
+            )))
+            .bind(&aggregate_type)
+            .fetch_all(pool)
+            .await?;
 
         if stale_aggregates.is_empty() {
             debug!(target: "cqrs", %aggregate_type, "All views up to date, nothing to replay");
@@ -275,10 +280,12 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
 
         info!(target: "cqrs", %view_id, %table, "Rebuilding view from event history");
 
-        sqlx::query(&format!("DELETE FROM {table} WHERE view_id = ?1"))
-            .bind(&view_id)
-            .execute(pool)
-            .await?;
+        sqlx::query(AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE view_id = ?1"
+        )))
+        .bind(&view_id)
+        .execute(pool)
+        .await?;
 
         self.catch_up().await
     }
@@ -293,7 +300,7 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
 
         info!(target: "cqrs", %table, "Rebuilding all views from event history");
 
-        sqlx::query(&format!("DELETE FROM {table}"))
+        sqlx::query(AssertSqlSafe(format!("DELETE FROM {table}")))
             .execute(pool)
             .await?;
 
@@ -375,11 +382,11 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
         // Write directly with version = max_seq, bypassing the view repo's
         // optimistic lock (which expects version + 1 increments). This is
         // safe because catch_up runs once at startup before the main loop.
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO {table} (view_id, version, payload) \
              VALUES (?1, ?2, ?3) \
              ON CONFLICT(view_id) DO UPDATE SET version = ?2, payload = ?3"
-        ))
+        )))
         .bind(view_id)
         .bind(max_seq)
         .bind(&payload)
@@ -557,10 +564,11 @@ async fn validate_column<Entity: EventSourced>(
 ) -> Result<(), ProjectionError<Entity>> {
     let column_name = column.0;
 
-    let columns: Vec<(String,)> =
-        sqlx::query_as(&format!("SELECT name FROM pragma_table_xinfo('{table}')"))
-            .fetch_all(pool)
-            .await?;
+    let columns: Vec<(String,)> = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT name FROM pragma_table_xinfo('{table}')"
+    )))
+    .fetch_all(pool)
+    .await?;
 
     if !columns.iter().any(|(name,)| name == column_name) {
         warn!(
@@ -575,15 +583,15 @@ async fn validate_column<Entity: EventSourced>(
         });
     }
 
-    let row_count: (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
+    let row_count: (i64,) = sqlx::query_as(AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
         .fetch_one(pool)
         .await?;
 
     if row_count.0 > 0 {
-        let non_null_count: (i64,) = sqlx::query_as(&format!(
+        let non_null_count: (i64,) = sqlx::query_as(AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM {table}
              WHERE {column_name} IS NOT NULL"
-        ))
+        )))
         .fetch_one(pool)
         .await?;
 

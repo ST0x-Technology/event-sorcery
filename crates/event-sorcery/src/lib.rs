@@ -94,6 +94,7 @@ use cqrs_es::EventStore;
 use cqrs_es::persist::PersistedEventStore;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use sqlx::AssertSqlSafe;
 use sqlx::SqlitePool;
 use std::fmt::{Debug, Display};
 use std::str::FromStr;
@@ -506,7 +507,7 @@ pub async fn vacuum(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 ///
 /// Returns database errors from SQLite `PRAGMA incremental_vacuum`.
 pub async fn incremental_vacuum(pool: &SqlitePool, pages: u32) -> Result<(), sqlx::Error> {
-    sqlx::query(&format!("PRAGMA incremental_vacuum({pages})"))
+    sqlx::query(AssertSqlSafe(format!("PRAGMA incremental_vacuum({pages})")))
         .execute(pool)
         .await?;
     Ok(())

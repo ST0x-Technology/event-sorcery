@@ -5,7 +5,8 @@ use cqrs_es::persist::{
 };
 use serde_json::Value;
 use sqlx::sqlite::SqliteRow;
-use sqlx::{Pool, Row, Sqlite};
+use sqlx::{AssertSqlSafe, Pool, Row, Sqlite};
+use std::sync::Arc;
 
 use crate::sql_query::SqlQueryFactory;
 
@@ -148,7 +149,7 @@ impl SqliteEventRepository {
         aggregate_id: &str,
     ) -> Result<Vec<SerializedEvent>, SqliteAggregateError> {
         let query = self.query_factory.select_events();
-        let rows = sqlx::query(&query)
+        let rows = sqlx::query(AssertSqlSafe(query))
             .bind(A::aggregate_type())
             .bind(aggregate_id)
             .fetch_all(&self.pool)
@@ -165,7 +166,7 @@ impl SqliteEventRepository {
         let query = self.query_factory.get_last_events();
         let last_sequence_i64 = i64::try_from(last_sequence)?;
 
-        let rows = sqlx::query(&query)
+        let rows = sqlx::query(AssertSqlSafe(query))
             .bind(A::aggregate_type())
             .bind(aggregate_id)
             .bind(last_sequence_i64)
@@ -180,7 +181,7 @@ impl SqliteEventRepository {
         aggregate_id: &str,
     ) -> Result<Option<SerializedSnapshot>, SqliteAggregateError> {
         let query = self.query_factory.select_snapshot();
-        let row = sqlx::query(&query)
+        let row = sqlx::query(AssertSqlSafe(query))
             .bind(A::aggregate_type())
             .bind(aggregate_id)
             .fetch_optional(&self.pool)
@@ -193,14 +194,14 @@ impl SqliteEventRepository {
     }
 
     async fn insert_events(&self, events: &[SerializedEvent]) -> Result<(), SqliteAggregateError> {
-        let insert_query = self.query_factory.insert_event();
+        let insert_query: Arc<str> = self.query_factory.insert_event().into();
 
         let mut tx = self.pool.begin().await?;
 
         for event in events {
             let sequence_i64 = i64::try_from(event.sequence)?;
 
-            let result = sqlx::query(&insert_query)
+            let result = sqlx::query(AssertSqlSafe(Arc::clone(&insert_query)))
                 .bind(&event.aggregate_type)
                 .bind(&event.aggregate_id)
                 .bind(sequence_i64)
@@ -235,7 +236,7 @@ impl SqliteEventRepository {
 
         let timestamp = chrono::Utc::now().to_rfc3339();
 
-        sqlx::query(&query)
+        sqlx::query(AssertSqlSafe(query))
             .bind(A::aggregate_type())
             .bind(aggregate_id)
             .bind(last_sequence_i64)
@@ -261,14 +262,14 @@ impl SqliteEventRepository {
         tokio::spawn(async move {
             let rows = match &aggregate_id {
                 Some(id) => {
-                    sqlx::query(&query)
+                    sqlx::query(AssertSqlSafe(query))
                         .bind(&aggregate_type)
                         .bind(id)
                         .fetch_all(&pool)
                         .await
                 }
                 None => {
-                    sqlx::query(&query)
+                    sqlx::query(AssertSqlSafe(query))
                         .bind(&aggregate_type)
                         .fetch_all(&pool)
                         .await
