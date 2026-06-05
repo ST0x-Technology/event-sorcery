@@ -675,29 +675,71 @@ For entities that don't need services, use `type Services = ()`.
 
 ## Testing Aggregates
 
-Use `Lifecycle::default()` with `Aggregate::handle()` for command tests. Set up
-prior state with `Aggregate::apply()`:
+Prefer the public `TestHarness` for command tests — it hides the cqrs-es
+plumbing (sink construction, event collection) behind a BDD-style interface:
 
 ```rust
-use cqrs_es::{Aggregate, View};
+use event_sorcery::testing::TestHarness;
+
+#[tokio::test]
+async fn test_my_command() {
+    TestHarness::<MyEntity>::with(())
+        .given(vec![MyEvent::Created { /* ... */ }])
+        .when(MyCommand::Update { /* ... */ })
+        .await
+        .then_expect_events(&[MyEvent::Updated { /* ... */ }]);
+}
+```
+
+When testing `Lifecycle` directly (inside this crate), the cqrs-es 0.5
+`Aggregate::handle` signature takes `&mut self`, the services, and an
+`EventSink`; emitted events are collected from the sink rather than returned:
+
+```rust
+use cqrs_es::Aggregate;
+use cqrs_es::event_sink::EventSink;
 
 #[tokio::test]
 async fn test_my_command() {
     let mut aggregate = Lifecycle::<MyEntity>::default();
-
-    // Given: apply prior events to set up state
     aggregate.apply(MyEvent::Created { /* ... */ });
 
-    // When: execute command under test
-    let events = aggregate
-        .handle(MyCommand::Update { /* ... */ }, &())
+    let sink = EventSink::default();
+    aggregate
+        .handle(MyCommand::Update { /* ... */ }, &(), &sink)
         .await
         .unwrap();
 
-    // Then: verify emitted events
+    let events = sink.collect().await;
     assert!(matches!(events[0], MyEvent::Updated { .. }));
 }
 ```
+
+Note the cqrs-es 0.5 commit contract: `PersistedEventStore::commit` rebuilds the
+snapshot by re-applying the sink's events to the aggregate it received from
+`handle`. `Lifecycle::handle` therefore leaves `self` at its pre-command state
+(events are routed through a throwaway scratch copy) — tests that call `handle`
+directly should assert this invariant where it matters (see the `handle_*` tests
+in `lifecycle.rs`).
+
+Two consequences of the scratch-copy design worth knowing:
+
+- **Command-time validation.** The scratch copy is checked after each event is
+  applied to it, so a command whose events the entity's own `originate`/`evolve`
+  rejects now fails at command time with the root-cause `LifecycleError` and
+  nothing is persisted. (Under cqrs-es 0.4 such events were committed and
+  poisoned the aggregate on its next load.)
+- **Scope of the exactly-once guarantee.** The pre-command-state invariant
+  guarantees exactly-once application through the
+  `handle -> commit ->
+  snapshot-rebuild` sequence of the Lifecycle adapter. It
+  does NOT cover the snapshot `last_sequence` bookkeeping in the repositories: a
+  multi-event command that crosses a snapshot boundary with `SNAPSHOT_SIZE > 1`
+  records a `last_sequence` past the state the snapshot payload actually folded
+  (pre-existing upstream limitation -- cqrs-es's persist API does not expose the
+  covered sequence), which can drop tail events from rehydrated state. Until
+  that is fixed, keep `SNAPSHOT_SIZE = 1` or emit single-event commands for
+  snapshotted aggregates.
 
 For view tests, use `View::update()` with `EventEnvelope`:
 
@@ -717,8 +759,7 @@ fn test_view_updates() {
 For error cases, verify the exact `LifecycleError` variant:
 
 ```rust
-assert!(matches!(
-    aggregate.handle(command, &()).await,
-    Err(LifecycleError::Apply(MyError::SpecificVariant))
-));
+let sink = EventSink::default();
+let error = aggregate.handle(command, &(), &sink).await.unwrap_err();
+assert!(matches!(error, LifecycleError::Apply(MyError::SpecificVariant)));
 ```

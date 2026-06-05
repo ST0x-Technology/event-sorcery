@@ -8,6 +8,7 @@
 //! See the [crate root](crate) for the full design rationale.
 
 use async_trait::async_trait;
+use cqrs_es::event_sink::EventSink;
 use cqrs_es::{Aggregate, EventEnvelope, Query, View};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -126,7 +127,6 @@ pub enum Never {}
 /// The `apply` method uses `std::mem::take` to move out of
 /// `&mut self`, avoiding unnecessary clones when transitioning
 /// between lifecycle states.
-#[async_trait]
 impl<Entity> Aggregate for Lifecycle<Entity>
 where
     Entity: EventSourced,
@@ -137,27 +137,74 @@ where
     type Error = LifecycleError<Entity>;
     type Services = Entity::Services;
 
-    fn aggregate_type() -> String {
-        Entity::AGGREGATE_TYPE.to_string()
-    }
+    const TYPE: &'static str = Entity::AGGREGATE_TYPE;
 
     async fn handle(
-        &self,
+        &mut self,
         command: Self::Command,
         services: &Self::Services,
-    ) -> Result<Vec<Self::Event>, Self::Error> {
-        match self {
-            Self::Uninitialized => Entity::initialize(command, services)
-                .await
-                .map_err(LifecycleError::Apply),
-
-            Self::Live(entity) => entity
-                .transition(command, services)
-                .await
-                .map_err(LifecycleError::Apply),
-
-            Self::Failed { error, .. } => Err(error.clone()),
+        sink: &EventSink<Self>,
+    ) -> Result<(), Self::Error> {
+        let events = match &*self {
+            Self::Uninitialized => Entity::initialize(command, services).await,
+            Self::Live(entity) => entity.transition(command, services).await,
+            Self::Failed { error, .. } => {
+                warn!(
+                    target: "cqrs",
+                    %error,
+                    aggregate_type = Entity::AGGREGATE_TYPE,
+                    "Rejecting command because lifecycle is already failed"
+                );
+                return Err(error.clone());
+            }
         }
+        .inspect_err(|domain_error| {
+            error!(
+                target: "cqrs",
+                %domain_error,
+                aggregate_type = Entity::AGGREGATE_TYPE,
+                "Command handler returned domain error"
+            );
+        })
+        .map_err(LifecycleError::Apply)?;
+
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        // cqrs-es 0.5 rebuilds the snapshot inside `commit` by re-applying these
+        // events to the aggregate it received from `handle`
+        // (`PersistedEventStore::update_snapshot_with_events`). `self` must
+        // therefore remain at its pre-command state when `handle` returns,
+        // otherwise the genesis/transition events get applied twice and the
+        // lifecycle collapses into `Failed`. Our `EventSourced` handlers already
+        // produce the full event list up front, so we feed the sink through a
+        // throwaway copy; `apply` evolves the persisted aggregate later during
+        // load (replay) and commit (snapshot).
+        // The scratch copy doubles as a validity check: if the entity emitted
+        // an event its own `originate`/`evolve` rejects, `scratch` lands in
+        // `Failed`. Surfacing that as the command's error keeps the poisoned
+        // events out of the store (the framework discards sink contents when
+        // `handle` errors) instead of committing them and failing the
+        // aggregate on its next load. The check runs after every write so the
+        // caller gets the root-cause error, not an `AlreadyFailed` wrapper
+        // from feeding later events through an already-failed scratch.
+        let mut scratch = self.clone();
+        for event in events {
+            sink.write(event, &mut scratch).await;
+
+            if let Self::Failed { error, .. } = &scratch {
+                error!(
+                    target: "cqrs",
+                    %error,
+                    aggregate_type = Entity::AGGREGATE_TYPE,
+                    "Command produced an event the entity cannot apply"
+                );
+                return Err(error.clone());
+            }
+        }
+
+        Ok(())
     }
 
     fn apply(&mut self, event: Self::Event) {
@@ -295,6 +342,7 @@ where
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
+    use cqrs_es::event_sink::EventSink;
     use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
@@ -334,9 +382,14 @@ mod tests {
     struct CounterError;
 
     enum CounterCommand {
-        Create { initial: u32 },
+        Create {
+            initial: u32,
+        },
         Increment,
         Fail,
+        /// Emits a multi-event batch whose first event is rejected by
+        /// `originate`/`evolve`, exercising the scratch short-circuit.
+        BrokenBatch,
     }
 
     #[async_trait]
@@ -379,6 +432,7 @@ mod tests {
                 Create { initial } => Ok(vec![CounterEvent::Created { initial }]),
                 Increment => Ok(vec![CounterEvent::Incremented]),
                 Fail => Err(CounterError),
+                BrokenBatch => Ok(vec![CounterEvent::Incremented, CounterEvent::Incremented]),
             }
         }
 
@@ -391,6 +445,9 @@ mod tests {
                 CounterCommand::Create { .. } => Ok(vec![]),
                 CounterCommand::Increment => Ok(vec![CounterEvent::Incremented]),
                 CounterCommand::Fail => Err(CounterError),
+                CounterCommand::BrokenBatch => {
+                    Ok(vec![CounterEvent::Invalid, CounterEvent::Incremented])
+                }
             }
         }
     }
@@ -482,38 +539,87 @@ mod tests {
 
     #[tokio::test]
     async fn handle_uninitialized_delegates_to_initialize() {
-        let lifecycle = Lifecycle::<Counter>::default();
+        let mut lifecycle = Lifecycle::<Counter>::default();
+        let sink = EventSink::default();
 
-        let events = lifecycle
-            .handle(CounterCommand::Create { initial: 42 }, &())
+        lifecycle
+            .handle(CounterCommand::Create { initial: 42 }, &(), &sink)
             .await
             .unwrap();
 
-        assert_eq!(events, vec![CounterEvent::Created { initial: 42 }]);
+        assert_eq!(
+            sink.collect().await,
+            vec![CounterEvent::Created { initial: 42 }]
+        );
+        // cqrs-es 0.5 re-applies the sink's events to `self` during commit's
+        // snapshot rebuild, so `handle` must leave `self` at its pre-command
+        // state or every event gets applied twice.
+        assert!(matches!(lifecycle, Lifecycle::Uninitialized));
     }
 
     #[tokio::test]
     async fn handle_live_delegates_to_transition() {
-        let lifecycle = Lifecycle::Live(Counter { value: 0 });
+        let mut lifecycle = Lifecycle::Live(Counter { value: 0 });
+        let sink = EventSink::default();
 
-        let events = lifecycle
-            .handle(CounterCommand::Increment, &())
+        lifecycle
+            .handle(CounterCommand::Increment, &(), &sink)
             .await
             .unwrap();
 
-        assert_eq!(events, vec![CounterEvent::Incremented]);
+        assert_eq!(sink.collect().await, vec![CounterEvent::Incremented]);
+        // Same pre-command-state invariant as the uninitialized case: the
+        // entity value must not advance until commit replays the events.
+        assert!(matches!(lifecycle, Lifecycle::Live(Counter { value: 0 })));
+    }
+
+    #[tokio::test]
+    async fn handle_rejects_events_the_entity_cannot_apply() {
+        let mut lifecycle = Lifecycle::<Counter>::default();
+        let sink = EventSink::default();
+
+        // `initialize` maps Increment to an Incremented event, which
+        // `originate` rejects -- the scratch replay must surface that as a
+        // command error instead of committing a poisoned event stream.
+        let error = lifecycle
+            .handle(CounterCommand::Increment, &(), &sink)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, LifecycleError::EventCantOriginate { .. }));
+        assert!(matches!(lifecycle, Lifecycle::Uninitialized));
+    }
+
+    #[tokio::test]
+    async fn handle_multi_event_rejection_returns_root_cause_error() {
+        let mut lifecycle = Lifecycle::Live(Counter { value: 3 });
+        let sink = EventSink::default();
+
+        // BrokenBatch emits [Invalid, Incremented]; evolve rejects Invalid.
+        // The scratch short-circuit must return the root UnexpectedEvent
+        // error, not an AlreadyFailed wrapper from the trailing event.
+        let error = lifecycle
+            .handle(CounterCommand::BrokenBatch, &(), &sink)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, LifecycleError::UnexpectedEvent { .. }));
+        assert!(matches!(lifecycle, Lifecycle::Live(Counter { value: 3 })));
     }
 
     #[tokio::test]
     async fn handle_maps_domain_error_to_lifecycle_apply() {
-        let lifecycle = Lifecycle::Live(Counter { value: 0 });
+        let mut lifecycle = Lifecycle::Live(Counter { value: 0 });
+        let sink = EventSink::default();
 
         let error = lifecycle
-            .handle(CounterCommand::Fail, &())
+            .handle(CounterCommand::Fail, &(), &sink)
             .await
             .unwrap_err();
 
         assert!(matches!(error, LifecycleError::Apply(CounterError)));
+        // Error paths must also leave `self` at its pre-command state.
+        assert!(matches!(lifecycle, Lifecycle::Live(Counter { value: 0 })));
     }
 
     #[tokio::test]
@@ -521,13 +627,14 @@ mod tests {
         let stored_error = LifecycleError::EventCantOriginate {
             event: CounterEvent::Incremented,
         };
-        let lifecycle = Lifecycle::<Counter>::Failed {
+        let mut lifecycle = Lifecycle::<Counter>::Failed {
             error: stored_error.clone(),
             last_valid_entity: None,
         };
+        let sink = EventSink::default();
 
         let error = lifecycle
-            .handle(CounterCommand::Increment, &())
+            .handle(CounterCommand::Increment, &(), &sink)
             .await
             .unwrap_err();
 

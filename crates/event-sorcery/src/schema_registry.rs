@@ -263,23 +263,28 @@ impl From<Never> for ReconcileError {
 #[cfg(test)]
 mod tests {
     use cqrs_es::Aggregate;
+    use cqrs_es::event_sink::EventSink;
 
     use super::*;
 
     #[tokio::test]
     async fn register_new_aggregate_emits_event() {
-        let aggregate = Lifecycle::<SchemaRegistry>::default();
+        let mut aggregate = Lifecycle::<SchemaRegistry>::default();
+        let sink = EventSink::default();
 
-        let events = aggregate
+        aggregate
             .handle(
                 SchemaRegistryCommand::Register {
                     name: "Position".to_string(),
                     version: 1,
                 },
                 &(),
+                &sink,
             )
             .await
             .unwrap();
+
+        let events = sink.collect().await;
 
         assert_eq!(events.len(), 1);
         assert_eq!(
@@ -300,16 +305,21 @@ mod tests {
             version: 1,
         });
 
-        let events = aggregate
+        let sink = EventSink::default();
+
+        aggregate
             .handle(
                 SchemaRegistryCommand::Register {
                     name: "Position".to_string(),
                     version: 1,
                 },
                 &(),
+                &sink,
             )
             .await
             .unwrap();
+
+        let events = sink.collect().await;
 
         assert!(events.is_empty());
     }
@@ -323,16 +333,21 @@ mod tests {
             version: 1,
         });
 
-        let events = aggregate
+        let sink = EventSink::default();
+
+        aggregate
             .handle(
                 SchemaRegistryCommand::Register {
                     name: "Position".to_string(),
                     version: 2,
                 },
                 &(),
+                &sink,
             )
             .await
             .unwrap();
+
+        let events = sink.collect().await;
 
         assert_eq!(events.len(), 1);
         assert_eq!(

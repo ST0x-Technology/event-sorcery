@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use cqrs_es::Aggregate;
 use cqrs_es::persist::{
     PersistedEventRepository, PersistenceError, ReplayStream, SerializedEvent, SerializedSnapshot,
@@ -58,7 +57,7 @@ impl SqliteEventRepository {
              WHERE aggregate_type = ?1 AND aggregate_id = ?2 \
              ORDER BY sequence",
         )
-        .bind(A::aggregate_type())
+        .bind(A::TYPE)
         .bind(aggregate_id)
         .fetch_all(&self.pool)
         .await?;
@@ -79,7 +78,7 @@ impl SqliteEventRepository {
              WHERE aggregate_type = ?1 AND aggregate_id = ?2 AND sequence > ?3 \
              ORDER BY sequence",
         )
-        .bind(A::aggregate_type())
+        .bind(A::TYPE)
         .bind(aggregate_id)
         .bind(last_sequence)
         .fetch_all(&self.pool)
@@ -97,7 +96,7 @@ impl SqliteEventRepository {
              FROM snapshots \
              WHERE aggregate_type = ?1 AND aggregate_id = ?2",
         )
-        .bind(A::aggregate_type())
+        .bind(A::TYPE)
         .bind(aggregate_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -150,7 +149,7 @@ impl SqliteEventRepository {
                  (aggregate_type, aggregate_id, last_sequence, snapshot_version, payload, timestamp) \
                  VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
             )
-            .bind(A::aggregate_type())
+            .bind(A::TYPE)
             .bind(aggregate_id)
             .bind(last_sequence)
             .bind(snapshot_version)
@@ -174,7 +173,7 @@ impl SqliteEventRepository {
     fn stream_events_impl<A: Aggregate>(&self, aggregate_id: Option<&str>) -> ReplayStream {
         let (mut feed, stream) = ReplayStream::new(self.stream_channel_size);
         let pool = self.pool.clone();
-        let aggregate_type = A::aggregate_type();
+        let aggregate_type = A::TYPE;
         let aggregate_id = aggregate_id.map(String::from);
 
         tokio::spawn(async move {
@@ -187,7 +186,7 @@ impl SqliteEventRepository {
                          WHERE aggregate_type = ?1 AND aggregate_id = ?2 \
                          ORDER BY sequence",
                     )
-                    .bind(&aggregate_type)
+                    .bind(aggregate_type)
                     .bind(aggregate_id)
                     .fetch_all(&pool)
                     .await
@@ -200,7 +199,7 @@ impl SqliteEventRepository {
                          WHERE aggregate_type = ?1 \
                          ORDER BY sequence",
                     )
-                    .bind(&aggregate_type)
+                    .bind(aggregate_type)
                     .fetch_all(&pool)
                     .await
                 }
@@ -235,7 +234,6 @@ impl SqliteEventRepository {
     }
 }
 
-#[async_trait]
 impl PersistedEventRepository for SqliteEventRepository {
     async fn get_events<A: Aggregate>(
         &self,

@@ -9,6 +9,7 @@
 //! Lifecycle/Aggregate internals.
 
 use async_trait::async_trait;
+use cqrs_es::event_sink::EventSink;
 use cqrs_es::persist::PersistedEventStore;
 use cqrs_es::{Aggregate, CqrsFramework, EventStore, Query, mem_store};
 use std::fmt::Debug;
@@ -83,9 +84,13 @@ impl<Entity: EventSourced> TestHarness<Entity> {
             lifecycle.apply(event);
         }
 
-        let result = lifecycle.handle(command, &self.services).await;
+        let sink = EventSink::default();
+        let handled = lifecycle.handle(command, &self.services, &sink).await;
+        let events = sink.collect().await;
 
-        TestResult { result }
+        TestResult {
+            result: handled.map(|()| events),
+        }
     }
 }
 
