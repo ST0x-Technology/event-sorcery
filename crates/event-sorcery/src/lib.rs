@@ -110,10 +110,10 @@ pub use dependency::{Dependent, EntityList, Fold, HasEntity, OneOf};
 pub use job::FailureInjector;
 #[doc(hidden)]
 pub use job::{
-    ExponentialBackoff, FAIL_STOP_RECOVERY_TIMEOUT, RETRY_BACKOFF, Storage, on_terminal_failure,
-    work,
+    ExponentialBackoff, FAIL_STOP_RECOVERY_TIMEOUT, RETRY_BACKOFF, Storage, flush_jobs,
+    on_terminal_failure, work,
 };
-pub use job::{Job, JobBackend, JobError, Label};
+pub use job::{HasJob, Job, JobBackend, JobError, JobList, JobQueue, Label, QueuePushError};
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
 pub use projection::{Column, Projection, ProjectionError, Table};
