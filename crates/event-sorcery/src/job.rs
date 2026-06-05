@@ -10,10 +10,26 @@
 //! Jobs are stored in apalis's `Jobs` table and executed by a
 //! supervised apalis worker. [`perform`](Job::perform) receives the
 //! consumer-owned [`Input`](Job::Input) dependency bundle.
+//!
+//! The queue is written through the event store's own connection
+//! (sqlx 0.9), while the worker side reads it through apalis's
+//! storage (sqlx 0.8). Both address the same `Jobs` table in the
+//! same SQLite database.
 
+use apalis::layers::retry::backoff::Backoff;
+use apalis::prelude::{Attempt, Data};
+use apalis_codec::json::JsonCodec;
+use apalis_core::backend::poll_strategy::{BackoffConfig, IntervalStrategy, StrategyBuilder};
+use apalis_core::worker::context::WorkerContext;
+use apalis_core::worker::event::Event;
+use apalis_sqlite::fetcher::SqliteFetcher;
+use apalis_sqlite::{CompactType, Config, SqlitePool, SqliteStorage};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::{debug, error};
 
 /// A durable, retryable unit of side-effecting work.
 ///
@@ -58,6 +74,62 @@ pub trait Job: Serialize + DeserializeOwned + Send + 'static {
     ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send;
 }
 
+/// Worker-side handle to apalis's SQLite storage for a single job
+/// type.
+///
+/// Built once at startup from a pool addressing the same database as
+/// the event store. Consumed by the worker wiring via
+/// [`into_storage`](Self::into_storage).
+pub struct JobBackend<J: Job> {
+    storage: Storage<J>,
+}
+
+impl<J: Job> JobBackend<J> {
+    /// Builds a backend over apalis's `Jobs` table in `pool`.
+    ///
+    /// `pool` is an apalis (sqlx 0.8) pool; the same database is
+    /// written by the event store's own connection at enqueue time.
+    #[must_use]
+    pub fn new(pool: &SqlitePool) -> Self {
+        Self {
+            storage: SqliteStorage::new_with_config(pool, &build_poll_config::<J>()),
+        }
+    }
+
+    /// Consumes the backend, yielding the apalis storage for worker
+    /// registration.
+    #[must_use]
+    pub fn into_storage(self) -> Storage<J> {
+        self.storage
+    }
+
+    /// The pool backing this storage, for queue maintenance.
+    #[must_use]
+    pub fn pool(&self) -> &SqlitePool {
+        self.storage.pool()
+    }
+}
+
+/// Error returned by the worker handler when a job fails or is
+/// deliberately failed by the injector.
+#[derive(Debug, thiserror::Error)]
+pub enum JobError {
+    /// The job's own [`perform`](Job::perform) returned an error.
+    #[error("{label}: {source}")]
+    Failed {
+        /// Label of the failed job instance.
+        label: Label,
+        /// The underlying domain error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// A failure injected by [`FailureInjector`] for fault testing.
+    #[cfg(any(test, feature = "test-support"))]
+    #[error("injected terminal job failure")]
+    Injected,
+}
+
 /// Human-readable identifier for a job instance, used in logs and
 /// failure-injection targeting.
 #[derive(Debug, Clone)]
@@ -68,12 +140,114 @@ impl Label {
     pub fn new(label: impl Into<String>) -> Self {
         Self(label.into())
     }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl std::fmt::Display for Label {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.0)
     }
+}
+
+/// Circuit-breaker recovery timeout. Set effectively infinite: a
+/// tripped breaker stays open until the supervisor restarts, since a
+/// terminal job failure indicates a problem a human must inspect.
+pub const FAIL_STOP_RECOVERY_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 24 * 365);
+
+/// Retry backoff applied to job execution: 1s base, doubling, capped
+/// at 30s.
+pub const RETRY_BACKOFF: ExponentialBackoff =
+    ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(30));
+
+/// Exponential backoff for apalis retries.
+#[derive(Clone, Debug)]
+pub struct ExponentialBackoff {
+    base: Duration,
+    max: Duration,
+    iteration: u32,
+}
+
+impl ExponentialBackoff {
+    /// Creates a backoff that starts at `base` and doubles up to
+    /// `max`.
+    #[must_use]
+    pub const fn new(base: Duration, max: Duration) -> Self {
+        Self {
+            base,
+            max,
+            iteration: 0,
+        }
+    }
+}
+
+impl Backoff for ExponentialBackoff {
+    type Future = tokio::time::Sleep;
+
+    fn next_backoff(&mut self) -> Self::Future {
+        let factor = 2u32.saturating_pow(self.iteration);
+        let delay = self.base.saturating_mul(factor).min(self.max);
+        self.iteration = self.iteration.saturating_add(1);
+        tokio::time::sleep(delay)
+    }
+}
+
+/// apalis SQLite storage specialized for a single job type with JSON
+/// payload encoding.
+pub type Storage<J> = SqliteStorage<J, JsonCodec<CompactType>, SqliteFetcher>;
+
+/// The apalis worker handler. Deserializes the job, logs, and runs
+/// [`perform`](Job::perform) against the injected input.
+#[cfg(not(feature = "test-support"))]
+pub async fn work<J>(
+    job: J,
+    input: Data<Arc<J::Input>>,
+    attempt: Attempt,
+) -> Result<J::Output, JobError>
+where
+    J: Job + Sync,
+{
+    let label = job.label();
+    log_processing(&label, attempt.current());
+    job.perform(&input)
+        .await
+        .map_err(|source| JobError::Failed {
+            label,
+            source: Box::new(source),
+        })
+}
+
+/// Worker event handler that stops the worker and notifies the
+/// supervisor on a terminal (retries-exhausted) failure.
+pub fn on_terminal_failure(
+    failure_notify: Arc<tokio::sync::Notify>,
+    error_msg: &'static str,
+) -> impl Fn(&WorkerContext, &Event) + Send + Sync + 'static {
+    move |context, event| {
+        if let Event::Error(error) = event {
+            error!(%error, worker = %context.name(), "{error_msg}");
+            failure_notify.notify_waiters();
+            let _ = context.stop();
+        }
+    }
+}
+
+fn build_poll_config<J: 'static>() -> Config {
+    let strategy = StrategyBuilder::new()
+        .apply(
+            IntervalStrategy::new(Duration::from_millis(100))
+                .with_backoff(BackoffConfig::new(Duration::from_secs(1))),
+        )
+        .build();
+
+    Config::new(std::any::type_name::<J>()).with_poll_interval(strategy)
+}
+
+fn log_processing(label: &Label, attempt: usize) {
+    debug!(target: "job", %label, attempt, "processing job");
 }
 
 #[cfg(test)]
