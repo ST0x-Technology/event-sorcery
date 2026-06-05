@@ -95,6 +95,8 @@ mod testing;
 mod view_backend;
 mod wire;
 
+pub use apalis::prelude::Monitor;
+pub use apalis_core::worker::ext::circuit_breaker::config::CircuitBreakerConfig;
 use async_trait::async_trait;
 pub use cqrs_es::AggregateError;
 use cqrs_es::CqrsFramework;
@@ -132,6 +134,14 @@ pub use testing::{
 };
 pub use view_backend::{SqliteViewBackend, ViewBackend};
 pub use wire::StoreBuilder;
+
+/// Re-exports of the apalis items that [`build_supervised_worker!`]
+/// expands to, so consumers need not depend on apalis directly.
+#[doc(hidden)]
+pub mod __apalis {
+    pub use apalis::layers::retry::RetryPolicy;
+    pub use apalis::prelude::{CircuitBreaker, EventListenerExt, WorkerBuilder, WorkerBuilderExt};
+}
 
 pub(crate) type SqliteCqrs<Entity> =
     CqrsFramework<Lifecycle<Entity>, PersistedEventStore<SqliteEventRepository, Lifecycle<Entity>>>;
