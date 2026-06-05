@@ -382,11 +382,11 @@ macro_rules! register_entities {
 
 #[cfg(test)]
 mod tests {
-    use async_trait::async_trait;
     use cqrs_es::DomainEvent;
     use serde::{Deserialize, Serialize};
 
     use super::*;
+    use crate::JobQueue;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct Alpha {
@@ -411,13 +411,12 @@ mod tests {
     #[error("alpha error")]
     struct AlphaError;
 
-    #[async_trait]
     impl EventSourced for Alpha {
         type Id = String;
         type Event = AlphaEvent;
         type Command = ();
         type Error = AlphaError;
-        type Services = ();
+        type Jobs = Nil;
         type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "Alpha";
@@ -436,11 +435,18 @@ mod tests {
             Ok(None)
         }
 
-        async fn initialize((): (), (): &()) -> Result<Vec<AlphaEvent>, AlphaError> {
+        fn initialize(
+            (): (),
+            _jobs: &mut JobQueue<Self::Jobs>,
+        ) -> Result<Vec<AlphaEvent>, AlphaError> {
             Ok(vec![AlphaEvent::Born])
         }
 
-        async fn transition(&self, (): (), (): &()) -> Result<Vec<AlphaEvent>, AlphaError> {
+        fn transition(
+            &self,
+            (): (),
+            _jobs: &mut JobQueue<Self::Jobs>,
+        ) -> Result<Vec<AlphaEvent>, AlphaError> {
             Ok(vec![])
         }
     }
@@ -468,13 +474,12 @@ mod tests {
     #[error("beta error")]
     struct BetaError;
 
-    #[async_trait]
     impl EventSourced for Beta {
         type Id = String;
         type Event = BetaEvent;
         type Command = ();
         type Error = BetaError;
-        type Services = ();
+        type Jobs = Nil;
         type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "Beta";
@@ -491,11 +496,18 @@ mod tests {
             Ok(None)
         }
 
-        async fn initialize((): (), (): &()) -> Result<Vec<BetaEvent>, BetaError> {
+        fn initialize(
+            (): (),
+            _jobs: &mut JobQueue<Self::Jobs>,
+        ) -> Result<Vec<BetaEvent>, BetaError> {
             Ok(vec![BetaEvent::Spawned])
         }
 
-        async fn transition(&self, (): (), (): &()) -> Result<Vec<BetaEvent>, BetaError> {
+        fn transition(
+            &self,
+            (): (),
+            _jobs: &mut JobQueue<Self::Jobs>,
+        ) -> Result<Vec<BetaEvent>, BetaError> {
             Ok(vec![])
         }
     }

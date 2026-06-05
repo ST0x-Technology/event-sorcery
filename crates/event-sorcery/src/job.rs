@@ -30,7 +30,7 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::dependency::{Cons, Nil};
 
@@ -88,7 +88,10 @@ pub trait Job: Serialize + DeserializeOwned + Send + 'static {
 /// Built from [`Cons`](crate::Cons) / [`Nil`](crate::Nil) -- the same
 /// cells [`deps!`](crate::deps) uses for reactor dependencies -- via
 /// the [`jobs!`](crate::jobs) macro: `jobs![SendEmail, ChargeCard]`.
-pub trait JobList {}
+///
+/// `Send` so the [`JobQueue`] threads through the framework's `Send`
+/// command future.
+pub trait JobList: Send {}
 
 impl JobList for Nil {}
 
@@ -459,22 +462,19 @@ macro_rules! build_supervised_worker {
     }};
 }
 
-/// Drains a [`JobQueue`] into apalis's `Jobs` table through `connection`.
+/// Writes buffered pushes into apalis's `Jobs` table through `connection`.
 ///
-/// Called by the framework inside the event-commit transaction so a
-/// job becomes visible to the worker iff its triggering events commit.
 /// Rows are written in apalis's storage format -- JSON-encoded payload,
 /// `Pending` status, the job type as the queue name -- so the worker's
 /// fetcher picks them up.
-#[doc(hidden)]
-pub async fn flush_jobs<Jobs: JobList>(
+async fn insert_pending(
     connection: &mut sqlx::SqliteConnection,
-    queue: JobQueue<Jobs>,
+    pending: Vec<PendingPush>,
 ) -> Result<(), QueuePushError> {
-    for pending in queue.into_pending() {
-        let job_type = pending.job.job_type();
-        let payload = pending.job.encode()?;
-        let delay_secs = match pending.delay {
+    for push in pending {
+        let job_type = push.job.job_type();
+        let payload = push.job.encode()?;
+        let delay_secs = match push.delay {
             None => 0_i64,
             Some(delay) => i64::try_from(delay.as_secs())?,
         };
@@ -493,6 +493,72 @@ pub async fn flush_jobs<Jobs: JobList>(
     }
 
     Ok(())
+}
+
+/// Drains a [`JobQueue`] into apalis's `Jobs` table through `connection`.
+///
+/// Called by the framework inside the event-commit transaction so a job
+/// becomes visible to the worker iff its triggering events commit.
+#[doc(hidden)]
+pub async fn flush_jobs<Jobs: JobList>(
+    connection: &mut sqlx::SqliteConnection,
+    queue: JobQueue<Jobs>,
+) -> Result<(), QueuePushError> {
+    insert_pending(connection, queue.into_pending()).await
+}
+
+tokio::task_local! {
+    /// Per-command buffer of jobs awaiting flush. Scoped by
+    /// [`with_pending_jobs`] around command execution, populated by the
+    /// [`Lifecycle`](crate::Lifecycle) handler, and drained by the event
+    /// repository inside its commit transaction.
+    static PENDING_JOBS: std::cell::RefCell<Vec<PendingPush>>;
+}
+
+/// Runs `future` with a fresh per-command pending-jobs buffer in scope, so
+/// the jobs a handler enqueues are flushed in the same transaction that
+/// commits its events.
+pub(crate) async fn with_pending_jobs<F>(future: F) -> F::Output
+where
+    F: Future,
+{
+    PENDING_JOBS
+        .scope(std::cell::RefCell::new(Vec::new()), future)
+        .await
+}
+
+/// Buffers a handler's [`JobQueue`] for the framework to flush at commit.
+///
+/// A no-op when the queue is empty. If jobs are present but no
+/// [`with_pending_jobs`] scope is active (a programming error -- handlers
+/// run inside [`Store::send`](crate::Store::send)), they are dropped with a
+/// warning rather than silently lost.
+pub(crate) fn buffer_pending<Jobs: JobList>(queue: JobQueue<Jobs>) {
+    let pending = queue.into_pending();
+    if pending.is_empty() {
+        return;
+    }
+
+    let count = pending.len();
+    if PENDING_JOBS
+        .try_with(move |cell| cell.borrow_mut().extend(pending))
+        .is_err()
+    {
+        warn!(target: "job", count, "jobs enqueued outside a command scope were dropped");
+    }
+}
+
+/// Flushes the current command's buffered jobs through `connection`.
+///
+/// Called by the event repository inside its commit transaction; a no-op
+/// when no scope is active or nothing was buffered.
+pub(crate) async fn flush_pending_jobs(
+    connection: &mut sqlx::SqliteConnection,
+) -> Result<(), QueuePushError> {
+    let pending = PENDING_JOBS
+        .try_with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+        .unwrap_or_default();
+    insert_pending(connection, pending).await
 }
 
 fn build_poll_config<J: Job>() -> Config {

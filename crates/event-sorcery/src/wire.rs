@@ -98,7 +98,6 @@ impl<Entity: EventSourced> StoreBuilder<Entity> {
 fn sqlite_snapshot_cqrs<Entity: EventSourced>(
     pool: SqlitePool,
     queries: Vec<Box<dyn Query<Lifecycle<Entity>>>>,
-    services: Entity::Services,
 ) -> SqliteCqrs<Entity> {
     let repo = SqliteEventRepository::new(pool);
     let store = PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
@@ -106,7 +105,7 @@ fn sqlite_snapshot_cqrs<Entity: EventSourced>(
         Entity::SNAPSHOT_SIZE,
     );
     #[allow(clippy::disallowed_methods)]
-    CqrsFramework::new(store, queries, services)
+    CqrsFramework::new(store, queries, ())
 }
 
 /// Projected entities: auto-creates and wires a [`Projection`],
@@ -119,7 +118,6 @@ where
 {
     pub async fn build(
         mut self,
-        services: Entity::Services,
     ) -> Result<(Arc<Store<Entity>>, Arc<Projection<Entity>>), ReconcileError> {
         // Projected entities must retain all events so that
         // `catch_up`/`rebuild_all` can replay the full history.
@@ -156,22 +154,19 @@ where
             reactor: projection.clone(),
         }));
 
-        let cqrs = sqlite_snapshot_cqrs(self.pool.clone(), self.queries, services);
+        let cqrs = sqlite_snapshot_cqrs(self.pool.clone(), self.queries);
         Ok((Arc::new(Store::new(cqrs, self.pool)), projection))
     }
 }
 
 /// Non-projected entities: returns just `Store`.
 impl<Entity: EventSourced<Materialized = Nil>> StoreBuilder<Entity, Nil> {
-    pub async fn build(
-        self,
-        services: Entity::Services,
-    ) -> Result<Arc<Store<Entity>>, ReconcileError> {
+    pub async fn build(self) -> Result<Arc<Store<Entity>>, ReconcileError> {
         Reconciler::new(self.pool.clone())
             .reconcile::<Entity>()
             .await?;
 
-        let cqrs = sqlite_snapshot_cqrs(self.pool.clone(), self.queries, services);
+        let cqrs = sqlite_snapshot_cqrs(self.pool.clone(), self.queries);
         Ok(Arc::new(Store::new(cqrs, self.pool)))
     }
 }
@@ -183,6 +178,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
+    use crate::JobQueue;
     use crate::dependency::EntityList;
     use crate::deps;
     use crate::lifecycle::Never;
@@ -219,13 +215,12 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl EventSourced for AggregateA {
         type Id = String;
         type Event = EventA;
         type Command = ();
         type Error = Never;
-        type Services = ();
+        type Jobs = Nil;
         type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "AggregateA";
@@ -240,22 +235,28 @@ mod tests {
             Ok(Some(Self))
         }
 
-        async fn initialize(_command: (), _services: &()) -> Result<Vec<EventA>, Never> {
+        fn initialize(
+            _command: (),
+            _jobs: &mut JobQueue<Self::Jobs>,
+        ) -> Result<Vec<EventA>, Never> {
             Ok(vec![])
         }
 
-        async fn transition(&self, _command: (), _services: &()) -> Result<Vec<EventA>, Never> {
+        fn transition(
+            &self,
+            _command: (),
+            _jobs: &mut JobQueue<Self::Jobs>,
+        ) -> Result<Vec<EventA>, Never> {
             Ok(vec![])
         }
     }
 
-    #[async_trait]
     impl EventSourced for AggregateB {
         type Id = String;
         type Event = EventB;
         type Command = ();
         type Error = Never;
-        type Services = ();
+        type Jobs = Nil;
         type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "AggregateB";
@@ -270,11 +271,18 @@ mod tests {
             Ok(Some(Self))
         }
 
-        async fn initialize(_command: (), _services: &()) -> Result<Vec<EventB>, Never> {
+        fn initialize(
+            _command: (),
+            _jobs: &mut JobQueue<Self::Jobs>,
+        ) -> Result<Vec<EventB>, Never> {
             Ok(vec![])
         }
 
-        async fn transition(&self, _command: (), _services: &()) -> Result<Vec<EventB>, Never> {
+        fn transition(
+            &self,
+            _command: (),
+            _jobs: &mut JobQueue<Self::Jobs>,
+        ) -> Result<Vec<EventB>, Never> {
             Ok(vec![])
         }
     }
@@ -324,7 +332,7 @@ mod tests {
 
         let _store = StoreBuilder::<AggregateA>::new(pool.clone())
             .with(Arc::new(SingleEntityReactor))
-            .build(())
+            .build()
             .await
             .unwrap();
     }
@@ -340,13 +348,13 @@ mod tests {
         let _store_a = StoreBuilder::<AggregateA>::new(pool.clone())
             .with(multi.clone())
             .with(single)
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let _store_b = StoreBuilder::<AggregateB>::new(pool.clone())
             .with(multi)
-            .build(())
+            .build()
             .await
             .unwrap();
     }

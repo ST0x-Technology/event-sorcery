@@ -44,24 +44,20 @@ pub fn replay<Entity: EventSourced>(
 /// # Example
 ///
 /// ```ignore
-/// TestHarness::<Position>::with(())
+/// TestHarness::<Position>::with()
 ///     .given(vec![PositionEvent::Initialized { .. }])
 ///     .when(PositionCommand::AcknowledgeFill { .. })
 ///     .await
 ///     .then_expect_events(vec![PositionEvent::FillAcknowledged { .. }]);
 /// ```
 pub struct TestHarness<Entity: EventSourced> {
-    services: Entity::Services,
     events: Vec<Entity::Event>,
 }
 
 impl<Entity: EventSourced> TestHarness<Entity> {
-    /// Create a harness with the given services.
-    pub fn with(services: Entity::Services) -> Self {
-        Self {
-            services,
-            events: vec![],
-        }
+    /// Create a harness with no prior events.
+    pub fn with() -> Self {
+        Self { events: vec![] }
     }
 
     /// Set up prior events (given some history).
@@ -85,7 +81,7 @@ impl<Entity: EventSourced> TestHarness<Entity> {
         }
 
         let sink = EventSink::default();
-        let handled = lifecycle.handle(command, &self.services, &sink).await;
+        let handled = lifecycle.handle(command, &(), &sink).await;
         let events = sink.collect().await;
 
         TestResult {
@@ -141,10 +137,7 @@ where
 ///
 /// Create a SQLite-backed Store with no reactors, for tests that
 /// need persistence but no event processing side-effects.
-pub fn test_store<Entity: EventSourced>(
-    pool: sqlx::SqlitePool,
-    services: Entity::Services,
-) -> Store<Entity> {
+pub fn test_store<Entity: EventSourced>(pool: sqlx::SqlitePool) -> Store<Entity> {
     let repo = SqliteEventRepository::new(pool.clone());
     let event_store =
         PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
@@ -152,7 +145,7 @@ pub fn test_store<Entity: EventSourced>(
             Entity::SNAPSHOT_SIZE,
         );
     #[allow(clippy::disallowed_methods)]
-    let cqrs = CqrsFramework::new(event_store, vec![], services);
+    let cqrs = CqrsFramework::new(event_store, vec![], ());
     Store::new(cqrs, pool)
 }
 
@@ -315,50 +308,16 @@ pub struct TestStore<Entity: EventSourced> {
 
 impl<Entity: EventSourced> TestStore<Entity> {
     /// Create an in-memory TestStore for fast, isolated unit tests.
-    pub fn new(services: Entity::Services) -> Self
+    pub fn new() -> Self
     where
         Entity: 'static,
         <Entity::Id as FromStr>::Err: Debug,
     {
-        Self::build(vec![], services)
+        Self::build(vec![])
     }
 
     /// Create an in-memory TestStore with a reactor that receives
     /// dispatched events.
-    ///
-    /// When `Entity::Services` is `()`, use the single-argument
-    /// overload instead: `TestStore::with_reactor(spy)`.
-    pub fn with_reactor_and<R>(reactor: Arc<R>, services: Entity::Services) -> Self
-    where
-        Entity: 'static,
-        Entity::Id: Clone,
-        Entity::Event: Clone,
-        <Entity::Id as FromStr>::Err: Debug + Send + Sync,
-        R: Reactor + 'static,
-        R::Dependencies: HasEntity<Entity>,
-    {
-        let query: Box<dyn Query<Lifecycle<Entity>>> = Box::new(ReactorBridge { reactor });
-        Self::build(vec![query], services)
-    }
-
-    fn build(queries: Vec<Box<dyn Query<Lifecycle<Entity>>>>, services: Entity::Services) -> Self
-    where
-        Entity: 'static,
-        <Entity::Id as FromStr>::Err: Debug,
-    {
-        let mem_store = mem_store::MemStore::default();
-        #[allow(clippy::disallowed_methods)]
-        let cqrs = CqrsFramework::new(mem_store.clone(), queries, services);
-        Self { mem_store, cqrs }
-    }
-}
-
-impl<Entity: EventSourced> TestStore<Entity>
-where
-    Entity::Services: Default,
-{
-    /// Create an in-memory TestStore with a reactor, using
-    /// `Default` services (typically `()`).
     pub fn with_reactor<R>(reactor: Arc<R>) -> Self
     where
         Entity: 'static,
@@ -368,7 +327,28 @@ where
         R: Reactor + 'static,
         R::Dependencies: HasEntity<Entity>,
     {
-        Self::with_reactor_and(reactor, Entity::Services::default())
+        let query: Box<dyn Query<Lifecycle<Entity>>> = Box::new(ReactorBridge { reactor });
+        Self::build(vec![query])
+    }
+
+    fn build(queries: Vec<Box<dyn Query<Lifecycle<Entity>>>>) -> Self
+    where
+        Entity: 'static,
+        <Entity::Id as FromStr>::Err: Debug,
+    {
+        let mem_store = mem_store::MemStore::default();
+        #[allow(clippy::disallowed_methods)]
+        let cqrs = CqrsFramework::new(mem_store.clone(), queries, ());
+        Self { mem_store, cqrs }
+    }
+}
+
+impl<Entity: EventSourced + 'static> Default for TestStore<Entity>
+where
+    <Entity::Id as FromStr>::Err: Debug,
+{
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -407,11 +387,11 @@ impl<Entity: EventSourced> TestStore<Entity> {
 
 #[cfg(test)]
 mod tests {
-    use async_trait::async_trait;
     use cqrs_es::DomainEvent;
     use serde::{Deserialize, Serialize};
 
     use super::*;
+    use crate::JobQueue;
     use crate::Nil;
 
     // Required for ReactorHarness::receive to resolve HasEntity<Counter>.
@@ -458,13 +438,12 @@ mod tests {
         Increment,
     }
 
-    #[async_trait]
     impl EventSourced for Counter {
         type Id = String;
         type Event = CounterEvent;
         type Command = CounterCommand;
         type Error = CounterError;
-        type Services = ();
+        type Jobs = Nil;
         type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "Counter";
@@ -494,9 +473,9 @@ mod tests {
             }
         }
 
-        async fn initialize(
+        fn initialize(
             command: CounterCommand,
-            _services: &(),
+            _jobs: &mut JobQueue<Self::Jobs>,
         ) -> Result<Vec<CounterEvent>, CounterError> {
             match command {
                 CounterCommand::Create { initial } => Ok(vec![CounterEvent::Created { initial }]),
@@ -504,10 +483,10 @@ mod tests {
             }
         }
 
-        async fn transition(
+        fn transition(
             &self,
             command: CounterCommand,
-            _services: &(),
+            _jobs: &mut JobQueue<Self::Jobs>,
         ) -> Result<Vec<CounterEvent>, CounterError> {
             match command {
                 CounterCommand::Create { .. } => Ok(vec![]),
@@ -558,7 +537,7 @@ mod tests {
 
     #[tokio::test]
     async fn harness_given_history_then_command_produces_events() {
-        TestHarness::<Counter>::with(())
+        TestHarness::<Counter>::with()
             .given(vec![CounterEvent::Created { initial: 0 }])
             .when(CounterCommand::Increment)
             .await
@@ -567,7 +546,7 @@ mod tests {
 
     #[tokio::test]
     async fn harness_initialize_produces_genesis_event() {
-        TestHarness::<Counter>::with(())
+        TestHarness::<Counter>::with()
             .given_no_previous_events()
             .when(CounterCommand::Create { initial: 42 })
             .await
@@ -576,7 +555,7 @@ mod tests {
 
     #[tokio::test]
     async fn harness_on_failed_lifecycle_returns_error() {
-        let error = TestHarness::<Counter>::with(())
+        let error = TestHarness::<Counter>::with()
             .given(vec![CounterEvent::Incremented])
             .when(CounterCommand::Increment)
             .await
@@ -587,7 +566,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_send_and_load() {
-        let store = TestStore::<Counter>::new(());
+        let store = TestStore::<Counter>::new();
         let id = "counter-1".to_string();
 
         store
@@ -601,7 +580,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_load_nonexistent_returns_none() {
-        let store = TestStore::<Counter>::new(());
+        let store = TestStore::<Counter>::new();
 
         let result = store.load(&"nonexistent".to_string()).await.unwrap();
         assert!(result.is_none());
@@ -609,7 +588,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_multiple_commands() {
-        let store = TestStore::<Counter>::new(());
+        let store = TestStore::<Counter>::new();
         let id = "counter-1".to_string();
 
         store

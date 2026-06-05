@@ -18,6 +18,7 @@ use std::sync::Arc;
 use tracing::{error, warn};
 
 use crate::EventSourced;
+use crate::JobQueue;
 use crate::dependency::HasEntity;
 use crate::reactor::Reactor;
 
@@ -135,19 +136,21 @@ where
     type Command = Entity::Command;
     type Event = Entity::Event;
     type Error = LifecycleError<Entity>;
-    type Services = Entity::Services;
+    type Services = ();
 
     const TYPE: &'static str = Entity::AGGREGATE_TYPE;
 
     async fn handle(
         &mut self,
         command: Self::Command,
-        services: &Self::Services,
+        _services: &Self::Services,
         sink: &EventSink<Self>,
     ) -> Result<(), Self::Error> {
+        let mut jobs = JobQueue::<Entity::Jobs>::default();
+
         let events = match &*self {
-            Self::Uninitialized => Entity::initialize(command, services).await,
-            Self::Live(entity) => entity.transition(command, services).await,
+            Self::Uninitialized => Entity::initialize(command, &mut jobs),
+            Self::Live(entity) => entity.transition(command, &mut jobs),
             Self::Failed { error, .. } => {
                 warn!(
                     target: "cqrs",
@@ -167,6 +170,12 @@ where
             );
         })
         .map_err(LifecycleError::Apply)?;
+
+        // Hand the buffered jobs to the framework: the event repository drains
+        // them inside the same transaction that commits these events, so a job
+        // is enqueued iff its triggering events commit (see
+        // `crate::job::with_pending_jobs` / `flush_pending_jobs`).
+        crate::job::buffer_pending(jobs);
 
         if events.is_empty() {
             return Ok(());
@@ -341,7 +350,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use async_trait::async_trait;
     use cqrs_es::event_sink::EventSink;
     use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
     use serde::{Deserialize, Serialize};
@@ -392,13 +400,12 @@ mod tests {
         BrokenBatch,
     }
 
-    #[async_trait]
     impl EventSourced for Counter {
         type Id = String;
         type Event = CounterEvent;
         type Command = CounterCommand;
         type Error = CounterError;
-        type Services = ();
+        type Jobs = Nil;
         type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "Counter";
@@ -423,9 +430,9 @@ mod tests {
             }
         }
 
-        async fn initialize(
+        fn initialize(
             command: CounterCommand,
-            _services: &(),
+            _jobs: &mut JobQueue<Self::Jobs>,
         ) -> Result<Vec<CounterEvent>, CounterError> {
             use CounterCommand::*;
             match command {
@@ -436,10 +443,10 @@ mod tests {
             }
         }
 
-        async fn transition(
+        fn transition(
             &self,
             command: CounterCommand,
-            _services: &(),
+            _jobs: &mut JobQueue<Self::Jobs>,
         ) -> Result<Vec<CounterEvent>, CounterError> {
             match command {
                 CounterCommand::Create { .. } => Ok(vec![]),

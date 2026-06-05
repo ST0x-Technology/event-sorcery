@@ -89,7 +89,6 @@ mod wire;
 
 pub use apalis::prelude::Monitor;
 pub use apalis_core::worker::ext::circuit_breaker::config::CircuitBreakerConfig;
-use async_trait::async_trait;
 pub use cqrs_es::AggregateError;
 use cqrs_es::CqrsFramework;
 pub use cqrs_es::DomainEvent;
@@ -167,9 +166,9 @@ pub enum CompactionPolicy {
 /// - `Error`: Domain-specific errors from command handling or
 ///   event application (e.g., arithmetic overflow). For
 ///   entities with infallible operations, use [`Never`].
-/// - `Services`: External dependencies injected into command
-///   handlers (e.g., `Arc<dyn OrderPlacer>`). Use `()` when
-///   no services are needed.
+/// - `Jobs`: Type-level list of job types the entity dispatches
+///   (`Nil` for none). Side effects run as durable jobs enqueued
+///   through the [`JobQueue`] passed to the command handlers.
 ///
 /// # Constants
 ///
@@ -207,7 +206,6 @@ pub enum CompactionPolicy {
 /// - `transition`: Handle a command against existing state.
 ///   Receives `&self` (the domain type, not `Lifecycle`), so
 ///   the handler only deals with live state.
-#[async_trait]
 pub trait EventSourced:
     Clone + Debug + Send + Sync + Sized + Serialize + DeserializeOwned + 'static
 {
@@ -220,9 +218,14 @@ pub trait EventSourced:
     /// Domain error type returned by command handlers and event
     /// application.
     type Error: DomainError;
-    /// External dependencies injected into command handlers (e.g.
-    /// API clients, order placers).
-    type Services: Send + Sync;
+    /// Type-level list of job types this entity can dispatch.
+    ///
+    /// `Nil` for entities with no jobs; `jobs![SendEmail, ChargeCard]`
+    /// for several. Each member is a [`Job`]; handlers enqueue them
+    /// through the [`JobQueue`] passed to `initialize`/`transition`,
+    /// and the framework flushes them in the same transaction that
+    /// commits the events.
+    type Jobs: JobList;
     /// Whether this entity has a materialized view.
     ///
     /// Set to `Table` with `PROJECTION = Table("view_name")` for
@@ -278,9 +281,9 @@ pub trait EventSourced:
     ///
     /// No `&self` -- impossible to accidentally reference
     /// existing state during creation.
-    async fn initialize(
+    fn initialize(
         command: Self::Command,
-        services: &Self::Services,
+        jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error>;
 
     /// Handle a command against existing state.
@@ -288,10 +291,10 @@ pub trait EventSourced:
     /// `&self` is the domain type directly, not `Lifecycle`.
     /// The handler only deals with live state; lifecycle routing
     /// is handled by the blanket `Aggregate` impl.
-    async fn transition(
+    fn transition(
         &self,
         command: Self::Command,
-        services: &Self::Services,
+        jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error>;
 }
 
@@ -346,7 +349,7 @@ impl<Entity: EventSourced> Store<Entity> {
         id: &Entity::Id,
         command: Entity::Command,
     ) -> Result<(), SendError<Entity>> {
-        self.cqrs.execute(&id.to_string(), command).await
+        crate::job::with_pending_jobs(self.cqrs.execute(&id.to_string(), command)).await
     }
 
     /// Load an entity's current state directly from the event store.
@@ -451,14 +454,12 @@ pub async fn load_entity<Entity: EventSourced>(
 /// contexts where you need to send a command but don't have (or need)
 /// a full server-lifetime Store.
 ///
-/// The caller must provide `services` matching the aggregate's
-/// `Services` type. For commands that never invoke services (e.g.,
-/// failure commands), a panicking stub is safe.
+/// Jobs the handler enqueues are flushed in the same transaction that
+/// commits its events.
 pub async fn send_command<Entity: EventSourced>(
     pool: &SqlitePool,
     id: &Entity::Id,
     command: Entity::Command,
-    services: Entity::Services,
 ) -> Result<(), SendError<Entity>> {
     let repo = SqliteEventRepository::new(pool.clone());
     let store = PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
@@ -467,9 +468,9 @@ pub async fn send_command<Entity: EventSourced>(
     );
 
     #[allow(clippy::disallowed_methods)]
-    let cqrs = CqrsFramework::new(store, vec![], services);
+    let cqrs = CqrsFramework::new(store, vec![], ());
 
-    cqrs.execute(&id.to_string(), command).await
+    crate::job::with_pending_jobs(cqrs.execute(&id.to_string(), command)).await
 }
 
 /// Delete compactable events that are already represented by snapshots.
@@ -703,7 +704,6 @@ pub enum LoadAllIdsError {
 
 #[cfg(test)]
 mod tests {
-    use async_trait::async_trait;
     use cqrs_es::DomainEvent;
     use serde::{Deserialize, Serialize};
     use sqlx::SqlitePool;
@@ -761,13 +761,12 @@ mod tests {
         Rename { name: String },
     }
 
-    #[async_trait]
     impl EventSourced for Widget {
         type Id = NumericId;
         type Event = WidgetEvent;
         type Command = WidgetCommand;
         type Error = WidgetError;
-        type Services = ();
+        type Jobs = Nil;
         type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "Widget";
@@ -790,9 +789,9 @@ mod tests {
             }
         }
 
-        async fn initialize(
+        fn initialize(
             command: WidgetCommand,
-            _services: &(),
+            _jobs: &mut JobQueue<Self::Jobs>,
         ) -> Result<Vec<WidgetEvent>, WidgetError> {
             match command {
                 WidgetCommand::Create { name } => Ok(vec![WidgetEvent::Created { name }]),
@@ -800,10 +799,10 @@ mod tests {
             }
         }
 
-        async fn transition(
+        fn transition(
             &self,
             command: WidgetCommand,
-            _services: &(),
+            _jobs: &mut JobQueue<Self::Jobs>,
         ) -> Result<Vec<WidgetEvent>, WidgetError> {
             match command {
                 WidgetCommand::Create { .. } => Ok(vec![]),
@@ -835,7 +834,7 @@ mod tests {
     #[tokio::test]
     async fn load_entity_replays_events_into_entity() {
         let pool = test_pool().await;
-        let store = testing::test_store::<Widget>(pool.clone(), ());
+        let store = testing::test_store::<Widget>(pool.clone());
 
         store
             .send(
@@ -856,7 +855,7 @@ mod tests {
     #[tokio::test]
     async fn load_entity_uses_snapshot_after_events_are_compacted() {
         let pool = test_pool().await;
-        let store = testing::test_store::<Widget>(pool.clone(), ());
+        let store = testing::test_store::<Widget>(pool.clone());
 
         store
             .send(
@@ -898,7 +897,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_version_advances_across_loads() {
         let pool = test_pool().await;
-        let store = testing::test_store::<Widget>(pool.clone(), ());
+        let store = testing::test_store::<Widget>(pool.clone());
 
         store
             .send(
@@ -958,13 +957,12 @@ mod tests {
             Increment,
         }
 
-        #[async_trait]
         impl EventSourced for Tally {
             type Id = NumericId;
             type Event = TallyEvent;
             type Command = TallyCommand;
             type Error = WidgetError;
-            type Services = ();
+            type Jobs = Nil;
             type Materialized = Nil;
 
             const AGGREGATE_TYPE: &'static str = "Tally";
@@ -988,9 +986,9 @@ mod tests {
                 }
             }
 
-            async fn initialize(
+            fn initialize(
                 command: TallyCommand,
-                _services: &(),
+                _jobs: &mut JobQueue<Self::Jobs>,
             ) -> Result<Vec<TallyEvent>, WidgetError> {
                 match command {
                     TallyCommand::Start => Ok(vec![TallyEvent::Started]),
@@ -998,10 +996,10 @@ mod tests {
                 }
             }
 
-            async fn transition(
+            fn transition(
                 &self,
                 command: TallyCommand,
-                _services: &(),
+                _jobs: &mut JobQueue<Self::Jobs>,
             ) -> Result<Vec<TallyEvent>, WidgetError> {
                 match command {
                     TallyCommand::Start => Ok(vec![]),
@@ -1011,7 +1009,7 @@ mod tests {
         }
 
         let pool = test_pool().await;
-        let store = testing::test_store::<Tally>(pool.clone(), ());
+        let store = testing::test_store::<Tally>(pool.clone());
 
         // SNAPSHOT_SIZE = 1 forces commit's snapshot rebuild
         // (`update_snapshot_with_events`) after every command, exercising the
@@ -1053,13 +1051,12 @@ mod tests {
             name: String,
         }
 
-        #[async_trait]
         impl EventSourced for RetainedWidget {
             type Id = NumericId;
             type Event = WidgetEvent;
             type Command = WidgetCommand;
             type Error = WidgetError;
-            type Services = ();
+            type Jobs = Nil;
             type Materialized = Nil;
 
             const AGGREGATE_TYPE: &'static str = "RetainedWidget";
@@ -1080,9 +1077,9 @@ mod tests {
                 }
             }
 
-            async fn initialize(
+            fn initialize(
                 command: WidgetCommand,
-                _services: &(),
+                _jobs: &mut JobQueue<Self::Jobs>,
             ) -> Result<Vec<WidgetEvent>, WidgetError> {
                 match command {
                     WidgetCommand::Create { name } => Ok(vec![WidgetEvent::Created { name }]),
@@ -1090,10 +1087,10 @@ mod tests {
                 }
             }
 
-            async fn transition(
+            fn transition(
                 &self,
                 command: WidgetCommand,
-                _services: &(),
+                _jobs: &mut JobQueue<Self::Jobs>,
             ) -> Result<Vec<WidgetEvent>, WidgetError> {
                 match command {
                     WidgetCommand::Create { .. } => Ok(vec![]),
@@ -1103,7 +1100,7 @@ mod tests {
         }
 
         let pool = test_pool().await;
-        let store = testing::test_store::<RetainedWidget>(pool.clone(), ());
+        let store = testing::test_store::<RetainedWidget>(pool.clone());
         store
             .send(
                 &NumericId(7),
@@ -1150,7 +1147,7 @@ mod tests {
     #[tokio::test]
     async fn load_all_ids_includes_snapshot_only_aggregates() {
         let pool = test_pool().await;
-        let store = testing::test_store::<Widget>(pool.clone(), ());
+        let store = testing::test_store::<Widget>(pool.clone());
         store
             .send(
                 &NumericId(30),
@@ -1217,7 +1214,7 @@ mod tests {
     #[tokio::test]
     async fn count_aggregates_includes_snapshot_only_aggregates() {
         let pool = test_pool().await;
-        let store = testing::test_store::<Widget>(pool.clone(), ());
+        let store = testing::test_store::<Widget>(pool.clone());
         store
             .send(
                 &NumericId(30),
@@ -1232,5 +1229,143 @@ mod tests {
         let count = count_aggregates::<Widget>(&pool).await.unwrap();
 
         assert_eq!(count, 1);
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct SendWelcome {
+        address: String,
+    }
+
+    impl Job for SendWelcome {
+        type Input = ();
+        type Output = ();
+        type Error = std::convert::Infallible;
+
+        const WORKER_NAME: &'static str = "send-welcome";
+        const KIND: &'static str = "send-welcome";
+
+        fn label(&self) -> Label {
+            Label::new(format!("welcome:{}", self.address))
+        }
+
+        async fn perform(&self, _input: &()) -> Result<(), std::convert::Infallible> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct Account {
+        email: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    enum AccountEvent {
+        Registered { email: String },
+    }
+
+    impl DomainEvent for AccountEvent {
+        fn event_type(&self) -> String {
+            "Registered".to_string()
+        }
+
+        fn event_version(&self) -> String {
+            "1.0".to_string()
+        }
+    }
+
+    enum AccountCommand {
+        Register { email: String },
+    }
+
+    impl EventSourced for Account {
+        type Id = String;
+        type Event = AccountEvent;
+        type Command = AccountCommand;
+        type Error = Never;
+        type Jobs = crate::jobs![SendWelcome];
+        type Materialized = Nil;
+
+        const AGGREGATE_TYPE: &'static str = "Account";
+        const PROJECTION: Nil = Nil;
+        const SCHEMA_VERSION: u64 = 1;
+
+        fn originate(event: &AccountEvent) -> Option<Self> {
+            let AccountEvent::Registered { email } = event;
+            Some(Self {
+                email: email.clone(),
+            })
+        }
+
+        fn evolve(_entity: &Self, _event: &AccountEvent) -> Result<Option<Self>, Never> {
+            Ok(None)
+        }
+
+        fn initialize(
+            command: AccountCommand,
+            jobs: &mut JobQueue<Self::Jobs>,
+        ) -> Result<Vec<AccountEvent>, Never> {
+            let AccountCommand::Register { email } = command;
+            jobs.push(SendWelcome {
+                address: email.clone(),
+            });
+            Ok(vec![AccountEvent::Registered { email }])
+        }
+
+        fn transition(
+            &self,
+            _command: AccountCommand,
+            _jobs: &mut JobQueue<Self::Jobs>,
+        ) -> Result<Vec<AccountEvent>, Never> {
+            Ok(vec![])
+        }
+    }
+
+    async fn pool_with_jobs_table() -> SqlitePool {
+        let pool = test_pool().await;
+        sqlx::query(
+            "CREATE TABLE Jobs ( \
+             job BLOB NOT NULL, id TEXT NOT NULL UNIQUE, job_type TEXT NOT NULL, \
+             status TEXT NOT NULL DEFAULT 'Pending', attempts INTEGER NOT NULL DEFAULT 0, \
+             max_attempts INTEGER NOT NULL DEFAULT 25, \
+             run_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')), \
+             last_result TEXT, lock_at INTEGER, lock_by TEXT, done_at INTEGER, \
+             priority INTEGER NOT NULL DEFAULT 0, metadata TEXT, idempotency_key TEXT, \
+             PRIMARY KEY(id))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn command_enqueues_job_atomically_with_its_events() {
+        let pool = pool_with_jobs_table().await;
+        let store = testing::test_store::<Account>(pool.clone());
+
+        store
+            .send(
+                &"acc-1".to_string(),
+                AccountCommand::Register {
+                    email: "a@example.com".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let event_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE aggregate_type = 'Account'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(event_count, 1);
+
+        let (job_type, status): (String, String) =
+            sqlx::query_as("SELECT job_type, status FROM Jobs")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(job_type, SendWelcome::KIND);
+        assert_eq!(status, "Pending");
     }
 }

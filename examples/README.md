@@ -7,7 +7,7 @@ usage in `st0x.liquidity` and `st0x.issuance`.
 
 | Example               | Domain                                                                                                                    |
 | --------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| [`simple`](simple/)   | One entity (`SupportTicket`) with a materialized view, an injected `Clock` service, and filtered queries.                 |
+| [`simple`](simple/)   | One entity (`SupportTicket`) with a materialized view and filtered queries.                                               |
 | [`complex`](complex/) | Two entities (`Order`, `Inventory`) with two reactors (`StockAlert`, `AuditLog`), an injected `Notifier`, and compaction. |
 
 ## Run

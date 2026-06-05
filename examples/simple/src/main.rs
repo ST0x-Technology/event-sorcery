@@ -1,6 +1,6 @@
-//! Single-entity `event-sorcery` example: a support-ticket aggregate with
-//! an injected `Clock` service and a materialized view that supports
-//! filtered queries via a SQLite generated column.
+//! Single-entity `event-sorcery` example: a support-ticket aggregate with a
+//! materialized view that supports filtered queries via a SQLite generated
+//! column.
 //!
 //! Run with: `cargo run --manifest-path examples/simple/Cargo.toml`
 //!
@@ -8,7 +8,6 @@
 //! `support_ticket.rs` for the entity definition, view SQL, and tests.
 
 use std::error::Error;
-use std::sync::Arc;
 
 use sqlx::SqlitePool;
 
@@ -16,18 +15,15 @@ use event_sorcery::StoreBuilder;
 
 mod support_ticket;
 
-use support_ticket::{
-    Clock, STATUS, Status, SupportTicket, SupportTicketCommand, TicketId, WallClock,
-};
+use support_ticket::{STATUS, Status, SupportTicket, SupportTicketCommand, TicketId};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let pool = SqlitePool::connect(":memory:").await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
 
-    let clock: Arc<dyn Clock> = Arc::new(WallClock);
     let (store, projection) = StoreBuilder::<SupportTicket>::new(pool.clone())
-        .build(clock)
+        .build()
         .await?;
 
     let login = TicketId(1);

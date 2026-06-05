@@ -43,14 +43,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let orders = StoreBuilder::<Order>::new(pool.clone())
         .with(stock_alert.clone())
         .with(audit.clone())
-        .build(())
+        .build()
         .await?;
 
     // Inventory is Materialized = Table -- the auto-wired projection is
     // returned alongside the store, and our custom reactor runs next to it.
     let (inventory, inventory_projection) = StoreBuilder::<Inventory>::new(pool.clone())
         .with(stock_alert.clone())
-        .build(())
+        .build()
         .await?;
 
     let widgets = Sku("widgets".to_string());
