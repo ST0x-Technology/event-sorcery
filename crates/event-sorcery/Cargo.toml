@@ -19,6 +19,7 @@ sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+ulid = "1.2.1"
 
 [features]
 test-support = []
