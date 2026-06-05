@@ -84,6 +84,7 @@
 //! to cqrs-es.
 
 pub(crate) mod dependency;
+mod job;
 mod lifecycle;
 mod projection;
 mod reactor;
@@ -111,6 +112,7 @@ use std::str::FromStr;
 pub use dependency::Cons;
 pub use dependency::Nil;
 pub use dependency::{Dependent, EntityList, Fold, HasEntity, OneOf};
+pub use job::{Job, JobQueue, Label};
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
 pub use projection::{Column, Projection, ProjectionError, Table};
