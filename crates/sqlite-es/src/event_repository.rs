@@ -27,6 +27,11 @@ pub enum SqliteAggregateError {
     /// Integer conversion error (e.g., sequence number overflow)
     #[error("Integer conversion error: {0}")]
     TryFromInt(#[from] std::num::TryFromIntError),
+
+    /// A snapshot update was requested for a commit that contains no events,
+    /// so there is no event sequence to record for the snapshot
+    #[error("snapshot update without accompanying events")]
+    EmptySnapshotUpdate,
 }
 
 impl From<SqliteAggregateError> for PersistenceError {
@@ -36,6 +41,7 @@ impl From<SqliteAggregateError> for PersistenceError {
             SqliteAggregateError::Connection(e) => Self::ConnectionError(Box::new(e)),
             SqliteAggregateError::Deserialization(e) => Self::DeserializationError(Box::new(e)),
             SqliteAggregateError::TryFromInt(e) => Self::UnknownError(Box::new(e)),
+            err @ SqliteAggregateError::EmptySnapshotUpdate => Self::UnknownError(Box::new(err)),
         }
     }
 }
@@ -82,12 +88,40 @@ impl PersistedEventRepository for SqliteEventRepository {
         events: &[SerializedEvent],
         snapshot_update: Option<(String, Value, usize)>,
     ) -> Result<(), PersistenceError> {
-        self.insert_events(events).await?;
+        // One transaction for both writes: a rejected snapshot write must
+        // roll back the events, otherwise the caller sees a conflict for a
+        // commit whose events durably persisted and a retry double-applies
+        // the command.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(SqliteAggregateError::from)?;
 
-        if let Some((aggregate_id, aggregate, current_sequence)) = snapshot_update {
-            self.update_snapshot::<A>(&aggregate_id, current_sequence, 0, aggregate)
-                .await?;
+        self.insert_events_within(&mut tx, events).await?;
+
+        // The third tuple element is cqrs-es's snapshot VERSION counter
+        // (`PersistedEventStore::commit` passes `next_snapshot`), not an
+        // event sequence. The snapshot's `last_sequence` must come from the
+        // events being committed -- conflating the two re-applies already-
+        // folded events on every reload after the first snapshot.
+        if let Some((aggregate_id, aggregate, snapshot_version)) = snapshot_update {
+            let last_sequence = events
+                .last()
+                .map(|event| event.sequence)
+                .ok_or(SqliteAggregateError::EmptySnapshotUpdate)?;
+
+            self.update_snapshot_within::<A>(
+                &mut tx,
+                &aggregate_id,
+                last_sequence,
+                snapshot_version,
+                aggregate,
+            )
+            .await?;
         }
+
+        tx.commit().await.map_err(SqliteAggregateError::from)?;
 
         Ok(())
     }
@@ -191,10 +225,20 @@ impl SqliteEventRepository {
         }
     }
 
+    #[cfg(test)]
     async fn insert_events(&self, events: &[SerializedEvent]) -> Result<(), SqliteAggregateError> {
-        let insert_query: Arc<str> = self.query_factory.insert_event().into();
-
         let mut tx = self.pool.begin().await?;
+        self.insert_events_within(&mut tx, events).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn insert_events_within(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        events: &[SerializedEvent],
+    ) -> Result<(), SqliteAggregateError> {
+        let insert_query: Arc<str> = self.query_factory.insert_event().into();
 
         for event in events {
             let sequence_i64 = i64::try_from(event.sequence)?;
@@ -207,7 +251,7 @@ impl SqliteEventRepository {
                 .bind(&event.event_version)
                 .bind(&event.payload)
                 .bind(&event.metadata)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await;
 
             if let Err(e) = result {
@@ -218,30 +262,67 @@ impl SqliteEventRepository {
             }
         }
 
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn update_snapshot<A: Aggregate>(
+        &self,
+        aggregate_id: &str,
+        last_sequence: usize,
+        snapshot_version: usize,
+        aggregate: Value,
+    ) -> Result<(), SqliteAggregateError> {
+        let mut tx = self.pool.begin().await?;
+        self.update_snapshot_within::<A>(
+            &mut tx,
+            aggregate_id,
+            last_sequence,
+            snapshot_version,
+            aggregate,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
 
-    async fn update_snapshot<A: Aggregate>(
+    /// Writes a snapshot guarded on `last_sequence` monotonicity: a writer
+    /// whose snapshot covers an older event sequence loses with an
+    /// optimistic-lock error instead of clobbering a newer snapshot.
+    ///
+    /// Guarding on the event sequence rather than `snapshot_version` keeps
+    /// cqrs-es's snapshot-corruption recovery working: after a snapshot
+    /// payload fails to deserialize, `load_aggregate` rebuilds from all
+    /// events and the next commit re-writes the snapshot at version 1 -- but
+    /// always at a strictly later event sequence, so the rebuild replaces the
+    /// stale row while genuinely stale writers still cannot.
+    async fn update_snapshot_within<A: Aggregate>(
         &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
         aggregate_id: &str,
-        current_sequence: usize,
-        _current_snapshot: usize,
+        last_sequence: usize,
+        snapshot_version: usize,
         aggregate: Value,
     ) -> Result<(), SqliteAggregateError> {
         let query = self.query_factory.update_snapshot();
-        let last_sequence_i64 = i64::try_from(current_sequence)?;
+        let last_sequence_i64 = i64::try_from(last_sequence)?;
+        let snapshot_version_i64 = i64::try_from(snapshot_version)?;
 
         let timestamp = chrono::Utc::now().to_rfc3339();
 
-        sqlx::query(AssertSqlSafe(query))
+        let result = sqlx::query(AssertSqlSafe(query))
             .bind(A::TYPE)
             .bind(aggregate_id)
             .bind(last_sequence_i64)
+            .bind(snapshot_version_i64)
             .bind(&aggregate)
             .bind(&timestamp)
-            .execute(&self.pool)
+            .execute(&mut **tx)
             .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(SqliteAggregateError::OptimisticLock);
+        }
 
         Ok(())
     }
@@ -327,13 +408,16 @@ fn row_to_serialized_snapshot(row: &SqliteRow) -> Result<SerializedSnapshot, Sql
     let last_sequence_i64: i64 = row.try_get("last_sequence")?;
     let current_sequence = usize::try_from(last_sequence_i64)?;
 
+    let snapshot_version_i64: i64 = row.try_get("snapshot_version")?;
+    let current_snapshot = usize::try_from(snapshot_version_i64)?;
+
     let payload_str: String = row.try_get("payload")?;
 
     Ok(SerializedSnapshot {
         aggregate_id: row.try_get("aggregate_id")?,
         aggregate: serde_json::from_str(&payload_str)?,
         current_sequence,
-        current_snapshot: 0,
+        current_snapshot,
     })
 }
 
@@ -348,8 +432,9 @@ fn is_optimistic_lock_error(err: &sqlx::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use cqrs_es::DomainEvent;
     use cqrs_es::event_sink::EventSink;
+    use cqrs_es::persist::PersistedEventStore;
+    use cqrs_es::{AggregateContext, CqrsFramework, DomainEvent, EventStore};
     use serde::{Deserialize, Serialize};
     use std::fmt::{self, Display};
 
@@ -412,6 +497,85 @@ mod tests {
         }
     }
 
+    /// Appends each event's value to a list, making double- or zero-
+    /// application of any event visible in the final state.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+    struct AppendingAggregate {
+        applied: Vec<String>,
+    }
+
+    impl Aggregate for AppendingAggregate {
+        const TYPE: &'static str = "AppendingAggregate";
+        type Command = String;
+        type Event = TestEvent;
+        type Error = TestError;
+        type Services = ();
+
+        async fn handle(
+            &mut self,
+            command: Self::Command,
+            _services: &Self::Services,
+            sink: &EventSink<Self>,
+        ) -> Result<(), Self::Error> {
+            // Write through a scratch copy so `self` stays at its pre-command
+            // state: `PersistedEventStore::commit` re-applies the sink's
+            // events to the aggregate it received from `handle` when
+            // rebuilding the snapshot, so mutating `self` here would fold
+            // every event into the snapshot payload twice.
+            let mut scratch = self.clone();
+            sink.write(TestEvent::Updated { value: command }, &mut scratch)
+                .await;
+            Ok(())
+        }
+
+        fn apply(&mut self, event: Self::Event) {
+            match event {
+                TestEvent::Created => self.applied.push("created".to_string()),
+                TestEvent::Updated { value } => self.applied.push(value),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_round_trip_applies_events_exactly_once() {
+        let pool = create_test_pool().await.unwrap();
+        let repo = SqliteEventRepository::new(pool.clone());
+        // Threshold 2 makes the event sequence diverge from the snapshot
+        // version counter (snapshot lands at sequence 2, version 1), so a
+        // regression to the old sequence/version conflation cannot pass by
+        // numeric coincidence the way it would with threshold 1.
+        let store = PersistedEventStore::<_, AppendingAggregate>::new_snapshot_store(repo, 2);
+        let cqrs = CqrsFramework::new(store, vec![], ());
+
+        cqrs.execute("agg-1", "a".to_string()).await.unwrap();
+        cqrs.execute("agg-1", "b".to_string()).await.unwrap();
+        cqrs.execute("agg-1", "c".to_string()).await.unwrap();
+
+        // The snapshot row must record the sequence of the last folded event,
+        // not the snapshot version counter.
+        let repo = SqliteEventRepository::new(pool.clone());
+        let snapshot = repo
+            .load_snapshot::<AppendingAggregate>("agg-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.current_sequence, 2);
+        assert_eq!(snapshot.current_snapshot, 1);
+
+        // Rehydrate through a fresh store: snapshot + trailing events must
+        // apply each committed event exactly once.
+        let repo = SqliteEventRepository::new(pool);
+        let store = PersistedEventStore::<_, AppendingAggregate>::new_snapshot_store(repo, 2);
+        let mut context = store.load_aggregate("agg-1").await.unwrap();
+
+        assert_eq!(
+            *context.aggregate(),
+            AppendingAggregate {
+                applied: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            }
+        );
+    }
+
     #[tokio::test]
     async fn test_persist_and_load_events() {
         let pool = create_test_pool().await.unwrap();
@@ -468,22 +632,168 @@ mod tests {
         let pool = create_test_pool().await.unwrap();
         let repo = SqliteEventRepository::new(pool);
 
-        let aggregate = serde_json::json!({"state": "data"});
+        repo.update_snapshot::<TestAggregate>(
+            "test-789",
+            5,
+            1,
+            serde_json::json!({"state": "first"}),
+        )
+        .await
+        .unwrap();
 
-        repo.update_snapshot::<TestAggregate>("test-789", 5, 0, aggregate.clone())
+        let aggregate = serde_json::json!({"state": "data"});
+        repo.update_snapshot::<TestAggregate>("test-789", 9, 2, aggregate.clone())
             .await
             .unwrap();
 
         let loaded = repo
             .load_snapshot::<TestAggregate>("test-789")
             .await
+            .unwrap()
             .unwrap();
 
-        assert!(loaded.is_some());
-        let loaded = loaded.unwrap();
         assert_eq!(loaded.aggregate_id, "test-789");
-        assert_eq!(loaded.current_sequence, 5);
+        assert_eq!(loaded.current_sequence, 9);
+        assert_eq!(loaded.current_snapshot, 2);
         assert_eq!(loaded.aggregate, aggregate);
+    }
+
+    #[tokio::test]
+    async fn stale_snapshot_writer_fails_optimistic_lock() {
+        let pool = create_test_pool().await.unwrap();
+        let repo = SqliteEventRepository::new(pool);
+
+        repo.update_snapshot::<TestAggregate>("test-cas", 2, 1, serde_json::json!({"v": 1}))
+            .await
+            .unwrap();
+        repo.update_snapshot::<TestAggregate>("test-cas", 4, 2, serde_json::json!({"v": 2}))
+            .await
+            .unwrap();
+
+        // A delayed writer whose snapshot covers an older event sequence
+        // must not clobber the newer row already written.
+        let stale_update = repo
+            .update_snapshot::<TestAggregate>("test-cas", 2, 2, serde_json::json!({"v": "stale"}))
+            .await;
+        assert!(matches!(
+            stale_update,
+            Err(SqliteAggregateError::OptimisticLock)
+        ));
+
+        // A delayed first-snapshot writer loses the same way.
+        let duplicate_insert = repo
+            .update_snapshot::<TestAggregate>("test-cas", 2, 1, serde_json::json!({"v": "dup"}))
+            .await;
+        assert!(matches!(
+            duplicate_insert,
+            Err(SqliteAggregateError::OptimisticLock)
+        ));
+
+        let loaded = repo
+            .load_snapshot::<TestAggregate>("test-cas")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.current_sequence, 4);
+        assert_eq!(loaded.current_snapshot, 2);
+        assert_eq!(loaded.aggregate, serde_json::json!({"v": 2}));
+    }
+
+    #[tokio::test]
+    async fn snapshot_rebuild_after_corruption_replaces_stale_row() {
+        let pool = create_test_pool().await.unwrap();
+        let repo = SqliteEventRepository::new(pool);
+
+        repo.update_snapshot::<TestAggregate>("test-heal", 4, 2, serde_json::json!({"v": 2}))
+            .await
+            .unwrap();
+
+        // cqrs-es's snapshot-corruption recovery rebuilds from all events and
+        // re-writes the snapshot at version 1 -- always at a strictly later
+        // event sequence. The rebuild must replace the stale row.
+        repo.update_snapshot::<TestAggregate>(
+            "test-heal",
+            6,
+            1,
+            serde_json::json!({"v": "rebuilt"}),
+        )
+        .await
+        .unwrap();
+
+        let loaded = repo
+            .load_snapshot::<TestAggregate>("test-heal")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.current_sequence, 6);
+        assert_eq!(loaded.current_snapshot, 1);
+        assert_eq!(loaded.aggregate, serde_json::json!({"v": "rebuilt"}));
+    }
+
+    #[tokio::test]
+    async fn failed_snapshot_guard_rolls_back_events() {
+        let pool = create_test_pool().await.unwrap();
+        let repo = SqliteEventRepository::new(pool);
+
+        repo.update_snapshot::<TestAggregate>("test-atomic", 10, 1, serde_json::json!({"v": 1}))
+            .await
+            .unwrap();
+
+        // A commit whose snapshot write loses the monotonicity guard must
+        // not leave its events behind, otherwise the caller retries a
+        // command that already half-persisted.
+        let event = SerializedEvent {
+            aggregate_type: TestAggregate::TYPE.to_string(),
+            aggregate_id: "test-atomic".to_string(),
+            sequence: 1,
+            event_type: "TestEvent".to_string(),
+            event_version: "1.0".to_string(),
+            payload: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+        };
+
+        let error = repo
+            .persist::<TestAggregate>(
+                std::slice::from_ref(&event),
+                Some(("test-atomic".to_string(), serde_json::json!({}), 2)),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PersistenceError::OptimisticLockError));
+
+        let events = repo
+            .load_events::<TestAggregate>("test-atomic")
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn persist_rejects_snapshot_update_without_events() {
+        let pool = create_test_pool().await.unwrap();
+        let repo = SqliteEventRepository::new(pool);
+
+        let error = repo
+            .persist::<TestAggregate>(
+                &[],
+                Some(("test-empty".to_string(), serde_json::json!({}), 1)),
+            )
+            .await
+            .unwrap_err();
+
+        let PersistenceError::UnknownError(inner) = error else {
+            panic!("expected UnknownError, got {error:?}");
+        };
+        assert!(matches!(
+            inner.downcast_ref::<SqliteAggregateError>(),
+            Some(SqliteAggregateError::EmptySnapshotUpdate)
+        ));
+
+        let snapshot = repo
+            .load_snapshot::<TestAggregate>("test-empty")
+            .await
+            .unwrap();
+        assert_eq!(snapshot, None);
     }
 
     #[tokio::test]
