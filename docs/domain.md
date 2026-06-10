@@ -57,10 +57,13 @@ never mutate state directly.
 
 `event-sorcery` splits command handling into two methods:
 
-- `EventSourced::initialize(command, services)` — for aggregates that don't yet
+- `EventSourced::initialize(command, jobs)` — for aggregates that don't yet
   exist. No `&self`, so handlers can't accidentally read state during creation.
-- `EventSourced::transition(&self, command, services)` — for live aggregates.
+- `EventSourced::transition(&self, command, jobs)` — for live aggregates.
   Receives the domain type, never the wrapping `Lifecycle`.
+
+Both handlers are synchronous and pure: they compute events and may enqueue jobs
+through the `jobs` handle, but perform no I/O.
 
 ### Event Application
 
@@ -124,11 +127,20 @@ of state, events, or projections changes. Compared against the persisted version
 in the `schema_registry` table on startup; mismatches clear stale snapshots and
 trigger view rebuilds.
 
-### Service
+### Job
 
-External dependency injected into command handlers (`EventSourced::Services`).
-Used so a handler can produce side-effects (e.g., enqueue work) atomically with
-event persistence. `()` when no services are needed.
+A durable, retryable unit of side-effect work (`trait Job`). Command handlers
+enqueue jobs instead of calling external systems directly, which keeps handlers
+pure. Each job declares its dependency bundle (`Input`), `Output`, and `Error`,
+plus a `perform` body. An entity lists the job types its handlers may dispatch
+via `EventSourced::Jobs` (a `JobList`; `Nil` when none).
+
+### Job Queue
+
+The handler-facing handle (`JobQueue<Jobs>`) passed to `initialize` /
+`transition`. `push` is synchronous and buffers the job; the framework flushes
+the buffer into the apalis `Jobs` table in the same transaction that persists
+the triggering events, so a job is enqueued iff its events commit.
 
 ### Lifecycle
 
@@ -180,18 +192,19 @@ Error variants store domain types, not opaque strings. Prefer
 `InvalidSymbol(Symbol)` over `InvalidSymbol(String)`. The compiler then prevents
 the caller from accidentally formatting the symbol away too early.
 
-### CQRS Aggregate Services
+### Job naming
 
-When an aggregate needs to perform side-effects atomically with persistence, the
-cqrs-es Service pattern applies. Naming convention used across consumer code:
+When an aggregate needs a side-effect, it enqueues a job rather than calling out
+from the handler. Naming convention:
 
-- **`{Action}er`** — the trait describing the capability (`OrderPlacer`).
-- **`{Domain}Service`** — the implementation (`OrderPlacementService`).
-- **`{Domain}Manager`** — the orchestration layer that drives commands through
-  the framework (`OrderManager`).
+- **`{Action}`** — the job type, named for the work it performs (`SendWelcome`,
+  `ChargeCard`). No generic `...Job` suffix.
+- **`{Job}Input`** — the dependency bundle the worker injects into `perform`
+  (HTTP clients, config, connection handles), exposed as `Job::Input`.
 
-This convention is library-imposed, not framework-enforced, but the `cqrs-es`
-`Service` parameter on aggregate `handle` is what makes it work.
+Jobs declared by an entity are listed in `EventSourced::Jobs` via `jobs![..]`.
+The framework enqueues them atomically with the triggering events; the
+consumer's worker wiring (`build_supervised_worker!`) runs them.
 
 ### Refactoring completeness
 

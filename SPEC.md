@@ -86,7 +86,8 @@ everything needed to event-source the type:
 - `Event` — domain event type (must implement `DomainEvent`)
 - `Command` — input that drives state transitions
 - `Error` — domain failure type (`Never` if everything is infallible)
-- `Services` — external dependencies passed into command handlers
+- `Jobs` — type-level list (`JobList`) of durable job types this entity's
+  handlers may enqueue; `Nil` when none
 - `Materialized` — `Table` if the entity has a SQLite-backed projection, `Nil`
   otherwise
 - `AGGREGATE_TYPE` — stable string identifier used in the event store
@@ -98,7 +99,11 @@ It splits behavior across two pairs:
   derives new state from subsequent events. Both are fallible.
 - Command-side: `initialize` handles a command when no state exists yet;
   `transition` handles a command against existing state. The split prevents
-  accidentally reading "current state" while bootstrapping.
+  accidentally reading "current state" while bootstrapping. Both are synchronous
+  and pure — they compute `Vec<Event>` and may enqueue durable jobs through a
+  `&mut JobQueue<Self::Jobs>`, but perform no I/O. External reads a handler once
+  did through `Services` (clock, config, idempotency keys) are now supplied
+  through the `Command`.
 
 ### `Lifecycle` adapter
 
@@ -138,6 +143,32 @@ Side-effect handler keyed off events. Used for cross-aggregate orchestration
 (e.g., one aggregate's event triggers a command on another). Has automatic
 retry-with-backoff on optimistic-lock conflicts.
 
+### Jobs
+
+Durable, retryable side-effect work. Handlers stay pure by enqueuing jobs
+instead of calling external systems directly:
+
+- `Job` — a serializable unit of work. Declares its dependency bundle (`Input`),
+  `Output`, and `Error`, a `perform(&self, &Input)` body, and constants for
+  worker naming, kind, and terminal-failure logging.
+- `JobList` / `HasJob<J>` — a type-level list (`Cons` / `Nil`) of the job types
+  an entity may dispatch. `JobQueue::push::<J>` is bounded
+  `where Jobs:
+  HasJob<J>`, so a handler can enqueue only the jobs its entity
+  declares — checked at compile time. `jobs![A, B]` is sugar for the list.
+- `JobQueue<Jobs>` — the handler-facing handle. `push` / `push_with_delay` are
+  synchronous and buffer onto the handle; the framework drains the buffer inside
+  the event-commit transaction (see "Job dispatch").
+- `JobBackend<J>` — apalis-backed `SqliteStorage` for one job type, built once
+  at startup and owned by the worker side.
+- `build_supervised_worker!` — wires a worker with the shared retry policy,
+  exponential backoff, circuit breaker, and terminal-failure notifier, so every
+  consumer gets identical execution semantics.
+
+apalis (`apalis`, `apalis-sqlite`, `apalis-core`, `apalis-codec`) is the
+non-negotiable queue backend; it is part of event-sorcery's public surface, not
+a feature flag.
+
 ### `SchemaRegistry`
 
 Tracks `(aggregate_type, schema_version)` tuples in a `schema_registry` table.
@@ -166,11 +197,30 @@ projection becomes a type error, not silent data staleness.
 2. `Store` looks up the aggregate, loads its `Lifecycle`, applies any relevant
    snapshot, replays uncached events.
 3. `Lifecycle::handle` routes to `EventSourced::initialize` (no state) or
-   `EventSourced::transition` (has state) and produces events.
-4. `cqrs-es::CqrsFramework` persists events with monotonic sequence numbers in
-   the same SQL transaction as any side-effects implemented via cqrs-es
-   `Service`s.
+   `EventSourced::transition` (has state) and produces events. The handler also
+   buffers any job pushes onto its `JobQueue` handle.
+4. `cqrs-es::CqrsFramework` persists events with monotonic sequence numbers, and
+   the framework drains the buffered `JobQueue` into the apalis `Jobs` table —
+   both in the same SQL transaction, so events and their jobs commit or roll
+   back together.
 5. Reactors registered on this aggregate are notified.
+
+### Job dispatch
+
+Command handlers never touch external systems. They enqueue work onto the
+`JobQueue<Self::Jobs>` handle the framework hands them; `push` is synchronous
+and only buffers. The framework flushes the buffer with a transaction-bound
+`INSERT` into the apalis `Jobs` table inside the same transaction that persists
+the events (write-path step 4). A crash before commit loses both the events and
+the jobs; a crash after commit leaves a durable job row the worker will pick up.
+This closes the window where a side effect fires but no event records it.
+Because the push is buffered, a queued row is never observable mid-handler.
+
+A separate apalis worker — wired with `build_supervised_worker!` — polls the
+table, runs each `Job::perform`, retries with exponential backoff, and trips a
+circuit breaker on sustained failure. Because the worker retries on failure and
+re-runs a job after a crash, jobs are delivered at-least-once: `Job::perform`
+must be idempotent, with any dedup key carried in the job payload or `Input`.
 
 ### Read path
 
