@@ -83,6 +83,7 @@ impl SqlQueryFactory {
                 aggregate_type,
                 aggregate_id,
                 last_sequence,
+                snapshot_version,
                 payload,
                 timestamp
              FROM {}
@@ -91,15 +92,26 @@ impl SqlQueryFactory {
         )
     }
 
+    /// Upsert guarded on `last_sequence` monotonicity: in the upsert's
+    /// `WHERE`, unqualified columns name the existing row and `excluded.*`
+    /// the proposed one, so a writer whose snapshot covers an older event
+    /// sequence updates zero rows instead of clobbering a newer snapshot.
     pub(crate) fn update_snapshot(&self) -> String {
         format!(
-            "INSERT OR REPLACE INTO {} (
+            "INSERT INTO {} (
                 aggregate_type,
                 aggregate_id,
                 last_sequence,
+                snapshot_version,
                 payload,
                 timestamp
-            ) VALUES (?, ?, ?, ?, ?)",
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(aggregate_type, aggregate_id) DO UPDATE SET
+                last_sequence = excluded.last_sequence,
+                snapshot_version = excluded.snapshot_version,
+                payload = excluded.payload,
+                timestamp = excluded.timestamp
+            WHERE excluded.last_sequence > last_sequence",
             self.snapshots_table
         )
     }
@@ -184,6 +196,7 @@ mod tests {
 
         assert!(query.contains("SELECT"));
         assert!(query.contains("FROM snapshots"));
+        assert!(query.contains("snapshot_version"));
         assert!(query.contains("WHERE aggregate_type = ? AND aggregate_id = ?"));
     }
 
@@ -192,8 +205,10 @@ mod tests {
         let factory = SqlQueryFactory::new("events".to_string(), "snapshots".to_string());
         let query = factory.update_snapshot();
 
-        assert!(query.contains("INSERT OR REPLACE INTO snapshots"));
-        assert!(query.contains("VALUES (?, ?, ?, ?, ?)"));
+        assert!(query.contains("INSERT INTO snapshots"));
+        assert!(query.contains("VALUES (?, ?, ?, ?, ?, ?)"));
+        assert!(query.contains("ON CONFLICT(aggregate_type, aggregate_id) DO UPDATE SET"));
+        assert!(query.contains("WHERE excluded.last_sequence > last_sequence"));
     }
 
     #[test]
