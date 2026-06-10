@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use cqrs_es::persist::{PersistenceError, ViewContext, ViewRepository};
 use cqrs_es::{Aggregate, View};
-use sqlx::{Pool, Row, Sqlite};
+use sqlx::{AssertSqlSafe, Pool, Row, Sqlite};
 use std::marker::PhantomData;
 
 use crate::sql_query::SqlQueryFactory;
@@ -101,7 +101,7 @@ where
     async fn load(&self, view_id: &str) -> Result<Option<V>, PersistenceError> {
         let query = SqlQueryFactory::select_view(&self.view_table);
 
-        let row = sqlx::query(&query)
+        let row = sqlx::query(AssertSqlSafe(query))
             .bind(view_id)
             .fetch_optional(&self.pool)
             .await
@@ -127,7 +127,7 @@ where
     ) -> Result<Option<(V, ViewContext)>, PersistenceError> {
         let query = SqlQueryFactory::select_view(&self.view_table);
 
-        let row = sqlx::query(&query)
+        let row = sqlx::query(AssertSqlSafe(query))
             .bind(view_id)
             .fetch_optional(&self.pool)
             .await
@@ -169,7 +169,7 @@ where
         if context.version == 0 {
             let insert_query = SqlQueryFactory::insert_view(&self.view_table);
 
-            sqlx::query(&insert_query)
+            sqlx::query(AssertSqlSafe(insert_query))
                 .bind(&context.view_instance_id)
                 .bind(new_version)
                 .bind(&payload)
@@ -179,7 +179,7 @@ where
         } else {
             let update_query = SqlQueryFactory::update_view(&self.view_table);
 
-            let result = sqlx::query(&update_query)
+            let result = sqlx::query(AssertSqlSafe(update_query))
                 .bind(new_version)
                 .bind(&payload)
                 .bind(&context.view_instance_id)
