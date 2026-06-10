@@ -35,7 +35,7 @@ explaining what it covers. Run any of them with
 - [`docs/domain.md`](docs/domain.md) — domain terminology and naming
   conventions.
 - [`docs/cqrs.md`](docs/cqrs.md) — event-sourcing patterns, the `EventSourced`
-  trait, projections, services, schema registry.
+  trait, projections, jobs, schema registry.
 - [`docs/sqlx.md`](docs/sqlx.md) — `SQLX_OFFLINE`, `query!` vs runtime queries,
   regenerating the query cache.
 - [`docs/ttdd.md`](docs/ttdd.md) — type-driven TDD methodology used in this

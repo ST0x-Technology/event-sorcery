@@ -28,7 +28,7 @@ the limit:
 **Read when relevant** to your task:
 
 - [docs/cqrs.md](docs/cqrs.md) - Event sourcing patterns: the `EventSourced`
-  trait, `Lifecycle` adapter, projections, services, schema registry.
+  trait, `Lifecycle` adapter, projections, jobs, schema registry.
 - [docs/sqlx.md](docs/sqlx.md) - `SQLX_OFFLINE`, `query!` vs runtime queries,
   regenerating the `.sqlx/` cache, common pitfalls.
 - [docs/ttdd.md](docs/ttdd.md) - Type-driven TDD workflow: scientific method
@@ -122,6 +122,13 @@ An epic is a roadmap subsection grouping related issues toward a single goal.
   multiple PRs, create or use Linear sub-issues for the split work and parent
   them under the original issue. Each PR should then close or reference its own
   sub-issue, not only the broad parent.
+
+### Pull Request Size
+
+- Prefer PRs under 500 additions. PRs up to 1,000 additions are acceptable when
+  the split would be artificial, but larger PRs should be broken down.
+- Removals are less concerning than additions and may exceed those thresholds
+  when deleting obsolete code or documentation.
 
 ## Plan & Review
 
@@ -219,7 +226,7 @@ workspace has two crates and no application binaries:
   repository traits. Standalone; usable wherever a `cqrs-es` backend is needed.
 - **`crates/event-sorcery`** — higher-level ergonomics on top of `sqlite-es`:
   the `EventSourced` trait, `Lifecycle` adapter, typed `Store`, projections,
-  schema registry, reactor.
+  schema registry, reactor, and apalis-backed jobs.
 
 The `migrations/` directory at the workspace root holds the canonical SQLite
 schema (events + snapshots tables) that `sqlite_es::testing::create_test_pool`
@@ -315,6 +322,10 @@ ignore rule cover it.
   the interactive view, e.g. `git --no-pager diff`
 - **CRITICAL: NEVER run a binary speculatively.** If you want to understand what
   code does, read it. If you want to test functionality, write proper tests.
+- **CRITICAL: Do not write ad-hoc scripts.** Use shell pipelines with standard
+  tools like `jq` for one-off data shaping. If automation needs a script, make
+  it a reusable Nushell script, expose it through the Nix package/dev shell, and
+  add tests for it.
 - When handling clippy errors about function lengths or cognitive complexity,
   don't split up the functions more than necessary to get below the limit.
   Instead ask the user if we can add a clippy allow for that error.
