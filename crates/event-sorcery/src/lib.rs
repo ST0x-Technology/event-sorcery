@@ -912,6 +912,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_rebuild_applies_events_exactly_once() {
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        struct Tally {
+            count: u64,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        enum TallyEvent {
+            Started,
+            Incremented,
+        }
+
+        impl DomainEvent for TallyEvent {
+            fn event_type(&self) -> String {
+                format!("{self:?}")
+            }
+
+            fn event_version(&self) -> String {
+                "1.0".to_string()
+            }
+        }
+
+        enum TallyCommand {
+            Start,
+            Increment,
+        }
+
+        #[async_trait]
+        impl EventSourced for Tally {
+            type Id = NumericId;
+            type Event = TallyEvent;
+            type Command = TallyCommand;
+            type Error = WidgetError;
+            type Services = ();
+            type Materialized = Nil;
+
+            const AGGREGATE_TYPE: &'static str = "Tally";
+            const PROJECTION: Nil = Nil;
+            const SCHEMA_VERSION: u64 = 1;
+            const SNAPSHOT_SIZE: usize = 1;
+
+            fn originate(event: &TallyEvent) -> Option<Self> {
+                match event {
+                    TallyEvent::Started => Some(Self { count: 0 }),
+                    TallyEvent::Incremented => None,
+                }
+            }
+
+            fn evolve(entity: &Self, event: &TallyEvent) -> Result<Option<Self>, WidgetError> {
+                match event {
+                    TallyEvent::Started => Ok(None),
+                    TallyEvent::Incremented => Ok(Some(Self {
+                        count: entity.count + 1,
+                    })),
+                }
+            }
+
+            async fn initialize(
+                command: TallyCommand,
+                _services: &(),
+            ) -> Result<Vec<TallyEvent>, WidgetError> {
+                match command {
+                    TallyCommand::Start => Ok(vec![TallyEvent::Started]),
+                    TallyCommand::Increment => Ok(vec![TallyEvent::Incremented]),
+                }
+            }
+
+            async fn transition(
+                &self,
+                command: TallyCommand,
+                _services: &(),
+            ) -> Result<Vec<TallyEvent>, WidgetError> {
+                match command {
+                    TallyCommand::Start => Ok(vec![]),
+                    TallyCommand::Increment => Ok(vec![TallyEvent::Incremented]),
+                }
+            }
+        }
+
+        let pool = test_pool().await;
+        let store = testing::test_store::<Tally>(pool.clone(), ());
+
+        // SNAPSHOT_SIZE = 1 forces commit's snapshot rebuild
+        // (`update_snapshot_with_events`) after every command, exercising the
+        // re-apply path that requires `Lifecycle::handle` to leave `self` at
+        // its pre-command state. A counting entity makes double-application
+        // visible as a wrong count rather than a coincidentally-equal value.
+        store
+            .send(&NumericId(1), TallyCommand::Start)
+            .await
+            .unwrap();
+        store
+            .send(&NumericId(1), TallyCommand::Increment)
+            .await
+            .unwrap();
+        store
+            .send(&NumericId(1), TallyCommand::Increment)
+            .await
+            .unwrap();
+
+        let entity = load_entity::<Tally>(&pool, &NumericId(1)).await.unwrap();
+        let tally = entity.expect("tally should exist after three commands");
+        assert_eq!(tally.count, 2);
+
+        let payload: String = sqlx::query_scalar(
+            "SELECT payload FROM snapshots \
+             WHERE aggregate_type = 'Tally' AND aggregate_id = '1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let snapshot: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(snapshot, serde_json::json!({"Live": {"count": 2}}));
+    }
+
+    #[tokio::test]
     async fn retain_policy_does_not_compact_events() {
         #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
         struct RetainedWidget {

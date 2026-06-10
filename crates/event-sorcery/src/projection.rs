@@ -223,7 +223,7 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
     /// comparison query with no replay.
     pub async fn catch_up(&self) -> Result<(), ProjectionError<Entity>> {
         let (pool, table) = self.sqlite_backing()?;
-        let aggregate_type = <Lifecycle<Entity> as Aggregate>::aggregate_type();
+        let aggregate_type = <Lifecycle<Entity> as Aggregate>::TYPE;
 
         // Drive from events table (LEFT JOIN) so we also detect aggregates
         // with persisted events but no view row (crash before initial view write).
@@ -240,7 +240,7 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
              LEFT JOIN {table} v ON v.view_id = e.aggregate_id \
              WHERE v.version IS NULL OR e.max_seq > v.version"
             )))
-            .bind(&aggregate_type)
+            .bind(aggregate_type)
             .fetch_all(pool)
             .await?;
 
@@ -255,7 +255,7 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
             self.replay_missed_events(
                 pool,
                 table,
-                &aggregate_type,
+                aggregate_type,
                 aggregate_id,
                 view_version,
                 *max_seq,
@@ -703,7 +703,6 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl<View, Agg> ViewRepository<View, Agg> for InMemoryRepo<View, Agg>
     where
         View: cqrs_es::View<Agg> + Clone,
@@ -791,7 +790,6 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl<View, Agg> ViewRepository<View, Agg> for ConflictingRepo<View, Agg>
     where
         View: cqrs_es::View<Agg> + Clone,

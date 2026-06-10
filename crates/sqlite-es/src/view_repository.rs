@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use cqrs_es::persist::{PersistenceError, ViewContext, ViewRepository};
 use cqrs_es::{Aggregate, View};
 use sqlx::{AssertSqlSafe, Pool, Row, Sqlite};
@@ -92,7 +91,6 @@ where
     }
 }
 
-#[async_trait]
 impl<V, A> ViewRepository<V, A> for SqliteViewRepository<V, A>
 where
     V: View<A>,
@@ -199,6 +197,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use cqrs_es::event_sink::EventSink;
     use cqrs_es::{DomainEvent, EventEnvelope};
     use serde::{Deserialize, Serialize};
     use std::fmt::{self, Display};
@@ -239,23 +238,20 @@ mod tests {
 
     impl std::error::Error for TestError {}
 
-    #[async_trait]
     impl Aggregate for TestAggregate {
+        const TYPE: &'static str = "TestAggregate";
         type Command = ();
         type Event = TestEvent;
         type Error = TestError;
         type Services = ();
 
-        fn aggregate_type() -> String {
-            "TestAggregate".to_string()
-        }
-
         async fn handle(
-            &self,
+            &mut self,
             _command: Self::Command,
             _services: &Self::Services,
-        ) -> Result<Vec<Self::Event>, Self::Error> {
-            Ok(vec![])
+            _sink: &EventSink<Self>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
         }
 
         fn apply(&mut self, _event: Self::Event) {}

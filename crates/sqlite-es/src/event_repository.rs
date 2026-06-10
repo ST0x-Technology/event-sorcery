@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use cqrs_es::Aggregate;
 use cqrs_es::persist::{
     PersistedEventRepository, PersistenceError, ReplayStream, SerializedEvent, SerializedSnapshot,
@@ -53,7 +52,6 @@ pub struct SqliteEventRepository {
     stream_channel_size: usize,
 }
 
-#[async_trait]
 impl PersistedEventRepository for SqliteEventRepository {
     async fn get_events<A: Aggregate>(
         &self,
@@ -150,7 +148,7 @@ impl SqliteEventRepository {
     ) -> Result<Vec<SerializedEvent>, SqliteAggregateError> {
         let query = self.query_factory.select_events();
         let rows = sqlx::query(AssertSqlSafe(query))
-            .bind(A::aggregate_type())
+            .bind(A::TYPE)
             .bind(aggregate_id)
             .fetch_all(&self.pool)
             .await?;
@@ -167,7 +165,7 @@ impl SqliteEventRepository {
         let last_sequence_i64 = i64::try_from(last_sequence)?;
 
         let rows = sqlx::query(AssertSqlSafe(query))
-            .bind(A::aggregate_type())
+            .bind(A::TYPE)
             .bind(aggregate_id)
             .bind(last_sequence_i64)
             .fetch_all(&self.pool)
@@ -182,7 +180,7 @@ impl SqliteEventRepository {
     ) -> Result<Option<SerializedSnapshot>, SqliteAggregateError> {
         let query = self.query_factory.select_snapshot();
         let row = sqlx::query(AssertSqlSafe(query))
-            .bind(A::aggregate_type())
+            .bind(A::TYPE)
             .bind(aggregate_id)
             .fetch_optional(&self.pool)
             .await?;
@@ -237,7 +235,7 @@ impl SqliteEventRepository {
         let timestamp = chrono::Utc::now().to_rfc3339();
 
         sqlx::query(AssertSqlSafe(query))
-            .bind(A::aggregate_type())
+            .bind(A::TYPE)
             .bind(aggregate_id)
             .bind(last_sequence_i64)
             .bind(&aggregate)
@@ -256,21 +254,21 @@ impl SqliteEventRepository {
             Some(_) => self.query_factory.select_events(),
             None => self.query_factory.all_events(),
         };
-        let aggregate_type = A::aggregate_type();
+        let aggregate_type = A::TYPE;
         let aggregate_id = aggregate_id.map(String::from);
 
         tokio::spawn(async move {
             let rows = match &aggregate_id {
                 Some(id) => {
                     sqlx::query(AssertSqlSafe(query))
-                        .bind(&aggregate_type)
+                        .bind(aggregate_type)
                         .bind(id)
                         .fetch_all(&pool)
                         .await
                 }
                 None => {
                     sqlx::query(AssertSqlSafe(query))
-                        .bind(&aggregate_type)
+                        .bind(aggregate_type)
                         .fetch_all(&pool)
                         .await
                 }
@@ -350,11 +348,13 @@ fn is_optimistic_lock_error(err: &sqlx::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::testing::create_test_pool;
     use cqrs_es::DomainEvent;
+    use cqrs_es::event_sink::EventSink;
     use serde::{Deserialize, Serialize};
     use std::fmt::{self, Display};
+
+    use super::*;
+    use crate::testing::create_test_pool;
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
     struct TestAggregate {
@@ -391,23 +391,20 @@ mod tests {
 
     impl std::error::Error for TestError {}
 
-    #[async_trait]
     impl Aggregate for TestAggregate {
+        const TYPE: &'static str = "TestAggregate";
         type Command = ();
         type Event = TestEvent;
         type Error = TestError;
         type Services = ();
 
-        fn aggregate_type() -> String {
-            "TestAggregate".to_string()
-        }
-
         async fn handle(
-            &self,
+            &mut self,
             _command: Self::Command,
             _services: &Self::Services,
-        ) -> Result<Vec<Self::Event>, Self::Error> {
-            Ok(vec![])
+            _sink: &EventSink<Self>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
         }
 
         fn apply(&mut self, event: Self::Event) {
@@ -421,7 +418,7 @@ mod tests {
         let repo = SqliteEventRepository::new(pool);
 
         let event = SerializedEvent {
-            aggregate_type: TestAggregate::aggregate_type(),
+            aggregate_type: TestAggregate::TYPE.to_string(),
             aggregate_id: "test-123".to_string(),
             sequence: 1,
             event_type: "TestEvent".to_string(),
@@ -448,7 +445,7 @@ mod tests {
         let repo = SqliteEventRepository::new(pool);
 
         let event = SerializedEvent {
-            aggregate_type: TestAggregate::aggregate_type(),
+            aggregate_type: TestAggregate::TYPE.to_string(),
             aggregate_id: "test-456".to_string(),
             sequence: 1,
             event_type: "TestEvent".to_string(),
@@ -496,7 +493,7 @@ mod tests {
 
         let events = vec![
             SerializedEvent {
-                aggregate_type: TestAggregate::aggregate_type(),
+                aggregate_type: TestAggregate::TYPE.to_string(),
                 aggregate_id: "test-abc".to_string(),
                 sequence: 1,
                 event_type: "Event1".to_string(),
@@ -505,7 +502,7 @@ mod tests {
                 metadata: serde_json::json!({}),
             },
             SerializedEvent {
-                aggregate_type: TestAggregate::aggregate_type(),
+                aggregate_type: TestAggregate::TYPE.to_string(),
                 aggregate_id: "test-abc".to_string(),
                 sequence: 2,
                 event_type: "Event2".to_string(),
@@ -514,7 +511,7 @@ mod tests {
                 metadata: serde_json::json!({}),
             },
             SerializedEvent {
-                aggregate_type: TestAggregate::aggregate_type(),
+                aggregate_type: TestAggregate::TYPE.to_string(),
                 aggregate_id: "test-abc".to_string(),
                 sequence: 3,
                 event_type: "Event3".to_string(),
