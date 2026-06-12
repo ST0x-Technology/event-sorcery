@@ -111,30 +111,9 @@ impl SqliteEventRepository {
     ) -> Result<(), SqliteEventRepositoryError> {
         let mut tx = self.pool.begin().await?;
 
-        for event in events {
-            let sequence = i64::try_from(event.sequence)?;
-            let result = sqlx::query(
-                "INSERT INTO events \
-                 (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            )
-            .bind(&event.aggregate_type)
-            .bind(&event.aggregate_id)
-            .bind(sequence)
-            .bind(&event.event_type)
-            .bind(&event.event_version)
-            .bind(&event.payload)
-            .bind(&event.metadata)
-            .execute(&mut *tx)
-            .await;
-
-            if let Err(error) = result {
-                if is_optimistic_lock_error(&error) {
-                    return Err(SqliteEventRepositoryError::OptimisticLock);
-                }
-                return Err(SqliteEventRepositoryError::Sql(error));
-            }
-        }
+        sqlite_es::insert_serialized_events_batch(&mut tx, "events", events)
+            .await
+            .map_err(map_sqlite_aggregate_error)?;
 
         if let Some((aggregate_id, aggregate, snapshot_version)) = snapshot_update {
             let last_sequence = events
@@ -310,14 +289,24 @@ fn row_to_serialized_snapshot(
     })
 }
 
-fn is_optimistic_lock_error(error: &sqlx::Error) -> bool {
+fn map_sqlite_aggregate_error(
+    error: sqlite_es::SqliteAggregateError,
+) -> SqliteEventRepositoryError {
     match error {
-        sqlx::Error::Database(database_error) => {
-            database_error.is_unique_violation()
-                || database_error
-                    .message()
-                    .contains("UNIQUE constraint failed")
+        sqlite_es::SqliteAggregateError::OptimisticLock => {
+            SqliteEventRepositoryError::OptimisticLock
         }
-        _ => false,
+        sqlite_es::SqliteAggregateError::Connection(source) => {
+            SqliteEventRepositoryError::Sql(source)
+        }
+        sqlite_es::SqliteAggregateError::Deserialization(source) => {
+            SqliteEventRepositoryError::Json(source)
+        }
+        sqlite_es::SqliteAggregateError::TryFromInt(source) => {
+            SqliteEventRepositoryError::Integer(source)
+        }
+        sqlite_es::SqliteAggregateError::EmptySnapshotUpdate => {
+            SqliteEventRepositoryError::EmptySnapshotUpdate
+        }
     }
 }
