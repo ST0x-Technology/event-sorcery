@@ -11,6 +11,10 @@ impl SqlQueryFactory {
         }
     }
 
+    pub(crate) fn events_table(&self) -> &str {
+        &self.events_table
+    }
+
     pub(crate) fn select_events(&self) -> String {
         format!(
             "SELECT
@@ -24,21 +28,6 @@ impl SqlQueryFactory {
              FROM {}
              WHERE aggregate_type = ? AND aggregate_id = ?
              ORDER BY sequence",
-            self.events_table
-        )
-    }
-
-    pub(crate) fn insert_event(&self) -> String {
-        format!(
-            "INSERT INTO {} (
-                aggregate_type,
-                aggregate_id,
-                sequence,
-                event_type,
-                event_version,
-                payload,
-                metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)",
             self.events_table
         )
     }
@@ -159,12 +148,10 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_event_query() {
+    fn events_table_returns_configured_name() {
         let factory = SqlQueryFactory::new("events".to_string(), "snapshots".to_string());
-        let query = factory.insert_event();
 
-        assert!(query.contains("INSERT INTO events"));
-        assert!(query.contains("VALUES (?, ?, ?, ?, ?, ?, ?)"));
+        assert_eq!(factory.events_table(), "events");
     }
 
     #[test]

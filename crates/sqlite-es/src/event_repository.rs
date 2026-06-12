@@ -4,8 +4,7 @@ use cqrs_es::persist::{
 };
 use serde_json::Value;
 use sqlx::sqlite::SqliteRow;
-use sqlx::{AssertSqlSafe, Pool, Row, Sqlite};
-use std::sync::Arc;
+use sqlx::{AssertSqlSafe, Pool, Row, Sqlite, SqliteConnection};
 
 use crate::sql_query::SqlQueryFactory;
 
@@ -238,31 +237,7 @@ impl SqliteEventRepository {
         tx: &mut sqlx::Transaction<'_, Sqlite>,
         events: &[SerializedEvent],
     ) -> Result<(), SqliteAggregateError> {
-        let insert_query: Arc<str> = self.query_factory.insert_event().into();
-
-        for event in events {
-            let sequence_i64 = i64::try_from(event.sequence)?;
-
-            let result = sqlx::query(AssertSqlSafe(Arc::clone(&insert_query)))
-                .bind(&event.aggregate_type)
-                .bind(&event.aggregate_id)
-                .bind(sequence_i64)
-                .bind(&event.event_type)
-                .bind(&event.event_version)
-                .bind(&event.payload)
-                .bind(&event.metadata)
-                .execute(&mut **tx)
-                .await;
-
-            if let Err(e) = result {
-                if is_optimistic_lock_error(&e) {
-                    return Err(SqliteAggregateError::OptimisticLock);
-                }
-                return Err(SqliteAggregateError::Connection(e));
-            }
-        }
-
-        Ok(())
+        insert_serialized_events_batch(tx, self.query_factory.events_table(), events).await
     }
 
     #[cfg(test)]
@@ -419,6 +394,61 @@ fn row_to_serialized_snapshot(row: &SqliteRow) -> Result<SerializedSnapshot, Sql
         current_sequence,
         current_snapshot,
     })
+}
+
+/// Inserts serialized events in batched multi-row `INSERT` statements.
+///
+/// SQLite caps bind parameters at 999; with seven columns per row, each batch
+/// carries at most 142 events in one round trip.
+pub async fn insert_serialized_events_batch(
+    connection: &mut SqliteConnection,
+    events_table: &str,
+    events: &[SerializedEvent],
+) -> Result<(), SqliteAggregateError> {
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    const BINDS_PER_ROW: usize = 7;
+    const SQLITE_MAX_VARIABLE_NUMBER: usize = 999;
+    const MAX_ROWS_PER_BATCH: usize = SQLITE_MAX_VARIABLE_NUMBER / BINDS_PER_ROW;
+
+    let mut sequences = Vec::with_capacity(events.len().min(MAX_ROWS_PER_BATCH));
+    for chunk in events.chunks(MAX_ROWS_PER_BATCH) {
+        sequences.clear();
+        for event in chunk {
+            sequences.push(i64::try_from(event.sequence)?);
+        }
+
+        let mut query_builder = sqlx::QueryBuilder::new(format!(
+            "INSERT INTO {events_table} \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) "
+        ));
+
+        query_builder.push_values(
+            chunk.iter().zip(&sequences),
+            |mut row, (event, sequence)| {
+                row.push_bind(&event.aggregate_type)
+                    .push_bind(&event.aggregate_id)
+                    .push_bind(*sequence)
+                    .push_bind(&event.event_type)
+                    .push_bind(&event.event_version)
+                    .push_bind(&event.payload)
+                    .push_bind(&event.metadata);
+            },
+        );
+
+        let result = query_builder.build().execute(&mut *connection).await;
+
+        if let Err(error) = result {
+            if is_optimistic_lock_error(&error) {
+                return Err(SqliteAggregateError::OptimisticLock);
+            }
+            return Err(SqliteAggregateError::Connection(error));
+        }
+    }
+
+    Ok(())
 }
 
 fn is_optimistic_lock_error(err: &sqlx::Error) -> bool {
