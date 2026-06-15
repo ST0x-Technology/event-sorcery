@@ -145,7 +145,7 @@ pub fn test_store<Entity: EventSourced>(
     pool: sqlx::SqlitePool,
     services: Entity::Services,
 ) -> Store<Entity> {
-    let repo = SqliteEventRepository::new(pool.clone());
+    let repo = SqliteEventRepository::new(pool.clone(), Entity::COMPACTION_POLICY);
     let event_store =
         PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
             repo,
