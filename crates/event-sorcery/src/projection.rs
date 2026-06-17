@@ -79,17 +79,6 @@ pub enum ProjectionError<Entity: EventSourced> {
         aggregate_id: String,
         source: serde_json::Error,
     },
-    #[error(
-        "event sequence gap for aggregate '{aggregate_id}': \
-         expected {expected} events after version {view_version}, \
-         found {actual}"
-    )]
-    EventSequenceGap {
-        aggregate_id: String,
-        view_version: i64,
-        expected: i64,
-        actual: usize,
-    },
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
     #[error(transparent)]
@@ -345,20 +334,22 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
         .await?;
 
         let actual = missed_payloads.len();
-        // behind is always positive (SQL WHERE max_seq > version), safe to compare
+        // A contiguous per-aggregate sequence would yield exactly `behind`
+        // events. Not every event store guarantees that: some assign sequences
+        // from a counter shared across aggregates (so a single aggregate's
+        // sequences are sparse, never 1..N), and historical stores can carry
+        // pre-existing sequence holes from an earlier framework. The aggregate
+        // load path already tolerates this -- it replays whatever events exist
+        // in `sequence` order without asserting contiguity -- so catch-up does
+        // the same here. We still WARN on a mismatch so gaps stay observable,
+        // but we do not abort startup over them. `behind` is always positive
+        // (SQL WHERE max_seq > version), so the comparison is safe.
         if !usize::try_from(behind).is_ok_and(|expected| actual == expected) {
-            error!(
+            warn!(
                 target: "cqrs",
                 %view_id, %view_version, expected = %behind, %actual,
-                "Event sequence gap detected"
+                "Event sequence gap detected; replaying available events in sequence order"
             );
-
-            return Err(ProjectionError::EventSequenceGap {
-                aggregate_id: view_id.to_string(),
-                view_version,
-                expected: behind,
-                actual,
-            });
         }
 
         for (payload_json,) in &missed_payloads {
@@ -1221,30 +1212,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catch_up_detects_sequence_gap() {
+    async fn catch_up_tolerates_sequence_gap() {
         let pool = setup_catch_up_db().await;
 
-        // Insert events with a gap: seq 1 and seq 3 (missing seq 2)
+        // Insert events with a gap: seq 1 and seq 3 (missing seq 2). A stale
+        // view at version 1 expects 2 missed events (3 - 1) but only 1 exists.
+        // Catch-up must not abort: it replays the available events in sequence
+        // order and advances the view to max_seq.
         insert_event(&pool, "counter-1", 1, &CounterEvent::Created { initial: 0 }).await;
         insert_event(&pool, "counter-1", 3, &CounterEvent::Incremented).await;
 
-        // View at version 1 expects 2 missed events (3 - 1), but only 1 exists
         insert_stale_view(&pool, "counter-1", 1, &Counter { value: 0 }).await;
 
-        let projection = Projection::<Counter>::sqlite(pool);
+        let projection = Projection::<Counter>::sqlite(pool.clone());
 
-        let error = projection.catch_up().await.unwrap_err();
-        assert!(
-            matches!(
-                error,
-                ProjectionError::EventSequenceGap {
-                    expected: 2,
-                    actual: 1,
-                    ..
-                }
-            ),
-            "expected EventSequenceGap, got: {error:?}"
+        projection.catch_up().await.unwrap();
+
+        let result = projection.load(&"counter-1".to_string()).await.unwrap();
+        assert_eq!(result, Some(Counter { value: 1 }));
+
+        let (version,): (i64,) =
+            sqlx::query_as("SELECT version FROM counter_view WHERE view_id = 'counter-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            version, 3,
+            "view advances to max event sequence despite the gap"
         );
+    }
+
+    #[tokio::test]
+    async fn catch_up_tolerates_non_contiguous_global_sequencing() {
+        let pool = setup_catch_up_db().await;
+
+        // Some stores assign sequences from a counter shared across aggregates,
+        // so a single aggregate's sequences are sparse (never 1..N). With no
+        // view row yet, catch-up must build from scratch by replaying every
+        // event in sequence order regardless of the gaps between them.
+        insert_event(
+            &pool,
+            "counter-1",
+            24,
+            &CounterEvent::Created { initial: 0 },
+        )
+        .await;
+        insert_event(&pool, "counter-1", 4559, &CounterEvent::Incremented).await;
+        insert_event(&pool, "counter-1", 4560, &CounterEvent::Incremented).await;
+        insert_event(&pool, "counter-1", 4561, &CounterEvent::Incremented).await;
+
+        let projection = Projection::<Counter>::sqlite(pool.clone());
+
+        projection.catch_up().await.unwrap();
+
+        let result = projection.load(&"counter-1".to_string()).await.unwrap();
+        assert_eq!(result, Some(Counter { value: 3 }));
+
+        let (version,): (i64,) =
+            sqlx::query_as("SELECT version FROM counter_view WHERE view_id = 'counter-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(version, 4561);
     }
 
     #[tokio::test]
