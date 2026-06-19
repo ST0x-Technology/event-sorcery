@@ -71,9 +71,12 @@ Two crates, no application binaries:
   and the `ViewBackend` GAT.
 
 The canonical SQLite schema for the event/snapshot tables lives at
-`migrations/20251016210348_init.sql` at the workspace root. Tests apply it
-in-memory via `sqlite_es::testing::create_test_pool()`. Consumers apply the same
-migration in their application database.
+`crates/sqlite-es/migrations/20251016210348_init.sql`, inside the `sqlite-es`
+crate that owns the event/view repository. Keeping it in-crate (rather than at
+the workspace root) means `sqlx::migrate!` embeds it from a path that survives
+`cargo package`/vendoring, so downstream Nix/crane builds compile offline. Tests
+apply it in-memory via `sqlite_es::testing::create_test_pool()`. Consumers apply
+the same migration in their application database.
 
 ## Components
 

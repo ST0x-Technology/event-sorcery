@@ -7,6 +7,6 @@ use sqlx::{Pool, Sqlite};
 /// Returns an error if the database connection fails or migrations cannot be applied
 pub async fn create_test_pool() -> Result<Pool<Sqlite>, sqlx::Error> {
     let pool = Pool::<Sqlite>::connect(":memory:").await?;
-    sqlx::migrate!("../../migrations").run(&pool).await?;
+    sqlx::migrate!("./migrations").run(&pool).await?;
     Ok(pool)
 }

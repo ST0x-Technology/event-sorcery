@@ -328,7 +328,10 @@ mod tests {
     #[tokio::test]
     async fn single_entity_wiring() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("../sqlite-es/migrations")
+            .run(&pool)
+            .await
+            .unwrap();
 
         let _store = StoreBuilder::<AggregateA>::new(pool.clone())
             .with(Arc::new(SingleEntityReactor))
@@ -340,7 +343,10 @@ mod tests {
     #[tokio::test]
     async fn multi_entity_wiring() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("../sqlite-es/migrations")
+            .run(&pool)
+            .await
+            .unwrap();
 
         let multi = Arc::new(MultiEntityReactor);
         let single = Arc::new(SingleEntityReactor);
