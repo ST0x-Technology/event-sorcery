@@ -112,7 +112,14 @@ use std::str::FromStr;
 pub use dependency::Cons;
 pub use dependency::Nil;
 pub use dependency::{Dependent, EntityList, Fold, HasEntity, OneOf};
-pub use job::{Job, Label};
+#[cfg(any(test, feature = "test-support"))]
+pub use job::FailureInjector;
+#[doc(hidden)]
+pub use job::{
+    ExponentialBackoff, FAIL_STOP_RECOVERY_TIMEOUT, RETRY_BACKOFF, Storage, on_terminal_failure,
+    work,
+};
+pub use job::{Job, JobBackend, JobError, Label};
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
 pub use projection::{Column, Projection, ProjectionError, Table};
