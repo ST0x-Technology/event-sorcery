@@ -19,6 +19,7 @@ use tracing::{error, warn};
 
 use crate::EventSourced;
 use crate::dependency::HasEntity;
+use crate::job::JobQueue;
 use crate::reactor::Reactor;
 
 /// Adapter that bridges [`EventSourced`] to cqrs-es `Aggregate`.
@@ -135,19 +136,25 @@ where
     type Command = Entity::Command;
     type Event = Entity::Event;
     type Error = LifecycleError<Entity>;
-    type Services = Entity::Services;
+    // Handlers receive a typed `JobQueue`, not cqrs-es services, so the
+    // framework-level services are unit; `handle` builds the queue itself.
+    type Services = ();
 
     const TYPE: &'static str = Entity::AGGREGATE_TYPE;
 
     async fn handle(
         &mut self,
         command: Self::Command,
-        services: &Self::Services,
+        _services: &Self::Services,
         sink: &EventSink<Self>,
     ) -> Result<(), Self::Error> {
+        // Handlers enqueue side-effect jobs onto this typed queue; the queue
+        // buffers into the per-command scope `Store::send` opened, and the event
+        // repository drains it in the same transaction that commits the events.
+        let jobs = JobQueue::<Entity::Jobs>::default();
         let events = match &*self {
-            Self::Uninitialized => Entity::initialize(command, services).await,
-            Self::Live(entity) => entity.transition(command, services).await,
+            Self::Uninitialized => Entity::initialize(command, &jobs).await,
+            Self::Live(entity) => entity.transition(command, &jobs).await,
             Self::Failed { error, .. } => {
                 warn!(
                     target: "cqrs",
@@ -398,7 +405,7 @@ mod tests {
         type Event = CounterEvent;
         type Command = CounterCommand;
         type Error = CounterError;
-        type Services = ();
+        type Jobs = Nil;
         type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "Counter";
@@ -425,7 +432,7 @@ mod tests {
 
         async fn initialize(
             command: CounterCommand,
-            _services: &(),
+            _jobs: &JobQueue<Self::Jobs>,
         ) -> Result<Vec<CounterEvent>, CounterError> {
             use CounterCommand::*;
             match command {
@@ -439,7 +446,7 @@ mod tests {
         async fn transition(
             &self,
             command: CounterCommand,
-            _services: &(),
+            _jobs: &JobQueue<Self::Jobs>,
         ) -> Result<Vec<CounterEvent>, CounterError> {
             match command {
                 CounterCommand::Create { .. } => Ok(vec![]),

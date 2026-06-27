@@ -210,6 +210,16 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
     ///
     /// On a normal startup (no crash), this is a cheap version
     /// comparison query with no replay.
+    ///
+    /// Only views that are *behind* on event sequence are revisited. A view
+    /// that is current (`version == max_seq`) but holds a payload in an old
+    /// wire format is not healed here -- that case is handled at startup by
+    /// `StoreBuilder::build`, which calls `rebuild_all` when the reconciler
+    /// reports a schema-version change. Changing a view's wire format therefore
+    /// requires bumping the entity's `SCHEMA_VERSION`; without it a
+    /// current-but-incompatible view stays unhealed and reads surface a
+    /// deserialization error until an event advances `max_seq` or an operator
+    /// calls `rebuild`/`rebuild_all`.
     pub async fn catch_up(&self) -> Result<(), ProjectionError<Entity>> {
         let (pool, table) = self.sqlite_backing()?;
         let aggregate_type = <Lifecycle<Entity> as Aggregate>::TYPE;
@@ -306,19 +316,33 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
         view_version: i64,
         max_seq: i64,
     ) -> Result<(), ProjectionError<Entity>> {
-        let behind = max_seq - view_version;
+        // A missing or incompatible stored payload resets the in-memory
+        // lifecycle to default, so replay must restart from the first event
+        // rather than the stale view version -- otherwise creation events at or
+        // below that version are skipped and the rebuilt view is wrong.
+        let (mut lifecycle, replay_from) = match self.repo.load_with_context(view_id).await {
+            Ok(Some((lifecycle, _context))) => (lifecycle, view_version),
+            Ok(None) => (Lifecycle::default(), 0),
+            Err(PersistenceError::DeserializationError(source)) => {
+                warn!(
+                    target: "cqrs",
+                    aggregate_type,
+                    view_id,
+                    %source,
+                    "Discarding incompatible view payload; replaying from events"
+                );
+                (Lifecycle::default(), 0)
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        let behind = max_seq - replay_from;
 
         info!(
             target: "cqrs",
-            %view_id, %view_version, %max_seq, %behind, %aggregate_type,
+            %view_id, %view_version, %replay_from, %max_seq, %behind, %aggregate_type,
             "View is behind, replaying missed events"
         );
-
-        let mut lifecycle = match self.repo.load_with_context(view_id).await? {
-            Some((lifecycle, _context)) => lifecycle,
-            // No view row exists -- start from scratch
-            None => Lifecycle::default(),
-        };
 
         let missed_payloads: Vec<(String,)> = sqlx::query_as(
             "SELECT payload FROM events \
@@ -329,7 +353,7 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
         )
         .bind(aggregate_type)
         .bind(view_id)
-        .bind(view_version)
+        .bind(replay_from)
         .fetch_all(pool)
         .await?;
 
@@ -347,7 +371,7 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
         if !usize::try_from(behind).is_ok_and(|expected| actual == expected) {
             warn!(
                 target: "cqrs",
-                %view_id, %view_version, expected = %behind, %actual,
+                %view_id, %replay_from, expected = %behind, %actual,
                 "Event sequence gap detected; replaying available events in sequence order"
             );
         }
@@ -628,6 +652,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     use super::*;
+    use crate::JobQueue;
     use crate::Nil;
     use crate::lifecycle::Never;
 
@@ -654,7 +679,7 @@ mod tests {
         type Event = TestEvent;
         type Command = ();
         type Error = Never;
-        type Services = ();
+        type Jobs = Nil;
         type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "TestEntity";
@@ -671,11 +696,18 @@ mod tests {
             Ok(Some(entity.clone()))
         }
 
-        async fn initialize(_command: (), _services: &()) -> Result<Vec<TestEvent>, Never> {
+        async fn initialize(
+            _command: (),
+            _jobs: &JobQueue<Self::Jobs>,
+        ) -> Result<Vec<TestEvent>, Never> {
             Ok(vec![])
         }
 
-        async fn transition(&self, _command: (), _services: &()) -> Result<Vec<TestEvent>, Never> {
+        async fn transition(
+            &self,
+            _command: (),
+            _jobs: &JobQueue<Self::Jobs>,
+        ) -> Result<Vec<TestEvent>, Never> {
             Ok(vec![])
         }
     }
@@ -1043,7 +1075,7 @@ mod tests {
         type Event = CounterEvent;
         type Command = ();
         type Error = Never;
-        type Services = ();
+        type Jobs = Nil;
         type Materialized = Table;
 
         const AGGREGATE_TYPE: &'static str = "Counter";
@@ -1066,14 +1098,17 @@ mod tests {
             }
         }
 
-        async fn initialize(_command: (), _services: &()) -> Result<Vec<CounterEvent>, Never> {
+        async fn initialize(
+            _command: (),
+            _jobs: &JobQueue<Self::Jobs>,
+        ) -> Result<Vec<CounterEvent>, Never> {
             Ok(vec![])
         }
 
         async fn transition(
             &self,
             _command: (),
-            _services: &(),
+            _jobs: &JobQueue<Self::Jobs>,
         ) -> Result<Vec<CounterEvent>, Never> {
             Ok(vec![])
         }
@@ -1321,6 +1356,47 @@ mod tests {
                 .unwrap();
 
         assert_eq!(version, 4561);
+    }
+
+    #[tokio::test]
+    async fn catch_up_recovers_from_incompatible_view_payload() {
+        let pool = setup_catch_up_db().await;
+
+        insert_event(&pool, "counter-1", 1, &CounterEvent::Created { initial: 0 }).await;
+        insert_event(&pool, "counter-1", 2, &CounterEvent::Incremented).await;
+        insert_event(&pool, "counter-1", 3, &CounterEvent::Incremented).await;
+
+        // Pre-Lifecycle wire format: bare entity variant instead of
+        // `{"Live": {...}}`.
+        sqlx::query("INSERT INTO counter_view (view_id, version, payload) VALUES (?1, ?2, ?3)")
+            .bind("counter-1")
+            .bind(1_i64)
+            .bind(r#"{"Completed": {"value": 0}}"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let projection = Projection::<Counter>::sqlite(pool.clone());
+        projection.catch_up().await.unwrap();
+
+        let payload: String =
+            sqlx::query_scalar("SELECT payload FROM counter_view WHERE view_id = 'counter-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let lifecycle: Lifecycle<Counter> = serde_json::from_str(&payload).unwrap();
+        assert!(matches!(lifecycle, Lifecycle::Live(Counter { value: 2 })));
+
+        // The version bookmark must advance to max_seq after recovery; a
+        // regression that left it at the stale version would re-replay every
+        // event on each subsequent catch_up and double-apply increments.
+        let version: i64 =
+            sqlx::query_scalar("SELECT version FROM counter_view WHERE view_id = 'counter-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(version, 3);
     }
 
     #[tokio::test]

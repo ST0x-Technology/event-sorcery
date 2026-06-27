@@ -2,7 +2,12 @@
 
 ## Status
 
-Accepted.
+Superseded by [ADR-0006](0006-cqrs-native-durable-jobs.md). The `JobStore`
+12-method backend trait described here is replaced by a single `EventBackend`
+(an event repository plus two job-shaped primitives, `claim` + `renew`); jobs
+became a first-class `EventSourced` aggregate whose ack rides cqrs-es `execute`
+rather than a worker-owned compare-and-swap. The motivation (one pluggable
+backend, atomic enqueue, durable lease-based claiming) carries over unchanged.
 
 ## Context
 
@@ -144,19 +149,25 @@ compiling and behaving identically.
 
 ## Scope boundary
 
-"Generic over any cqrs-es backend" currently means the **event store + durable
-jobs + `Nil`-entity wiring**. Out of scope (stays SQLite-bound, tracked
-follow-up):
+"Generic over any cqrs-es backend" currently means the **durable-job worker
+(fully agnostic over `JobStore`)** plus the **type-level core**: `Store`,
+`StoreBuilder`, and `EsCqrs` are generic over `B: EventBackend`, and the CQRS
+framework is constructed through `EventBackend::event_repo`, so the abstraction
+is genuinely consumed. The default `SqliteBackend` keeps every existing call
+site unchanged.
 
-- The `Materialized = Table` build path — its `build()` uses
-  `Projection::sqlite`, `Reconciler::new`, and `rebuild_all`/`catch_up`, all raw
-  `SqlitePool` SQL.
-- Materialized-view reconciliation in `projection.rs`.
-- The `lib.rs` maintenance/enumeration free functions (`compact_events`,
-  `vacuum`, `load_all_ids`, `send_command`, etc.) on `&SqlitePool`.
+What stays SQLite-bound (tracked follow-up): **`StoreBuilder::build()` itself**.
+Both the `Nil` and `Table` paths call `Reconciler::new(pool)` (schema-version
+reconciliation is raw SQLite SQL), and the `Table` path additionally uses
+`Projection::sqlite` + `rebuild_all`/`catch_up`. So `build()` is implemented
+only for `StoreBuilder<Entity, SqliteBackend, _>`; a non-SQLite backend can be
+constructed via `with_backend` but cannot `build()` until the `Reconciler` and
+view recovery are themselves lifted off `SqlitePool`. Also out of scope: the
+`lib.rs` maintenance/enumeration free functions (`compact_events`, `vacuum`,
+`load_all_ids`, etc.) on `&SqlitePool`.
 
-Generalizing those is a larger, separate effort (it requires lifting view
-recovery off `SqlitePool`) and is deferred to the Postgres PR.
+Generalizing those is a larger, separate effort (generifying `Reconciler` and
+view recovery over the backend) and is deferred to the Postgres PR.
 
 ## Consequences
 
@@ -199,9 +210,11 @@ recovery off `SqlitePool`) and is deferred to the Postgres PR.
    through `take_pending` + `flush_pending`.
 3. Generify the worker over `Q: JobStore` (default `SqliteBackend`); rewrite the
    7 tests' helpers to the trait, preserving every assertion.
-4. Generify the core over `B: EventBackend` (default `SqliteBackend`); `Nil`
-   build path generic, `Table` build path stays `SqliteBackend`.
-5. Add a mock `JobStore` in `#[cfg(test)]` so the generic bounds are exercised
-   without a real DB.
+4. Generify the core types (`Store`, `StoreBuilder`, `EsCqrs`) over
+   `B: EventBackend` (default `SqliteBackend`), constructing the CQRS framework
+   via `EventBackend::event_repo`. `build()` stays `SqliteBackend`-only (the
+   `Reconciler` is SQLite-bound); generifying it is a follow-up.
+5. (Follow-up) Generify `Reconciler` + view recovery so `build()` works over any
+   backend; add a mock `JobStore`/`EventBackend` exercising the generic bounds.
 6. (Separate future PR) `PostgresBackend` + the `migrations/{sqlite,postgres}/`
    split; generalize views/maintenance.

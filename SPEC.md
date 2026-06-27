@@ -43,9 +43,12 @@ a safer, more ergonomic public surface.
   invalidate stale snapshots/views without touching the database by hand.
 - **Don't reinvent persistence.** SQLite-backed event/view repositories live in
   their own crate (`sqlite-es`) so non-event-sorcery consumers can use them too.
-- **Stay backend-pluggable.** Projections take a `ViewBackend` parameter
-  (defaulting to SQLite) so tests can swap in in-memory storage and future
-  callers can add Postgres without touching the projection logic.
+- **Stay backend-pluggable.** Storage is abstracted on both sides. Projections
+  take a `ViewBackend` parameter; the event store, the `Store`, and the
+  durable-job worker take a single `EventBackend` parameter. All default to
+  SQLite, so existing call sites are untouched, while tests can swap in
+  alternatives and a future Postgres/MySQL backend plugs in by implementing the
+  trait — not by editing the worker or `Store` logic.
 
 ## Non-goals
 
@@ -151,6 +154,22 @@ A higher-kinded-type emulation that makes `Projection` generic over its storage
 backend without leaking `Lifecycle` into any public bound. The default backend
 is `SqliteViewBackend`. Custom backends plug in alternative storage (in-memory
 for tests, Postgres in the future).
+
+### `EventBackend`
+
+The write-side equivalent of `ViewBackend`: the single backend a consumer
+supplies for the event store, the `Store`, and the durable jobs. It is a cqrs-es
+event-repository factory plus exactly two job-shaped primitives cqrs-es cannot
+provide — a write-locked `claim` transaction (a generic envelope: the backend
+re-reads the row and enacts a crate-side decision, naming no job type) and a
+projection-only `renew`. Everything else durable jobs need — the claim/ack
+compare-and-swap, the fence, retry, dead-letter, the runnable poll — is ordinary
+cqrs-es: jobs are an `EventSourced` aggregate, the ack is a fenced command, and
+the `job_queue` is a generic projection. `Store`/`StoreBuilder`, the durable-job
+worker (`EventStoreBackend<Job, Backend>`), and `JobRuntime` are all generic
+over `EventBackend`. The default is `SqliteBackend`; a Postgres/MySQL backend
+implements the one trait (only dialect deltas differ). See
+[ADR-0006](adrs/0006-cqrs-native-durable-jobs.md).
 
 ### `StoreBuilder<Entity>`
 

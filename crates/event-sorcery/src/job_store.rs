@@ -1,214 +1,130 @@
-//! Backend-agnostic durable-job storage.
+//! The backend abstraction for durable jobs: [`EventBackend`].
 //!
-//! [`JobStore`] names the operations cqrs-es does not provide -- the `job_queue`
-//! projection, a compare-and-swap event append, a write-locked claim
-//! transaction, lease renewal, and the runnable poll. Each cqrs-es backend
-//! implements it once; [`crate::SqliteBackend`] is the default. This mirrors the
-//! [`crate::ViewBackend`] idiom (a backend trait whose concrete capabilities are
-//! associated types) but needs no GAT: the job aggregate is mono-typed and a
-//! pooled connection/transaction is owned and `'static`. See
-//! [ADR-0005](../../adrs/0005-backend-agnostic-event-store.md).
+//! A consumer supplies a single `EventBackend` -- a cqrs-es event repository plus
+//! two engine-shaped primitives ([`claim`](EventBackend::claim) and
+//! [`renew`](EventBackend::renew)) -- and gets the whole durable-jobs capability,
+//! built by event-sorcery's own cqrs/es machinery (the job is an
+//! [`crate::EventSourced`] aggregate, the ack is a command, the `job_queue` is a
+//! projection). The backend never names a job type: the claim *decision* (which
+//! event to append, the new projection payload, the strongly-typed claim result)
+//! is a crate-side closure, and the result rides through the backend as an opaque
+//! `Won` payload. The backend owns only the *transaction*. See
+//! [ADR-0006](../../adrs/0006-cqrs-native-durable-jobs.md).
 
 use std::future::Future;
-use std::ops::DerefMut;
 
-use cqrs_es::persist::SerializedEvent;
+use cqrs_es::persist::{PersistedEventRepository, SerializedEvent};
 
-/// Outcome of a compare-and-swap event append.
+use crate::CompactionPolicy;
+
+/// A complete event-sorcery backend.
 ///
-/// `Conflict` is the backend-neutral image of a uniqueness violation on
-/// `events (aggregate_type, aggregate_id, sequence)` -- the arbiter of every
-/// claim/ack race. It is an EXPECTED control-flow result on the `Ok` channel,
-/// not an error: a stream `Err` would stop the worker, so contention must ride
-/// `Ok` and force every call site to handle it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CasOutcome {
-    /// The event was appended at the requested sequence.
-    Committed,
-    /// Another writer already holds that sequence.
-    Conflict,
-}
+/// Beyond the cqrs-es event repository, it exposes exactly two job-shaped
+/// primitives that cqrs-es cannot: a write-locked compare-and-swap
+/// [`claim`](Self::claim) (whose runnable check must read the projection-only
+/// lease column, not a folded event lease), and a projection-only
+/// [`renew`](Self::renew). Everything else -- the claim/ack CAS, the fence, the
+/// retry, the dead-letter, the poll -- is cqrs-es `execute` + the generic
+/// projection. Used only as a generic bound, never `dyn`.
+pub trait EventBackend: Clone + Send + Sync + 'static {
+    /// The cqrs-es event repository. Its `persist` flushes buffered `Enqueued`
+    /// events AND seeds their `job_queue` rows in the same transaction that
+    /// commits the triggering events (the atomic-enqueue guarantee).
+    type EventRepo: PersistedEventRepository + Send + Sync + 'static;
 
-/// Backend-neutral severity of a store error, so the worker branches on a
-/// classification instead of decoding driver codes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Severity {
-    /// Busy/locked/dropped-connection/pool-timeout/serialization-failure.
-    /// Claim: skip the candidate; ack: retry within lease; poll: idle.
-    Transient,
-    /// Will not succeed on retry. Skip and log; never treated as success.
-    Fatal,
-}
-
-/// Result of the projection-only lease-renewal `UPDATE`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LeaseRenewal {
-    /// The update matched the claimed row: the lease is still held.
-    Held,
-    /// Zero rows matched: the ack already advanced/deleted the row, or a
-    /// re-claimer stole it. Stop renewing.
-    Lost,
-}
-
-/// Live status of a `job_queue` row. Terminal jobs are deleted, so the worker
-/// never sees done/dead here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QueueStatus {
-    /// Runnable at `run_at`.
-    Pending,
-    /// Held under a lease until `lease_until`.
-    Claimed,
-}
-
-/// One runnable-job nomination from the poll: a stale snapshot, re-validated
-/// inside the claim transaction.
-pub struct Candidate {
-    /// The job's id (its event-stream aggregate id).
-    pub job_id: String,
-    /// The job's last applied sequence, the expected-version for the claim CAS.
-    pub sequence: i64,
-}
-
-/// The `job_queue` head re-read inside the claim transaction (the guard against
-/// a stale poll snapshot). Times are Unix epoch milliseconds.
-pub struct QueueRow {
-    /// The job kind ([`crate::Job::KIND`]).
-    pub kind: String,
-    /// Whether the row is pending or claimed.
-    pub status: QueueStatus,
-    /// When a pending job becomes runnable.
-    pub run_at_ms: i64,
-    /// Lease expiry; `Some` iff `status == Claimed`.
-    pub lease_until_ms: Option<i64>,
-    /// Recorded-failure count.
-    pub attempt: u32,
-    /// Last applied event sequence.
-    pub sequence: i64,
-}
-
-/// The active-job row to upsert (a pending or claimed projection row). The crate
-/// folds the job state and builds this; the backend writes it in its dialect.
-pub struct JobRow {
-    /// The job kind.
-    pub kind: String,
-    /// Whether the row is pending or claimed.
-    pub status: QueueStatus,
-    /// When a pending job becomes runnable.
-    pub run_at_ms: i64,
-    /// Lease expiry; `Some` iff `status == Claimed`.
-    pub lease_until_ms: Option<i64>,
-    /// Recorded-failure count.
-    pub attempt: u32,
-    /// Last applied event sequence.
-    pub sequence: i64,
-}
-
-/// Per-backend storage for the durable-job queue.
-///
-/// Every method returns `impl Future + Send` (RPITIT, **not** `async fn`): the
-/// worker boxes the poll stream (`BoxStream<'static>`) and `tokio::spawn`s the
-/// lease renewal, both of which require `Send` futures. This mirrors
-/// [`cqrs_es::persist::PersistedEventRepository`] and is mandatory.
-pub trait JobStore: Clone + Send + Sync + 'static {
-    /// What SQL executes against (SQLite: `SqliteConnection`). No lifetime: that
-    /// is the move that avoids a lifetime GAT.
-    type Connection: Send;
-
-    /// Owned, write-locked transaction guard, consumed by [`commit`](Self::commit)
-    /// or [`rollback`](Self::rollback) on every path -- never dropped open (a
-    /// manual `BEGIN IMMEDIATE` is not undone by drop). The generic claim path
-    /// stays `?`-free between begin and the closer to honour this.
-    type Tx: DerefMut<Target = Self::Connection> + Send;
-
-    /// Owned, autocommit connection guard for the ack append + projection
-    /// (returned to the pool on drop). Deref to reach the connection.
-    type Conn: DerefMut<Target = Self::Connection> + Send;
-
-    /// Backend-native error for everything that is not a CAS conflict.
+    /// Backend-native error.
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Begin a write-locked transaction for a claim (SQLite: `BEGIN IMMEDIATE`).
-    fn begin_claim(&self) -> impl Future<Output = Result<Self::Tx, Self::Error>> + Send;
+    /// Builds the flush-aware event repository for `compaction_policy`.
+    fn event_repo(&self, compaction_policy: CompactionPolicy) -> Self::EventRepo;
 
-    /// Commit a claim transaction.
-    fn commit(&self, tx: Self::Tx) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    /// Applies the canonical events + snapshots + `job_queue` schema.
+    fn migrate(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Roll back a claim transaction (best-effort; errors are logged by the impl).
-    fn rollback(&self, tx: Self::Tx) -> impl Future<Output = ()> + Send;
-
-    /// Acquire a plain (autocommit) connection for the ack append + projection.
-    fn acquire(&self) -> impl Future<Output = Result<Self::Conn, Self::Error>> + Send;
-
-    /// Compare-and-swap append one serialized job event at `event.sequence`.
-    fn append_event(
+    /// Claims one job in a single write-locked transaction: re-read the row, hand
+    /// the RAW row to `decide`, and enact the decision (compare-and-swap-append
+    /// the event via the events UNIQUE; write the row). `decide` is crate-side
+    /// and owns all `JobState`/`JobEvent` knowledge; its strongly-typed success
+    /// payload `Won` rides back through the backend untouched -- so the backend
+    /// stays generic and names no job type.
+    fn claim<Decide, Won>(
         &self,
-        connection: &mut Self::Connection,
-        event: &SerializedEvent,
-    ) -> impl Future<Output = Result<CasOutcome, Self::Error>> + Send;
-
-    /// Re-read the `job_queue` head inside the claim transaction. The read MUST
-    /// serialize concurrent claimers of the same `job_id` (SQLite: the
-    /// `BEGIN IMMEDIATE` write lock; Postgres: `SELECT ... FOR UPDATE`).
-    fn read_head(
-        &self,
-        connection: &mut Self::Connection,
         job_id: &str,
-    ) -> impl Future<Output = Result<Option<QueueRow>, Self::Error>> + Send;
+        decide: Decide,
+    ) -> impl Future<Output = Result<ClaimOutcome<Won>, Self::Error>> + Send
+    where
+        Decide: FnOnce(Option<ClaimRead>) -> ClaimDecision<Won> + Send,
+        Won: Send;
 
-    /// Upsert the active-job row (claim/retry/enqueue).
-    fn upsert_row(
-        &self,
-        connection: &mut Self::Connection,
-        job_id: &str,
-        row: &JobRow,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Delete the row on a terminal (done/dead) outcome.
-    fn delete_row(
-        &self,
-        connection: &mut Self::Connection,
-        job_id: &str,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Poll runnable jobs (snapshot, no locks): pending-and-due or
-    /// claimed-with-expired-lease of `kind`, oldest `run_at` first.
-    fn fetch_candidates(
-        &self,
-        kind: &str,
-        now_ms: i64,
-        scan_limit: i64,
-    ) -> impl Future<Output = Result<Vec<Candidate>, Self::Error>> + Send;
-
-    /// Projection-only lease renewal keyed on the fixed claim sequence.
-    fn renew_lease(
+    /// Projection-only lease renewal: bump `lease_until` on the claimed row,
+    /// keyed on its `version` (== the claim sequence), without touching
+    /// `version`. Zero rows matched (the ack already advanced/changed the row, or
+    /// a re-claimer took it) -> [`LeaseRenewal::Lost`].
+    fn renew(
         &self,
         job_id: &str,
         claim_seq: i64,
         new_lease_until_ms: i64,
     ) -> impl Future<Output = Result<LeaseRenewal, Self::Error>> + Send;
-
-    /// Read the raw `Enqueued` event (sequence 1) for `job_id` as a JSON value,
-    /// so the TEXT-vs-jsonb storage difference stays inside the impl.
-    fn load_enqueued_event(
-        &self,
-        job_id: &str,
-    ) -> impl Future<Output = Result<serde_json::Value, Self::Error>> + Send;
-
-    /// Map a backend error to a neutral [`Severity`].
-    fn classify(error: &Self::Error) -> Severity;
 }
 
-/// apalis-facing worker error: a backend store error, or a job that cannot be
-/// decoded into its job type.
-#[derive(Debug, thiserror::Error)]
-pub enum BackendError<E> {
-    /// The job store backend failed.
-    #[error("job store backend error")]
-    Backend(#[source] E),
-    /// A claimed job's stored event could not be decoded into the job type.
-    #[error("failed to decode a claimed job")]
-    Decode(#[source] serde_json::Error),
-    /// A job event stream does not begin with an `Enqueued` event.
-    #[error("job event stream does not begin with Enqueued")]
-    OrphanEvent,
+/// The `job_queue` row as the claim transaction re-reads it, raw. The crate
+/// deserializes `payload` into `Lifecycle<JobState>` itself.
+pub struct ClaimRead {
+    /// The last applied event sequence (the view version).
+    pub version: i64,
+    /// The serialized `Lifecycle<JobState>` projection payload.
+    pub payload: String,
+    /// The projection-only lease column -- the value the runnable check reads.
+    pub lease_until_ms: Option<i64>,
+}
+
+/// What the crate's `plan_claim` decided after re-reading the row
+/// in-transaction. `Won` is the crate's strongly-typed success payload, opaque
+/// to the backend.
+pub enum ClaimDecision<Won> {
+    /// Win the claim: append `event` (a `Claimed`) at `event.sequence` (a
+    /// uniqueness violation -> [`ClaimOutcome::Contended`]); then write the row
+    /// `(version = event.sequence, payload, lease_until_ms)` ->
+    /// [`ClaimOutcome::Won`].
+    Claim {
+        /// The `Claimed` event to compare-and-swap-append.
+        event: SerializedEvent,
+        /// The new `Lifecycle<JobState>` projection payload.
+        payload: String,
+        /// The lease to write on the projection row.
+        lease_until_ms: i64,
+        /// The strongly-typed result handed back on success.
+        won: Won,
+    },
+    /// Dead-letter as abandoned (claim budget exhausted): append `event` (a
+    /// `Dead`) then write the terminal row -> [`ClaimOutcome::Abandoned`].
+    Abandon {
+        /// The `Dead` event to append.
+        event: SerializedEvent,
+        /// The new `Lifecycle<JobState>` (Dead) projection payload.
+        payload: String,
+    },
+    /// Gone, not runnable, or undecodable: roll back -> [`ClaimOutcome::Skip`].
+    Skip,
+}
+
+/// Outcome of [`EventBackend::claim`], carrying the crate's strongly-typed `Won`.
+pub enum ClaimOutcome<Won> {
+    /// Claimed; run it.
+    Won(Won),
+    /// Dead-lettered as abandoned; the slot is freed.
+    Abandoned,
+    /// A concurrent worker won the compare-and-swap.
+    Contended,
+    /// No longer runnable (terminated, re-claimed with a live lease, or gone).
+    Skip,
+}
+
+/// Outcome of [`EventBackend::renew`].
+pub enum LeaseRenewal {
+    /// The update matched the claimed row: the lease is still held.
+    Held,
+    /// Zero rows matched: the ack advanced the row, or a re-claimer took it.
+    Lost,
 }

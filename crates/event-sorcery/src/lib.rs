@@ -16,9 +16,17 @@
 //!   cmd)` takes `&str`, making it trivial to pass the wrong ID.
 //!   This has caused production bugs.
 //!
-//! - **No schema versioning**: When aggregate or view schemas
-//!   change, stale snapshots and views cause silent data
-//!   corruption. Manual database intervention is required.
+//! - **Manual schema versioning**: When aggregate or view schemas
+//!   change, a stale `SCHEMA_VERSION` leaves snapshots and views
+//!   in the old shape. Bumping it is the operator's responsibility;
+//!   [`EventSourced::SCHEMA_VERSION`] plus startup reconciliation
+//!   clears version-mismatched snapshots and rebuilds views. On load,
+//!   an incompatible snapshot for a [`CompactionPolicy::Retain`]
+//!   aggregate is ignored and the entity rebuilt from its
+//!   always-present event history; for a
+//!   [`CompactionPolicy::CompactAfterSnapshot`] aggregate it instead
+//!   surfaces an error, since its events may be gone and the snapshot
+//!   is the only durable state -- so state is never silently lost.
 //!
 //! - **Flat command handling**: A single `handle` method receives
 //!   all commands regardless of lifecycle state. Implementors
@@ -107,19 +115,16 @@ use std::str::FromStr;
 pub use dependency::Cons;
 pub use dependency::Nil;
 pub use dependency::{Dependent, EntityList, Fold, HasEntity, OneOf};
-pub use job::{Job, JobQueue, JobStoreError, Label};
-pub use job_backend::{Backoff, Clock, EventStoreBackend, JobWorkerConfig};
+pub use job::{Contains, Here, Job, JobList, JobQueue, JobStoreError, Label, There};
+pub use job_backend::{Backoff, Clock, EventStoreBackend, JobRuntime, JobWorkerConfig, run_job};
 pub use job_sqlite::{SqliteBackend, SqliteJobError};
-pub use job_store::{
-    BackendError, Candidate, CasOutcome, JobRow, JobStore, LeaseRenewal, QueueRow, QueueStatus,
-    Severity,
-};
+pub use job_store::{ClaimDecision, ClaimOutcome, ClaimRead, EventBackend, LeaseRenewal};
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
 pub use projection::{Column, Projection, ProjectionError, Table};
 pub use reactor::Reactor;
-pub use schema_registry::{ReconcileError, Reconciler, SchemaRegistry};
-use sqlite_event_repository::SqliteEventRepository;
+pub use schema_registry::{ReconcileError, Reconciler, SchemaReconciliation, SchemaRegistry};
+pub use sqlite_event_repository::SqliteEventRepository;
 #[cfg(any(test, feature = "test-support"))]
 pub use testing::{
     ReactorHarness, SpyReactor, TestHarness, TestResult, TestStore, replay, test_store,
@@ -127,8 +132,18 @@ pub use testing::{
 pub use view_backend::{SqliteViewBackend, ViewBackend};
 pub use wire::StoreBuilder;
 
-pub(crate) type SqliteCqrs<Entity> =
-    CqrsFramework<Lifecycle<Entity>, PersistedEventStore<SqliteEventRepository, Lifecycle<Entity>>>;
+pub(crate) type EsCqrs<Entity, Backend> = CqrsFramework<
+    Lifecycle<Entity>,
+    PersistedEventStore<<Backend as EventBackend>::EventRepo, Lifecycle<Entity>>,
+>;
+
+/// apalis items that [`build_supervised_worker!`] expands to, so consumers need
+/// not depend on `apalis-core` directly. Not part of the stable API.
+#[doc(hidden)]
+pub mod __worker {
+    pub use apalis_core::monitor::Monitor;
+    pub use apalis_core::worker::builder::WorkerBuilder;
+}
 
 /// Whether old events may be deleted after they are captured in a snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,9 +174,11 @@ pub enum CompactionPolicy {
 /// - `Error`: Domain-specific errors from command handling or
 ///   event application (e.g., arithmetic overflow). For
 ///   entities with infallible operations, use [`Never`].
-/// - `Services`: External dependencies injected into command
-///   handlers (e.g., `Arc<dyn OrderPlacer>`). Use `()` when
-///   no services are needed.
+/// - `Jobs`: Type-level list of the [`Job`] types this entity's
+///   handlers may enqueue (`jobs![SendEmail, ChargeCard]`, or
+///   [`Nil`] for none). Handlers receive a [`JobQueue<Self::Jobs>`](JobQueue)
+///   and can only push declared jobs -- side effects run as durable
+///   jobs flushed in the same transaction that commits the events.
 ///
 /// # Constants
 ///
@@ -212,9 +229,15 @@ pub trait EventSourced:
     /// Domain error type returned by command handlers and event
     /// application.
     type Error: DomainError;
-    /// External dependencies injected into command handlers (e.g.
-    /// API clients, order placers).
-    type Services: Send + Sync;
+    /// Type-level list of the [`Job`] types this entity's command
+    /// handlers may enqueue.
+    ///
+    /// Write it with the [`jobs!`] macro (`jobs![SendEmail, ChargeCard]`),
+    /// or [`Nil`] for an entity that dispatches no jobs. Handlers receive a
+    /// [`JobQueue<Self::Jobs>`](JobQueue) and can only push jobs declared
+    /// here -- enqueuing an undeclared job is a compile error. The framework
+    /// flushes pushed jobs in the same transaction that commits the events.
+    type Jobs: JobList;
     /// Whether this entity has a materialized view.
     ///
     /// Set to `Table` with `PROJECTION = Table("view_name")` for
@@ -269,21 +292,22 @@ pub trait EventSourced:
     /// Handle a command when the entity doesn't exist yet.
     ///
     /// No `&self` -- impossible to accidentally reference
-    /// existing state during creation.
+    /// existing state during creation. Enqueue side effects via `jobs`.
     async fn initialize(
         command: Self::Command,
-        services: &Self::Services,
+        jobs: &JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error>;
 
     /// Handle a command against existing state.
     ///
     /// `&self` is the domain type directly, not `Lifecycle`.
     /// The handler only deals with live state; lifecycle routing
-    /// is handled by the blanket `Aggregate` impl.
+    /// is handled by the blanket `Aggregate` impl. Enqueue side effects via
+    /// `jobs`; the handler stays pure `(state, command) -> events` + enqueues.
     async fn transition(
         &self,
         command: Self::Command,
-        services: &Self::Services,
+        jobs: &JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error>;
 }
 
@@ -309,20 +333,22 @@ pub trait EventSourced:
 /// startup. The builder handles CQRS framework construction,
 /// query wiring, and schema reconciliation, returning a
 /// ready-to-use `Store`.
-pub struct Store<Entity: EventSourced> {
-    cqrs: SqliteCqrs<Entity>,
-    event_store: PersistedEventStore<SqliteEventRepository, Lifecycle<Entity>>,
+pub struct Store<Entity: EventSourced, Backend: EventBackend = SqliteBackend> {
+    cqrs: EsCqrs<Entity, Backend>,
+    event_store: PersistedEventStore<Backend::EventRepo, Lifecycle<Entity>>,
 }
 
-impl<Entity: EventSourced> Store<Entity> {
-    /// Wrap an existing `SqliteCqrs` framework.
+impl<Entity: EventSourced, Backend: EventBackend> Store<Entity, Backend> {
+    /// Wrap an existing CQRS framework built over `backend`.
     ///
     /// Prefer using `StoreBuilder::build()` which handles wiring
     /// and reconciliation. This constructor exists for cases
     /// where direct construction is needed (e.g., tests).
-    pub(crate) fn new(cqrs: SqliteCqrs<Entity>, pool: SqlitePool) -> Self {
-        let repo = SqliteEventRepository::new(pool);
-        let event_store = PersistedEventStore::new_snapshot_store(repo, Entity::SNAPSHOT_SIZE);
+    pub(crate) fn new(cqrs: EsCqrs<Entity, Backend>, backend: &Backend) -> Self {
+        let event_store = PersistedEventStore::new_snapshot_store(
+            backend.event_repo(Entity::COMPACTION_POLICY),
+            Entity::SNAPSHOT_SIZE,
+        );
         Self { cqrs, event_store }
     }
 
@@ -338,7 +364,9 @@ impl<Entity: EventSourced> Store<Entity> {
         id: &Entity::Id,
         command: Entity::Command,
     ) -> Result<(), SendError<Entity>> {
-        self.cqrs.execute(&id.to_string(), command).await
+        // Open a pending-job scope so any `JobQueue::push` the handler makes is
+        // drained by the repository's flush in the same commit transaction.
+        job::with_pending_scope(self.cqrs.execute(&id.to_string(), command)).await
     }
 
     /// Load an entity's current state directly from the event store.
@@ -355,7 +383,10 @@ impl<Entity: EventSourced> Store<Entity> {
 
         Ok(context.aggregate.into_result()?)
     }
+}
 
+/// SQLite-specific [`Store`] helpers.
+impl<Entity: EventSourced> Store<Entity, SqliteBackend> {
     /// Reconstruct an entity's state from events without needing
     /// a full `Store` (no services or CQRS framework required).
     ///
@@ -366,7 +397,7 @@ impl<Entity: EventSourced> Store<Entity> {
         pool: SqlitePool,
         id: &Entity::Id,
     ) -> Result<Option<Entity>, SendError<Entity>> {
-        let repo = SqliteEventRepository::new(pool);
+        let repo = SqliteEventRepository::new(pool, Entity::COMPACTION_POLICY);
         let event_store =
             PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
                 repo,
@@ -423,7 +454,7 @@ pub async fn load_entity<Entity: EventSourced>(
     pool: &SqlitePool,
     id: &Entity::Id,
 ) -> Result<Option<Entity>, SendError<Entity>> {
-    let repo = SqliteEventRepository::new(pool.clone());
+    let repo = SqliteEventRepository::new(pool.clone(), Entity::COMPACTION_POLICY);
     let event_store =
         PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
             repo,
@@ -439,29 +470,25 @@ pub async fn load_entity<Entity: EventSourced>(
 /// [`Store`].
 ///
 /// Creates a temporary CQRS framework with no query processors,
-/// executes the command, and discards the framework. Useful in CLI
-/// contexts where you need to send a command but don't have (or need)
-/// a full server-lifetime Store.
-///
-/// The caller must provide `services` matching the aggregate's
-/// `Services` type. For commands that never invoke services (e.g.,
-/// failure commands), a panicking stub is safe.
+/// executes the command (inside a pending-job scope, so any jobs the
+/// handler enqueues flush with the events), and discards the framework.
+/// Useful in CLI contexts where you need to send a command but don't have
+/// (or need) a full server-lifetime Store.
 pub async fn send_command<Entity: EventSourced>(
     pool: &SqlitePool,
     id: &Entity::Id,
     command: Entity::Command,
-    services: Entity::Services,
 ) -> Result<(), SendError<Entity>> {
-    let repo = SqliteEventRepository::new(pool.clone());
+    let repo = SqliteEventRepository::new(pool.clone(), Entity::COMPACTION_POLICY);
     let store = PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
         repo,
         Entity::SNAPSHOT_SIZE,
     );
 
     #[allow(clippy::disallowed_methods)]
-    let cqrs = CqrsFramework::new(store, vec![], services);
+    let cqrs = CqrsFramework::new(store, vec![], ());
 
-    cqrs.execute(&id.to_string(), command).await
+    job::with_pending_scope(cqrs.execute(&id.to_string(), command)).await
 }
 
 /// Delete compactable events that are already represented by snapshots.
@@ -759,7 +786,7 @@ mod tests {
         type Event = WidgetEvent;
         type Command = WidgetCommand;
         type Error = WidgetError;
-        type Services = ();
+        type Jobs = Nil;
         type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "Widget";
@@ -784,7 +811,7 @@ mod tests {
 
         async fn initialize(
             command: WidgetCommand,
-            _services: &(),
+            _jobs: &JobQueue<Self::Jobs>,
         ) -> Result<Vec<WidgetEvent>, WidgetError> {
             match command {
                 WidgetCommand::Create { name } => Ok(vec![WidgetEvent::Created { name }]),
@@ -795,7 +822,7 @@ mod tests {
         async fn transition(
             &self,
             command: WidgetCommand,
-            _services: &(),
+            _jobs: &JobQueue<Self::Jobs>,
         ) -> Result<Vec<WidgetEvent>, WidgetError> {
             match command {
                 WidgetCommand::Create { .. } => Ok(vec![]),
@@ -827,7 +854,7 @@ mod tests {
     #[tokio::test]
     async fn load_entity_replays_events_into_entity() {
         let pool = test_pool().await;
-        let store = testing::test_store::<Widget>(pool.clone(), ());
+        let store = testing::test_store::<Widget>(pool.clone());
 
         store
             .send(
@@ -848,7 +875,7 @@ mod tests {
     #[tokio::test]
     async fn load_entity_uses_snapshot_after_events_are_compacted() {
         let pool = test_pool().await;
-        let store = testing::test_store::<Widget>(pool.clone(), ());
+        let store = testing::test_store::<Widget>(pool.clone());
 
         store
             .send(
@@ -890,7 +917,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_version_advances_across_loads() {
         let pool = test_pool().await;
-        let store = testing::test_store::<Widget>(pool.clone(), ());
+        let store = testing::test_store::<Widget>(pool.clone());
 
         store
             .send(
@@ -956,7 +983,7 @@ mod tests {
             type Event = TallyEvent;
             type Command = TallyCommand;
             type Error = WidgetError;
-            type Services = ();
+            type Jobs = Nil;
             type Materialized = Nil;
 
             const AGGREGATE_TYPE: &'static str = "Tally";
@@ -982,7 +1009,7 @@ mod tests {
 
             async fn initialize(
                 command: TallyCommand,
-                _services: &(),
+                _jobs: &JobQueue<Self::Jobs>,
             ) -> Result<Vec<TallyEvent>, WidgetError> {
                 match command {
                     TallyCommand::Start => Ok(vec![TallyEvent::Started]),
@@ -993,7 +1020,7 @@ mod tests {
             async fn transition(
                 &self,
                 command: TallyCommand,
-                _services: &(),
+                _jobs: &JobQueue<Self::Jobs>,
             ) -> Result<Vec<TallyEvent>, WidgetError> {
                 match command {
                     TallyCommand::Start => Ok(vec![]),
@@ -1003,7 +1030,7 @@ mod tests {
         }
 
         let pool = test_pool().await;
-        let store = testing::test_store::<Tally>(pool.clone(), ());
+        let store = testing::test_store::<Tally>(pool.clone());
 
         // SNAPSHOT_SIZE = 1 forces commit's snapshot rebuild
         // (`update_snapshot_with_events`) after every command, exercising the
@@ -1051,7 +1078,7 @@ mod tests {
             type Event = WidgetEvent;
             type Command = WidgetCommand;
             type Error = WidgetError;
-            type Services = ();
+            type Jobs = Nil;
             type Materialized = Nil;
 
             const AGGREGATE_TYPE: &'static str = "RetainedWidget";
@@ -1074,7 +1101,7 @@ mod tests {
 
             async fn initialize(
                 command: WidgetCommand,
-                _services: &(),
+                _jobs: &JobQueue<Self::Jobs>,
             ) -> Result<Vec<WidgetEvent>, WidgetError> {
                 match command {
                     WidgetCommand::Create { name } => Ok(vec![WidgetEvent::Created { name }]),
@@ -1085,7 +1112,7 @@ mod tests {
             async fn transition(
                 &self,
                 command: WidgetCommand,
-                _services: &(),
+                _jobs: &JobQueue<Self::Jobs>,
             ) -> Result<Vec<WidgetEvent>, WidgetError> {
                 match command {
                     WidgetCommand::Create { .. } => Ok(vec![]),
@@ -1095,7 +1122,7 @@ mod tests {
         }
 
         let pool = test_pool().await;
-        let store = testing::test_store::<RetainedWidget>(pool.clone(), ());
+        let store = testing::test_store::<RetainedWidget>(pool.clone());
         store
             .send(
                 &NumericId(7),
@@ -1142,7 +1169,7 @@ mod tests {
     #[tokio::test]
     async fn load_all_ids_includes_snapshot_only_aggregates() {
         let pool = test_pool().await;
-        let store = testing::test_store::<Widget>(pool.clone(), ());
+        let store = testing::test_store::<Widget>(pool.clone());
         store
             .send(
                 &NumericId(30),
@@ -1209,7 +1236,7 @@ mod tests {
     #[tokio::test]
     async fn count_aggregates_includes_snapshot_only_aggregates() {
         let pool = test_pool().await;
-        let store = testing::test_store::<Widget>(pool.clone(), ());
+        let store = testing::test_store::<Widget>(pool.clone());
         store
             .send(
                 &NumericId(30),

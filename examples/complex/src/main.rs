@@ -1,6 +1,7 @@
 //! Multi-entity `event-sorcery` example: an order/inventory domain with
 //! one reactor watching both event streams (alerts) and one reactor
-//! watching `Order` only (audit log).
+//! watching `Order` only (audit log). Placing an order also enqueues a
+//! durable `SendOrderConfirmation` job that a supervised worker runs.
 //!
 //! Run with: `cargo run --manifest-path examples/complex/Cargo.toml`
 //!
@@ -13,7 +14,10 @@ use std::sync::atomic::Ordering;
 
 use sqlx::SqlitePool;
 
-use event_sorcery::{StoreBuilder, compact_events, count_aggregates, load_entity};
+use event_sorcery::{
+    Clock, JobRuntime, JobWorkerConfig, StoreBuilder, build_supervised_worker, compact_events,
+    count_aggregates, load_entity,
+};
 
 mod audit_log;
 mod inventory;
@@ -22,7 +26,7 @@ mod stock_alert;
 
 use audit_log::AuditLog;
 use inventory::{Inventory, InventoryCommand, Sku};
-use order::{Order, OrderCommand, OrderId};
+use order::{Confirmer, Order, OrderCommand, OrderId, SendOrderConfirmation};
 use stock_alert::{LogNotifier, Notifier, StockAlert};
 
 const LOW_WATER: u32 = 2;
@@ -43,14 +47,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let orders = StoreBuilder::<Order>::new(pool.clone())
         .with(stock_alert.clone())
         .with(audit.clone())
-        .build(())
+        .build()
         .await?;
 
     // Inventory is Materialized = Table -- the auto-wired projection is
     // returned alongside the store, and our custom reactor runs next to it.
     let (inventory, inventory_projection) = StoreBuilder::<Inventory>::new(pool.clone())
         .with(stock_alert.clone())
-        .build(())
+        .build()
         .await?;
 
     let widgets = Sku("widgets".to_string());
@@ -140,6 +144,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // reads from the events table.
     let deleted = compact_events::<Order>(&pool).await?;
     println!("compact_events(Order)        = {deleted} events reclaimed");
+
+    // Durable jobs: placing each order enqueued a SendOrderConfirmation job
+    // atomically with its Placed event. Wire a supervised worker over the same
+    // database and run it briefly to drain the queue.
+    let runtime = JobRuntime::build(pool.clone()).await?;
+    let monitor = build_supervised_worker!(
+        runtime,
+        JobWorkerConfig::default(),
+        Clock::system(),
+        { SendOrderConfirmation => Confirmer }
+    );
+    println!("running the job worker briefly to drain the queue...");
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(750), monitor.run()).await;
 
     Ok(())
 }

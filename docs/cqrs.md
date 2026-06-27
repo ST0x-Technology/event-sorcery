@@ -75,7 +75,7 @@ impl EventSourced for MyEntity {
     type Event = MyEntityEvent;
     type Command = MyEntityCommand;
     type Error = Never;         // or a thiserror type
-    type Services = ();         // or Arc<dyn SomeService>
+    type Jobs = Nil;            // or jobs![SendEmail, ChargeCard]
     type Materialized = Table;  // Table for projected, Nil for non-projected
 
     const AGGREGATE_TYPE: &'static str = "MyEntity";
@@ -87,13 +87,19 @@ impl EventSourced for MyEntity {
     fn evolve(entity: &Self, event: &Self::Event)
         -> Result<Option<Self>, Self::Error> { /* ... */ }
 
-    // Command-side: process commands to produce events
-    async fn initialize(command: Self::Command, services: &Self::Services)
+    // Command-side: process commands to produce events (and enqueue jobs)
+    async fn initialize(command: Self::Command, jobs: &JobQueue<Self::Jobs>)
         -> Result<Vec<Self::Event>, Self::Error> { /* ... */ }
-    async fn transition(&self, command: Self::Command, services: &Self::Services)
+    async fn transition(&self, command: Self::Command, jobs: &JobQueue<Self::Jobs>)
         -> Result<Vec<Self::Event>, Self::Error> { /* ... */ }
 }
 ```
+
+`Jobs` is the type-level list of `Job`s the entity's handlers may enqueue --
+written with the `jobs!` macro (`jobs![SendEmail, ChargeCard]`), or `Nil` for
+none. Handlers get a typed `JobQueue<Self::Jobs>` and can only push declared
+jobs; pushed jobs flush in the same transaction as the events and run later in a
+supervised worker. See the **Jobs Pattern** and **Running Jobs** sections below.
 
 **Method naming conventions:**
 
@@ -118,7 +124,11 @@ impl EventSourced for MyEntity {
 | `Never`                | Error type for infallible entities           |
 | `DomainEvent`          | Trait for event serialization (from cqrs-es) |
 | `Table`                | Newtype for projection table name            |
-| `Nil`                  | Marker for entities without projections      |
+| `Nil`                  | Empty type-level list (no projection / jobs) |
+| `Job`                  | Trait for a durable, retryable side effect   |
+| `JobQueue<Jobs>`       | Handler handle for enqueuing declared jobs   |
+| `jobs!`                | Macro building the type-level `Job` list     |
+| `JobRuntime`           | Wires the worker-side durable-jobs runtime   |
 
 ## Sending Commands
 
@@ -143,7 +153,7 @@ aggregates directly:
 ```rust
 // Projection is returned by StoreBuilder::build() for Table entities
 let (store, projection) = StoreBuilder::<Position>::new(pool)
-    .build(())
+    .build()
     .await?;
 
 // Load by typed ID
@@ -176,7 +186,7 @@ For **projected entities** (`type Materialized = Table`), `build()` returns
 ```rust
 let (store, projection) = StoreBuilder::<Position>::new(pool)
     .with(rebalancing_trigger)  // wire a reactor
-    .build(())
+    .build()
     .await?;
 ```
 
@@ -185,7 +195,7 @@ For **non-projected entities** (`type Materialized = Nil`), `build()` returns
 
 ```rust
 let store = StoreBuilder::<OnChainTrade>::new(pool)
-    .build(())
+    .build()
     .await?;
 ```
 
@@ -243,32 +253,71 @@ receives `(error, id, event)` and can reprocess the event from the errored state
 
 Wire reactors via `Unwired` + `StoreBuilder::wire()`.
 
-## Services Pattern
+## Jobs Pattern
 
-Inject external dependencies into command handlers:
+Command handlers stay pure `(state, command) -> events`. Side effects (sending
+an email, charging a card, calling a chain) are enqueued as durable `Job`s
+rather than run inline: the handler pushes a job onto its typed `JobQueue`, and
+a supervised worker runs it later. A pushed job is flushed in the **same
+transaction** that commits the triggering events, so the job exists iff its
+events commit -- there is no crash window between a side effect and the event
+meant to record it.
+
+Declare the jobs an entity may enqueue with the `jobs!` macro:
 
 ```rust
-type Services = Arc<dyn OrderPlacer>;
+type Jobs = jobs![NotifyClosed];  // or Nil for an entity that enqueues nothing
+```
 
+Handlers receive a typed `JobQueue<Self::Jobs>` and enqueue with `push`. The
+queue compile-checks that the job is one of the declared `Jobs` -- pushing an
+undeclared job is a compile error:
+
+```rust
 async fn transition(
     &self,
     command: Self::Command,
-    services: &Self::Services,
+    jobs: &JobQueue<Self::Jobs>,
 ) -> Result<Vec<Self::Event>, Self::Error> {
-    let result = services.place_order(/* ... */).await?;
-    Ok(vec![MyEvent::OrderPlaced { /* ... */ }])
+    jobs.push(NotifyClosed { subject: self.subject.clone() });
+    Ok(vec![MyEvent::Closed { /* ... */ }])
 }
 ```
 
-Pass services when building the `Store`:
+Use `push_with_delay(job, duration)` to defer a job's first run. Inputs a side
+effect used to read from an injected service (e.g. the current time from a
+clock) now travel on the command instead, keeping handlers deterministic: the
+only non-determinism is what the command carries in.
+
+A `Job` is one self-contained side effect. Its `Input` associated type is the
+dependency bundle a worker injects into `perform` (e.g. an email client); `KIND`
+routes the job to the worker that runs it:
 
 ```rust
-let store = StoreBuilder::<MyEntity>::new(pool)
-    .build(services)
-    .await?;
+#[derive(Serialize, Deserialize)]
+struct NotifyClosed {
+    subject: String,
+}
+
+impl Job for NotifyClosed {
+    type Input = Notifier;  // injected by the worker
+    type Output = ();
+    type Error = std::convert::Infallible;
+
+    const WORKER_NAME: &'static str = "notify-closed";
+    const KIND: &'static str = "notify-closed";
+
+    fn label(&self) -> Label {
+        Label::new(format!("notify-closed:{}", self.subject))
+    }
+
+    async fn perform(&self, input: &Notifier) -> Result<(), Self::Error> {
+        input.email_customer(&self.subject).await  // the actual side effect
+    }
+}
 ```
 
-For entities that don't need services, use `type Services = ()`.
+See **Running Jobs** below for wiring the worker that drains the queue.
 
 ## Schema Versioning
 
@@ -323,7 +372,7 @@ assert_eq!(position.net, dec!(100));
 ```rust
 use event_sorcery::TestHarness;
 
-TestHarness::<Position>::with(())
+TestHarness::<Position>::new()
     .given(vec![PositionEvent::Initialized { /* ... */ }])
     .when(PositionCommand::AcknowledgeFill { /* ... */ })
     .await
@@ -335,7 +384,7 @@ TestHarness::<Position>::with(())
 ```rust
 use event_sorcery::TestStore;
 
-let store = TestStore::<MyEntity>::new(vec![], ());
+let store = TestStore::<MyEntity>::new();
 store.send(&id, MyCommand::Create { /* ... */ }).await.unwrap();
 
 let entity = store.load(&id).await.unwrap().unwrap();
@@ -347,7 +396,7 @@ assert_eq!(entity.field, expected);
 ```rust
 use event_sorcery::test_store;
 
-let store = test_store::<VaultRegistry>(pool.clone(), ());
+let store = test_store::<VaultRegistry>(pool.clone());
 store.send(&id, command).await.unwrap();
 ```
 
@@ -640,38 +689,36 @@ the same result.
 **Call replay at startup** to ensure views are up-to-date with any schema
 changes.
 
-## Services Pattern
+## Running Jobs
 
-Domain types can depend on external services (APIs, blockchain, etc.) via the
-`Services` associated type on `EventSourced`:
+Enqueuing a job (see **Jobs Pattern** above) only writes a pending row; a worker
+has to drain it. `JobRuntime::build(pool)` wires the durable-jobs runtime over
+the same database, and `build_supervised_worker!` registers one supervised
+worker per job type, mapping each `Job` to the `Input` its `perform` receives:
 
 ```rust
-#[async_trait]
-impl EventSourced for MyEntity {
-    type Services = Arc<dyn MyService>;  // or () if none needed
+let runtime = JobRuntime::build(pool.clone()).await?;
 
-    async fn transition(
-        &self,
-        command: Self::Command,
-        services: &Self::Services,
-    ) -> Result<Vec<Self::Event>, Self::Error> {
-        let result = services.do_something().await?;
-        Ok(vec![MyEvent::SomethingDone { result }])
+let monitor = build_supervised_worker!(
+    runtime,
+    JobWorkerConfig::default(),
+    Clock::system(),
+    {
+        NotifyClosed => Notifier,
+        ChargeCard   => billing_client.clone(),
     }
-    // ...
-}
+);
+
+monitor.run().await?;  // polls, claims, runs, and acks jobs
 ```
 
-Pass services when building the `Store`:
-
-```rust
-let services: Arc<dyn MyService> = Arc::new(MyServiceImpl::new());
-let store = StoreBuilder::<MyEntity>::new(pool)
-    .build(services)
-    .await?;
-```
-
-For entities that don't need services, use `type Services = ()`.
+Each worker polls the `job_queue` projection for runnable jobs of its `KIND`,
+claims one under a lease, runs `perform`, and durably records the outcome
+(success, retry with backoff, or dead-letter) -- all fenced so a job runs
+exactly once per successful claim. `JobWorkerConfig` tunes poll cadence,
+concurrency, lease duration, retry budget, and backoff; `Clock::system()` is the
+real wall clock (use `Clock::from_fn(..)` to drive lease and retry timing
+deterministically in tests).
 
 ## Testing Aggregates
 
@@ -683,7 +730,7 @@ use event_sorcery::testing::TestHarness;
 
 #[tokio::test]
 async fn test_my_command() {
-    TestHarness::<MyEntity>::with(())
+    TestHarness::<MyEntity>::new()
         .given(vec![MyEvent::Created { /* ... */ }])
         .when(MyCommand::Update { /* ... */ })
         .await

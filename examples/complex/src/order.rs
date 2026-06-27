@@ -1,5 +1,8 @@
 //! `Order` aggregate: a placed/filled/cancelled state machine, no
 //! materialized view. Reads go through `Store::load` (replay from events).
+//! Placing an order enqueues a durable [`SendOrderConfirmation`] job -- the
+//! handler stays a pure `(state, command) -> events` function and the side
+//! effect (confirming the order to the customer) runs in a supervised worker.
 //!
 //! Orders hit a short-lived terminal state (filled or cancelled), so the
 //! aggregate opts into `CompactionPolicy::CompactAfterSnapshot`. Once a
@@ -16,7 +19,7 @@ use async_trait::async_trait;
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
-use event_sorcery::{CompactionPolicy, EventSourced, Nil};
+use event_sorcery::{CompactionPolicy, EventSourced, Job, JobQueue, Label, Nil};
 
 use crate::inventory::Sku;
 
@@ -101,13 +104,51 @@ pub enum OrderError {
     NotOpen,
 }
 
+/// Durable side effect dispatched when an order is placed: confirm it to the
+/// customer.
+///
+/// The handler enqueues this on the typed [`JobQueue`]; a supervised worker runs
+/// it later, exactly once per placement, atomically with the `Placed` event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendOrderConfirmation {
+    pub item: Sku,
+    pub quantity: u32,
+}
+
+/// Dependency bundle the worker injects into [`SendOrderConfirmation::perform`].
+/// A real app would hold an email/SMS client; here it just prints the
+/// confirmation it would have sent.
+#[derive(Clone, Default)]
+pub struct Confirmer;
+
+impl Job for SendOrderConfirmation {
+    type Input = Confirmer;
+    type Output = ();
+    type Error = std::convert::Infallible;
+
+    const WORKER_NAME: &'static str = "send-order-confirmation";
+    const KIND: &'static str = "send-order-confirmation";
+
+    fn label(&self) -> Label {
+        Label::new(format!("send-order-confirmation:{}", self.item))
+    }
+
+    async fn perform(&self, _input: &Confirmer) -> Result<(), Self::Error> {
+        println!(
+            "  [worker] sent confirmation for {} x{}",
+            self.item, self.quantity
+        );
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl EventSourced for Order {
     type Id = OrderId;
     type Event = OrderEvent;
     type Command = OrderCommand;
     type Error = OrderError;
-    type Services = ();
+    type Jobs = event_sorcery::jobs![SendOrderConfirmation];
     type Materialized = Nil;
 
     const AGGREGATE_TYPE: &'static str = "Order";
@@ -143,10 +184,16 @@ impl EventSourced for Order {
 
     async fn initialize(
         command: OrderCommand,
-        _services: &(),
+        jobs: &JobQueue<Self::Jobs>,
     ) -> Result<Vec<OrderEvent>, OrderError> {
         match command {
             OrderCommand::Place { item, quantity } => {
+                // Enqueue the confirmation side effect; it flushes atomically
+                // with the Placed event and runs in a supervised worker.
+                jobs.push(SendOrderConfirmation {
+                    item: item.clone(),
+                    quantity,
+                });
                 Ok(vec![OrderEvent::Placed { item, quantity }])
             }
             OrderCommand::Fill | OrderCommand::Cancel => Err(OrderError::NotPlaced),
@@ -156,7 +203,7 @@ impl EventSourced for Order {
     async fn transition(
         &self,
         command: OrderCommand,
-        _services: &(),
+        _jobs: &JobQueue<Self::Jobs>,
     ) -> Result<Vec<OrderEvent>, OrderError> {
         match command {
             OrderCommand::Place { .. } => Err(OrderError::AlreadyPlaced),
@@ -184,7 +231,7 @@ mod tests {
 
     #[tokio::test]
     async fn fill_after_place_emits_filled_event() {
-        TestHarness::<Order>::with(())
+        TestHarness::<Order>::new()
             .given(vec![OrderEvent::Placed {
                 item: widgets(),
                 quantity: 3,
@@ -196,7 +243,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_filled_order_returns_not_open() {
-        let error = TestHarness::<Order>::with(())
+        let error = TestHarness::<Order>::new()
             .given(vec![
                 OrderEvent::Placed {
                     item: widgets(),
