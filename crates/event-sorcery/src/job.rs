@@ -88,7 +88,7 @@ impl std::fmt::Display for Label {
 
 /// Stable identifier for a job kind -- the [`Job::KIND`] -- recorded on the
 /// `Enqueued` event and used to route a job to the worker that runs it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct JobKind(String);
 
 impl JobKind {
@@ -107,11 +107,25 @@ impl JobKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WorkerId(String);
 
+impl WorkerId {
+    /// A process-run-unique worker id: the worker name plus a fresh ULID, so a
+    /// restarted process never reuses an old id (sound ownership and audit).
+    pub(crate) fn new(name: &str) -> Self {
+        Self(format!("{name}:{}", Ulid::new()))
+    }
+}
+
 /// Why a job was dead-lettered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum DeadReason {
     /// Every retry attempt failed.
     RetriesExhausted,
+    /// The stored payload no longer deserializes into the job type and the
+    /// rolling-deploy grace window has elapsed (genuine poison, not version skew).
+    Undecodable,
+    /// The job was claimed too many times without ever recording an outcome
+    /// (a crash or hang loop), exceeding the claim budget.
+    Abandoned,
 }
 
 /// A transition in a durable job's lifecycle, appended to the job's own event
@@ -252,7 +266,7 @@ const JOB_EVENT_VERSION: &str = "1.0";
 
 /// Error from the event-sourced job store's append + projection writes.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum JobStoreError {
+pub enum JobStoreError {
     /// A job event could not be JSON-encoded.
     #[error("failed to encode job event")]
     Encode(#[from] serde_json::Error),
@@ -284,7 +298,7 @@ impl JobEvent {
         }
     }
 
-    fn serialized(
+    pub(crate) fn serialized(
         &self,
         job_id: &str,
         sequence: usize,
@@ -305,7 +319,7 @@ impl JobEvent {
 /// `(aggregate_type, aggregate_id, sequence)` uniqueness makes this a
 /// compare-and-swap on `sequence`: a duplicate returns
 /// [`SqliteAggregateError::OptimisticLock`].
-async fn append_job_event(
+pub(crate) async fn append_job_event(
     connection: &mut SqliteConnection,
     job_id: &str,
     sequence: usize,
@@ -324,7 +338,7 @@ async fn append_job_event(
 /// Writes the active-job row for `state`, or removes it once the job reaches a
 /// terminal state. `job_queue` holds only runnable/claimed jobs; the event
 /// store keeps the full history.
-async fn apply_to_job_queue(
+pub(crate) async fn apply_to_job_queue(
     connection: &mut SqliteConnection,
     job_id: &str,
     state: &JobState,

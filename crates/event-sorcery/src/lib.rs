@@ -77,6 +77,9 @@
 
 pub(crate) mod dependency;
 mod job;
+mod job_backend;
+mod job_sqlite;
+mod job_store;
 mod lifecycle;
 mod projection;
 mod reactor;
@@ -104,7 +107,13 @@ use std::str::FromStr;
 pub use dependency::Cons;
 pub use dependency::Nil;
 pub use dependency::{Dependent, EntityList, Fold, HasEntity, OneOf};
-pub use job::{Job, JobQueue, Label};
+pub use job::{Job, JobQueue, JobStoreError, Label};
+pub use job_backend::{Backoff, Clock, EventStoreBackend, JobWorkerConfig};
+pub use job_sqlite::{SqliteBackend, SqliteJobError};
+pub use job_store::{
+    BackendError, Candidate, CasOutcome, JobRow, JobStore, LeaseRenewal, QueueRow, QueueStatus,
+    Severity,
+};
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
 pub use projection::{Column, Projection, ProjectionError, Table};

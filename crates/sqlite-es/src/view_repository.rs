@@ -195,6 +195,155 @@ where
     }
 }
 
+/// A predicate scan the load-by-id [`ViewRepository`] cannot express.
+///
+/// Returns the `view_id`s whose columns satisfy a predicate, ordered and
+/// limited -- so a projection can be polled for "all rows matching X" (e.g. the
+/// durable-job runnable poll) without the caller writing SQL.
+pub trait IndexedView<V, A>: ViewRepository<V, A>
+where
+    V: View<A>,
+    A: Aggregate,
+{
+    /// Returns the `view_id`s whose columns satisfy `predicate` (disjunctive
+    /// normal form: an OR of AND-groups), ordered and capped at `limit`.
+    fn find(
+        &self,
+        predicate: &Predicate,
+        order: Option<&Order>,
+        limit: i64,
+    ) -> impl std::future::Future<Output = Result<Vec<String>, PersistenceError>> + Send;
+}
+
+/// A predicate in disjunctive normal form: any of these AND-groups matching is a
+/// match. An empty `any_of` matches nothing.
+pub struct Predicate {
+    /// OR of conjunctions; each inner `Vec` is an AND of [`Term`]s.
+    pub any_of: Vec<Vec<Term>>,
+}
+
+/// One column comparison.
+pub struct Term {
+    /// The column name. MUST be a trusted, code-controlled identifier (a view
+    /// column), never user input -- it is interpolated, not bound.
+    pub column: String,
+    /// The comparison operator.
+    pub cmp: Cmp,
+    /// The bound value; `None` for [`Cmp::IsNull`]/[`Cmp::IsNotNull`].
+    pub value: Option<Value>,
+}
+
+/// Comparison operators for a [`Term`].
+pub enum Cmp {
+    /// `=`
+    Eq,
+    /// `<`
+    Lt,
+    /// `<=`
+    Le,
+    /// `>`
+    Gt,
+    /// `>=`
+    Ge,
+    /// `IS NULL` (no bound value)
+    IsNull,
+    /// `IS NOT NULL` (no bound value)
+    IsNotNull,
+}
+
+impl Cmp {
+    fn sql(&self) -> &'static str {
+        match self {
+            Self::Eq => "=",
+            Self::Lt => "<",
+            Self::Le => "<=",
+            Self::Gt => ">",
+            Self::Ge => ">=",
+            Self::IsNull => "IS NULL",
+            Self::IsNotNull => "IS NOT NULL",
+        }
+    }
+}
+
+/// A bound scalar value.
+pub enum Value {
+    /// An integer column value.
+    Int(i64),
+    /// A text column value.
+    Text(String),
+}
+
+/// Result ordering for [`IndexedView::find`].
+pub struct Order {
+    /// The column to order by (trusted identifier; interpolated).
+    pub column: String,
+    /// Ascending when true, descending otherwise.
+    pub ascending: bool,
+}
+
+impl<V, A> IndexedView<V, A> for SqliteViewRepository<V, A>
+where
+    V: View<A>,
+    A: Aggregate,
+{
+    async fn find(
+        &self,
+        predicate: &Predicate,
+        order: Option<&Order>,
+        limit: i64,
+    ) -> Result<Vec<String>, PersistenceError> {
+        if predicate.any_of.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut binds: Vec<&Value> = vec![];
+        let groups: Vec<String> = predicate
+            .any_of
+            .iter()
+            .map(|conjunction| {
+                let terms: Vec<String> = conjunction
+                    .iter()
+                    .map(|term| {
+                        term.value.as_ref().map_or_else(
+                            || format!("{} {}", term.column, term.cmp.sql()),
+                            |value| {
+                                binds.push(value);
+                                format!("{} {} ?", term.column, term.cmp.sql())
+                            },
+                        )
+                    })
+                    .collect();
+                format!("({})", terms.join(" AND "))
+            })
+            .collect();
+
+        let order_clause = order.map_or_else(String::new, |order| {
+            let direction = if order.ascending { "ASC" } else { "DESC" };
+            format!(" ORDER BY {} {direction}", order.column)
+        });
+        let sql = format!(
+            "SELECT view_id FROM {} WHERE {}{order_clause} LIMIT ?",
+            self.view_table,
+            groups.join(" OR "),
+        );
+
+        let mut query = sqlx::query_scalar::<_, String>(AssertSqlSafe(sql));
+        for value in binds {
+            query = match value {
+                Value::Int(int) => query.bind(int),
+                Value::Text(text) => query.bind(text),
+            };
+        }
+        query = query.bind(limit);
+
+        query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(SqliteViewError::Connection)
+            .map_err(PersistenceError::from)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use cqrs_es::event_sink::EventSink;
@@ -333,6 +482,74 @@ mod tests {
         let loaded_view = result.unwrap();
         assert_eq!(loaded_view.count, 42);
         assert_eq!(loaded_view.values, vec!["foo", "bar"]);
+    }
+
+    #[tokio::test]
+    async fn find_returns_view_ids_matching_a_dnf_predicate_ordered_and_limited() {
+        let pool = create_test_pool().await.unwrap();
+        sqlx::query(
+            "CREATE TABLE q (
+                view_id TEXT PRIMARY KEY,
+                version BIGINT NOT NULL,
+                payload JSON NOT NULL,
+                status TEXT    GENERATED ALWAYS AS (json_extract(payload, '$.status')) STORED,
+                run_at INTEGER GENERATED ALWAYS AS (json_extract(payload, '$.run_at')) STORED
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for (id, status, run_at) in [
+            ("a", "pending", 10),
+            ("b", "pending", 30),
+            ("c", "claimed", 20),
+            ("d", "done", 5),
+        ] {
+            let payload = serde_json::json!({ "status": status, "run_at": run_at }).to_string();
+            sqlx::query("INSERT INTO q (view_id, version, payload) VALUES (?, 1, ?)")
+                .bind(id)
+                .bind(&payload)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let repo = SqliteViewRepository::<TestView, TestAggregate>::new(pool, "q".to_string());
+
+        // (status='pending' AND run_at <= 20) OR (status='claimed'), oldest run_at first.
+        let predicate = Predicate {
+            any_of: vec![
+                vec![
+                    Term {
+                        column: "status".to_string(),
+                        cmp: Cmp::Eq,
+                        value: Some(Value::Text("pending".to_string())),
+                    },
+                    Term {
+                        column: "run_at".to_string(),
+                        cmp: Cmp::Le,
+                        value: Some(Value::Int(20)),
+                    },
+                ],
+                vec![Term {
+                    column: "status".to_string(),
+                    cmp: Cmp::Eq,
+                    value: Some(Value::Text("claimed".to_string())),
+                }],
+            ],
+        };
+        let order = Order {
+            column: "run_at".to_string(),
+            ascending: true,
+        };
+
+        let ids = repo.find(&predicate, Some(&order), 10).await.unwrap();
+        // a (pending, 10) then c (claimed, 20); b excluded (run_at 30 > 20), d excluded (done).
+        assert_eq!(ids, vec!["a".to_string(), "c".to_string()]);
+
+        let limited = repo.find(&predicate, Some(&order), 1).await.unwrap();
+        assert_eq!(limited, vec!["a".to_string()]);
     }
 
     #[tokio::test]

@@ -54,4 +54,6 @@ pub use cqrs_es::persist::ViewContext;
 pub use event_repository::{
     SqliteAggregateError, SqliteEventRepository, insert_serialized_events_batch,
 };
-pub use view_repository::{SqliteViewError, SqliteViewRepository};
+pub use view_repository::{
+    Cmp, IndexedView, Order, Predicate, SqliteViewError, SqliteViewRepository, Term, Value,
+};
