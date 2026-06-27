@@ -69,13 +69,12 @@ pub enum MyEntityCommand {
 ### 3. Implement EventSourced
 
 ```rust
-#[async_trait]
 impl EventSourced for MyEntity {
     type Id = MyEntityId;       // strongly-typed, Display + FromStr
     type Event = MyEntityEvent;
     type Command = MyEntityCommand;
     type Error = Never;         // or a thiserror type
-    type Services = ();         // or Arc<dyn SomeService>
+    type Jobs = Nil;            // or jobs![SendEmail, ChargeCard]
     type Materialized = Table;  // Table for projected, Nil for non-projected
 
     const AGGREGATE_TYPE: &'static str = "MyEntity";
@@ -87,10 +86,10 @@ impl EventSourced for MyEntity {
     fn evolve(entity: &Self, event: &Self::Event)
         -> Result<Option<Self>, Self::Error> { /* ... */ }
 
-    // Command-side: process commands to produce events
-    async fn initialize(command: Self::Command, services: &Self::Services)
+    // Command-side: sync, pure -- produce events, enqueue jobs
+    fn initialize(command: Self::Command, jobs: &mut JobQueue<Self::Jobs>)
         -> Result<Vec<Self::Event>, Self::Error> { /* ... */ }
-    async fn transition(&self, command: Self::Command, services: &Self::Services)
+    fn transition(&self, command: Self::Command, jobs: &mut JobQueue<Self::Jobs>)
         -> Result<Vec<Self::Event>, Self::Error> { /* ... */ }
 }
 ```
@@ -243,32 +242,73 @@ receives `(error, id, event)` and can reprocess the event from the errored state
 
 Wire reactors via `Unwired` + `StoreBuilder::wire()`.
 
-## Services Pattern
+## Jobs Pattern
 
-Inject external dependencies into command handlers:
+Handlers are sync and pure: they must not call external systems. Side-effecting
+work is enqueued as a durable job and runs in a separate worker. The enqueue
+commits in the same SQLite transaction as the events that triggered it, so a job
+exists iff its events do.
+
+The worker retries `perform` on failure and re-runs it after a crash, so jobs
+are delivered **at-least-once** -- `perform` must be idempotent. Carry any dedup
+key in the job payload or `Input`.
+
+Declare a job and the entity's job list:
 
 ```rust
-type Services = Arc<dyn OrderPlacer>;
+#[derive(Serialize, Deserialize)]
+struct PlaceOrder { order_id: OrderId, quantity: u32 }
 
-async fn transition(
-    &self,
-    command: Self::Command,
-    services: &Self::Services,
-) -> Result<Vec<Self::Event>, Self::Error> {
-    let result = services.place_order(/* ... */).await?;
-    Ok(vec![MyEvent::OrderPlaced { /* ... */ }])
+impl Job for PlaceOrder {
+    type Input = Arc<dyn OrderPlacer>;   // dependency bundle, injected by the worker
+    type Output = ();
+    type Error = PlaceOrderError;
+
+    const WORKER_NAME: &'static str = "place-order";
+    const KIND: &'static str = "PlaceOrder";
+
+    fn label(&self) -> Label { Label(format!("place-order:{}", self.order_id)) }
+
+    async fn perform(&self, placer: &Self::Input) -> Result<(), Self::Error> {
+        placer.place_order(self.order_id, self.quantity).await
+    }
 }
 ```
 
-Pass services when building the `Store`:
-
 ```rust
-let store = StoreBuilder::<MyEntity>::new(pool)
-    .build(services)
-    .await?;
+type Jobs = jobs![PlaceOrder];   // Nil if the entity dispatches none
 ```
 
-For entities that don't need services, use `type Services = ()`.
+Enqueue from a handler through the `jobs` handle. `push` is synchronous and
+buffers; the framework flushes the buffer at commit. `push::<J>` only compiles
+when `J` is in the entity's `Jobs` list (`HasJob<J>`):
+
+```rust
+fn transition(
+    &self,
+    command: Self::Command,
+    jobs: &mut JobQueue<Self::Jobs>,
+) -> Result<Vec<Self::Event>, Self::Error> {
+    jobs.push(PlaceOrder { order_id: self.id, quantity: command.quantity });
+    Ok(vec![MyEvent::OrderRequested { /* ... */ }])
+}
+```
+
+A queued row is never observable mid-handler -- the push is buffered, not a live
+`INSERT`. Reads a handler once did via `Services` (clock, config, idempotency
+keys) move into the `Command`; the caller supplies them at dispatch time.
+
+Run the jobs in a worker, wired with the shared retry/backoff/circuit-breaker
+policy. `Input` is the only context handed in:
+
+```rust
+let placer: Arc<dyn OrderPlacer> = Arc::new(/* ... */);
+let backend = JobBackend::<PlaceOrder>::new(&pool);
+
+Monitor::new().register(build_supervised_worker!(
+    ::<PlaceOrder>, 0, backend.into_storage(), placer, fail_stop, failure_notify,
+));
+```
 
 ## Schema Versioning
 
@@ -640,38 +680,31 @@ the same result.
 **Call replay at startup** to ensure views are up-to-date with any schema
 changes.
 
-## Services Pattern
+## Jobs and Crash Safety
 
-Domain types can depend on external services (APIs, blockchain, etc.) via the
-`Services` associated type on `EventSourced`:
+The reason handlers enqueue jobs instead of calling out directly: a job's
+enqueue and its triggering events commit in one SQLite transaction. There is no
+window where a side effect fires but no event records it, and none where an
+event commits but the follow-up work is lost.
 
 ```rust
-#[async_trait]
-impl EventSourced for MyEntity {
-    type Services = Arc<dyn MyService>;  // or () if none needed
-
-    async fn transition(
-        &self,
-        command: Self::Command,
-        services: &Self::Services,
-    ) -> Result<Vec<Self::Event>, Self::Error> {
-        let result = services.do_something().await?;
-        Ok(vec![MyEvent::SomethingDone { result }])
-    }
-    // ...
+fn transition(
+    &self,
+    command: Self::Command,
+    jobs: &mut JobQueue<Self::Jobs>,
+) -> Result<Vec<Self::Event>, Self::Error> {
+    jobs.push(SettlePayment { id: self.id });   // buffered, not yet persisted
+    Ok(vec![MyEvent::PaymentRequested { /* ... */ }])
 }
 ```
 
-Pass services when building the `Store`:
+`push` only buffers; the framework drains the buffer with a transaction-bound
+`INSERT` into the apalis `Jobs` table alongside the event write. On rollback,
+neither is visible. A worker (`build_supervised_worker!`) then polls the table
+and runs `Job::perform` with retries and a circuit breaker. See
+[Jobs Pattern](#jobs-pattern) for the full `Job` impl and worker wiring.
 
-```rust
-let services: Arc<dyn MyService> = Arc::new(MyServiceImpl::new());
-let store = StoreBuilder::<MyEntity>::new(pool)
-    .build(services)
-    .await?;
-```
-
-For entities that don't need services, use `type Services = ()`.
+For entities that dispatch no jobs, use `type Jobs = Nil`.
 
 ## Testing Aggregates
 
