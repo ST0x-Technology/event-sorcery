@@ -45,7 +45,7 @@ use crate::dependency::HasEntity;
 use crate::lifecycle::{Lifecycle, ReactorBridge};
 use crate::projection::{Projection, ProjectionError, Table};
 use crate::reactor::Reactor;
-use crate::schema_registry::{ReconcileError, Reconciler};
+use crate::schema_registry::{ReconcileError, Reconciler, SchemaReconciliation};
 use crate::sqlite_event_repository::SqliteEventRepository;
 use crate::{CompactionPolicy, EventSourced, SqliteCqrs, Store};
 
@@ -100,7 +100,7 @@ fn sqlite_snapshot_cqrs<Entity: EventSourced>(
     queries: Vec<Box<dyn Query<Lifecycle<Entity>>>>,
     services: Entity::Services,
 ) -> SqliteCqrs<Entity> {
-    let repo = SqliteEventRepository::new(pool);
+    let repo = SqliteEventRepository::new(pool, Entity::COMPACTION_POLICY);
     let store = PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
         repo,
         Entity::SNAPSHOT_SIZE,
@@ -134,23 +134,40 @@ where
             );
         }
 
-        Reconciler::new(self.pool.clone())
-            .reconcile::<Entity>()
-            .await?;
+        let reconciler = Reconciler::new(self.pool.clone());
+        let reconciliation = reconciler.reconcile::<Entity>().await?;
 
         let projection = Arc::new(Projection::sqlite(self.pool.clone()));
 
-        // Replay any events the view missed due to a crash between
-        // event persistence and view update. Runs before registering
-        // the projection as a reactor so no concurrent writes can
-        // interfere.
-        projection.catch_up().await.map_err(|error| match error {
+        // A schema version change can leave stored view payloads in an
+        // incompatible format. `catch_up` only revisits views that are behind
+        // on event sequence, so a view that is current but incompatible (the
+        // normal state after a view-schema change with no new events) would
+        // never be healed. On a detected schema change, rebuild every view
+        // from the event log; otherwise just replay any events the view missed
+        // due to a crash between event persistence and view update. Projected
+        // entities are guaranteed `CompactionPolicy::Retain` (asserted above),
+        // so the full history is always available to rebuild from. Either path
+        // runs before registering the projection as a reactor so no concurrent
+        // writes can interfere.
+        let recovery = match reconciliation {
+            SchemaReconciliation::Changed => projection.rebuild_all().await,
+            SchemaReconciliation::Unchanged => projection.catch_up().await,
+        };
+        recovery.map_err(|error| match error {
             ProjectionError::Sqlx(sqlx_error) => ReconcileError::from(sqlx_error),
             ProjectionError::Persistence(persistence_error) => {
                 ReconcileError::from(persistence_error)
             }
             other => ReconcileError::Persistence(PersistenceError::UnknownError(Box::new(other))),
         })?;
+
+        // Mark the schema version reconciled only after the snapshot clear and
+        // view recovery above have durably completed. A crash before this point
+        // leaves the version unadvanced, so the next startup re-runs the whole
+        // reconcile -- including rebuild_all -- instead of recording a version
+        // whose view rebuild never finished.
+        reconciler.record_version::<Entity>().await?;
 
         self.queries.push(Box::new(ReactorBridge {
             reactor: projection.clone(),
@@ -167,9 +184,12 @@ impl<Entity: EventSourced<Materialized = Nil>> StoreBuilder<Entity, Nil> {
         self,
         services: Entity::Services,
     ) -> Result<Arc<Store<Entity>>, ReconcileError> {
-        Reconciler::new(self.pool.clone())
-            .reconcile::<Entity>()
-            .await?;
+        // A non-projected entity has no views to rebuild, so the reconciliation
+        // outcome does not change recovery; reconcile still clears stale
+        // snapshots and record_version marks the version handled.
+        let reconciler = Reconciler::new(self.pool.clone());
+        let _ = reconciler.reconcile::<Entity>().await?;
+        reconciler.record_version::<Entity>().await?;
 
         let cqrs = sqlite_snapshot_cqrs(self.pool.clone(), self.queries, services);
         Ok(Arc::new(Store::new(cqrs, self.pool)))
@@ -185,7 +205,7 @@ mod tests {
     use super::*;
     use crate::dependency::EntityList;
     use crate::deps;
-    use crate::lifecycle::Never;
+    use crate::lifecycle::{Lifecycle, Never};
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
     struct AggregateA;
@@ -349,5 +369,200 @@ mod tests {
             .build(())
             .await
             .unwrap();
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+    struct Tally {
+        count: u64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    enum TallyEvent {
+        Bumped,
+    }
+
+    impl DomainEvent for TallyEvent {
+        fn event_type(&self) -> String {
+            "TallyEvent::Bumped".to_string()
+        }
+
+        fn event_version(&self) -> String {
+            "1.0".to_string()
+        }
+    }
+
+    #[async_trait]
+    impl EventSourced for Tally {
+        type Id = String;
+        type Event = TallyEvent;
+        type Command = ();
+        type Error = Never;
+        type Services = ();
+        type Materialized = Table;
+
+        const AGGREGATE_TYPE: &'static str = "Tally";
+        const PROJECTION: Table = Table("tally_view");
+        const SCHEMA_VERSION: u64 = 1;
+
+        fn originate(event: &TallyEvent) -> Option<Self> {
+            match event {
+                TallyEvent::Bumped => Some(Self { count: 1 }),
+            }
+        }
+
+        fn evolve(entity: &Self, event: &TallyEvent) -> Result<Option<Self>, Never> {
+            match event {
+                TallyEvent::Bumped => Ok(Some(Self {
+                    count: entity.count + 1,
+                })),
+            }
+        }
+
+        async fn initialize(_command: (), _services: &()) -> Result<Vec<TallyEvent>, Never> {
+            Ok(vec![])
+        }
+
+        async fn transition(&self, _command: (), _services: &()) -> Result<Vec<TallyEvent>, Never> {
+            Ok(vec![])
+        }
+    }
+
+    /// A schema-version change (here, the first build, when no stored version
+    /// exists) must rebuild views from the event log, healing a view that is
+    /// current on event sequence but holds an incompatible payload -- the case
+    /// `catch_up` alone never revisits because the view is not behind.
+    #[tokio::test]
+    async fn schema_change_rebuilds_incompatible_current_view() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+
+        sqlx::query(
+            "CREATE TABLE tally_view ( \
+                 view_id TEXT NOT NULL PRIMARY KEY, \
+                 version BIGINT NOT NULL, \
+                 payload TEXT NOT NULL \
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let payload = serde_json::to_string(&TallyEvent::Bumped).unwrap();
+        for sequence in 1..=3 {
+            sqlx::query(
+                "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, \
+                 event_version, payload, metadata) \
+                 VALUES ('Tally', 'tally-1', ?1, 'TallyEvent::Bumped', '1.0', ?2, '{}')",
+            )
+            .bind(sequence)
+            .bind(&payload)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // A view that is CURRENT (version == max_seq == 3) but holds an
+        // incompatible payload. `catch_up` would never revisit it.
+        sqlx::query("INSERT INTO tally_view (view_id, version, payload) VALUES ('tally-1', 3, ?1)")
+            .bind(r#"{"Completed": {"count": 0}}"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let (_store, _projection) = StoreBuilder::<Tally>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let healed: String =
+            sqlx::query_scalar("SELECT payload FROM tally_view WHERE view_id = 'tally-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let lifecycle: Lifecycle<Tally> = serde_json::from_str(&healed).unwrap();
+        assert!(matches!(lifecycle, Lifecycle::Live(Tally { count: 3 })));
+
+        let version: i64 =
+            sqlx::query_scalar("SELECT version FROM tally_view WHERE view_id = 'tally-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(version, 3);
+    }
+
+    /// A real version transition (a prior version is already recorded, then the
+    /// code's `SCHEMA_VERSION` differs) also rebuilds incompatible current
+    /// views. This distinguishes the genuine-mismatch trigger from the
+    /// first-registration trigger above: a regression that gated `rebuild_all`
+    /// on `stored_version.is_some()` would pass the test above but fail here.
+    #[tokio::test]
+    async fn schema_version_bump_rebuilds_incompatible_current_view() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+
+        sqlx::query(
+            "CREATE TABLE tally_view ( \
+                 view_id TEXT NOT NULL PRIMARY KEY, \
+                 version BIGINT NOT NULL, \
+                 payload TEXT NOT NULL \
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Seed a PRIOR recorded schema version (0) for Tally, so build() sees a
+        // genuine 0 -> 1 mismatch rather than a first registration.
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, \
+             event_version, payload, metadata) \
+             VALUES ('SchemaRegistry', 'schema', 1, 'SchemaRegistryEvent::VersionUpdated', '1.0', \
+             '{\"VersionUpdated\":{\"name\":\"Tally\",\"version\":0}}', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let payload = serde_json::to_string(&TallyEvent::Bumped).unwrap();
+        for sequence in 1..=3 {
+            sqlx::query(
+                "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, \
+                 event_version, payload, metadata) \
+                 VALUES ('Tally', 'tally-1', ?1, 'TallyEvent::Bumped', '1.0', ?2, '{}')",
+            )
+            .bind(sequence)
+            .bind(&payload)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        sqlx::query("INSERT INTO tally_view (view_id, version, payload) VALUES ('tally-1', 3, ?1)")
+            .bind(r#"{"Completed": {"count": 0}}"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let (_store, _projection) = StoreBuilder::<Tally>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let healed: String =
+            sqlx::query_scalar("SELECT payload FROM tally_view WHERE view_id = 'tally-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let lifecycle: Lifecycle<Tally> = serde_json::from_str(&healed).unwrap();
+        assert!(matches!(lifecycle, Lifecycle::Live(Tally { count: 3 })));
+
+        // The version bookmark must advance to max_seq; otherwise the next
+        // catch_up would re-replay every event and double-apply increments.
+        let version: i64 =
+            sqlx::query_scalar("SELECT version FROM tally_view WHERE view_id = 'tally-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(version, 3);
     }
 }
