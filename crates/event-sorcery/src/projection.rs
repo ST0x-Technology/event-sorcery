@@ -630,7 +630,6 @@ async fn validate_column<Entity: EventSourced>(
 
 #[cfg(test)]
 mod tests {
-    use async_trait::async_trait;
     use cqrs_es::DomainEvent;
     use cqrs_es::persist::{PersistenceError, ViewContext, ViewRepository};
     use serde::{Deserialize, Serialize};
@@ -639,6 +638,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     use super::*;
+    use crate::JobQueue;
     use crate::Nil;
     use crate::lifecycle::Never;
 
@@ -659,13 +659,12 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl EventSourced for TestEntity {
         type Id = String;
         type Event = TestEvent;
         type Command = ();
         type Error = Never;
-        type Services = ();
+        type Jobs = Nil;
         type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "TestEntity";
@@ -682,11 +681,18 @@ mod tests {
             Ok(Some(entity.clone()))
         }
 
-        async fn initialize(_command: (), _services: &()) -> Result<Vec<TestEvent>, Never> {
+        fn initialize(
+            _command: (),
+            _jobs: &mut JobQueue<Self::Jobs>,
+        ) -> Result<Vec<TestEvent>, Never> {
             Ok(vec![])
         }
 
-        async fn transition(&self, _command: (), _services: &()) -> Result<Vec<TestEvent>, Never> {
+        fn transition(
+            &self,
+            _command: (),
+            _jobs: &mut JobQueue<Self::Jobs>,
+        ) -> Result<Vec<TestEvent>, Never> {
             Ok(vec![])
         }
     }
@@ -1016,13 +1022,12 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl EventSourced for Counter {
         type Id = String;
         type Event = CounterEvent;
         type Command = ();
         type Error = Never;
-        type Services = ();
+        type Jobs = Nil;
         type Materialized = Table;
 
         const AGGREGATE_TYPE: &'static str = "Counter";
@@ -1045,14 +1050,17 @@ mod tests {
             }
         }
 
-        async fn initialize(_command: (), _services: &()) -> Result<Vec<CounterEvent>, Never> {
+        fn initialize(
+            _command: (),
+            _jobs: &mut JobQueue<Self::Jobs>,
+        ) -> Result<Vec<CounterEvent>, Never> {
             Ok(vec![])
         }
 
-        async fn transition(
+        fn transition(
             &self,
             _command: (),
-            _services: &(),
+            _jobs: &mut JobQueue<Self::Jobs>,
         ) -> Result<Vec<CounterEvent>, Never> {
             Ok(vec![])
         }

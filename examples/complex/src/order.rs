@@ -12,11 +12,10 @@
 use std::fmt::{self, Display};
 use std::str::FromStr;
 
-use async_trait::async_trait;
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
-use event_sorcery::{CompactionPolicy, EventSourced, Nil};
+use event_sorcery::{CompactionPolicy, EventSourced, JobQueue, Nil};
 
 use crate::inventory::Sku;
 
@@ -101,13 +100,12 @@ pub enum OrderError {
     NotOpen,
 }
 
-#[async_trait]
 impl EventSourced for Order {
     type Id = OrderId;
     type Event = OrderEvent;
     type Command = OrderCommand;
     type Error = OrderError;
-    type Services = ();
+    type Jobs = Nil;
     type Materialized = Nil;
 
     const AGGREGATE_TYPE: &'static str = "Order";
@@ -141,9 +139,9 @@ impl EventSourced for Order {
         }
     }
 
-    async fn initialize(
+    fn initialize(
         command: OrderCommand,
-        _services: &(),
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<OrderEvent>, OrderError> {
         match command {
             OrderCommand::Place { item, quantity } => {
@@ -153,10 +151,10 @@ impl EventSourced for Order {
         }
     }
 
-    async fn transition(
+    fn transition(
         &self,
         command: OrderCommand,
-        _services: &(),
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<OrderEvent>, OrderError> {
         match command {
             OrderCommand::Place { .. } => Err(OrderError::AlreadyPlaced),
@@ -184,7 +182,7 @@ mod tests {
 
     #[tokio::test]
     async fn fill_after_place_emits_filled_event() {
-        TestHarness::<Order>::with(())
+        TestHarness::<Order>::with()
             .given(vec![OrderEvent::Placed {
                 item: widgets(),
                 quantity: 3,
@@ -196,7 +194,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_filled_order_returns_not_open() {
-        let error = TestHarness::<Order>::with(())
+        let error = TestHarness::<Order>::with()
             .given(vec![
                 OrderEvent::Placed {
                     item: widgets(),

@@ -21,7 +21,6 @@
 //!
 //! [`SCHEMA_VERSION`]: crate::EventSourced::SCHEMA_VERSION
 
-use async_trait::async_trait;
 use cqrs_es::AggregateError;
 use cqrs_es::persist::PersistenceError;
 use serde::{Deserialize, Serialize};
@@ -32,7 +31,7 @@ use tracing::{debug, info};
 
 use crate::CompactionPolicy;
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
-use crate::{DomainEvent, EventSourced, Nil};
+use crate::{DomainEvent, EventSourced, JobQueue, Nil};
 
 /// Singleton aggregate ID for the schema registry.
 const REGISTRY_ID: &str = "schema";
@@ -69,13 +68,12 @@ pub enum SchemaRegistryCommand {
     Register { name: String, version: u64 },
 }
 
-#[async_trait]
 impl EventSourced for SchemaRegistry {
     type Id = String;
     type Event = SchemaRegistryEvent;
     type Command = SchemaRegistryCommand;
     type Error = Never;
-    type Services = ();
+    type Jobs = Nil;
     type Materialized = Nil;
 
     const AGGREGATE_TYPE: &'static str = "SchemaRegistry";
@@ -96,18 +94,18 @@ impl EventSourced for SchemaRegistry {
         Ok(Some(new_state))
     }
 
-    async fn initialize(
+    fn initialize(
         command: Self::Command,
-        _services: &Self::Services,
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         let SchemaRegistryCommand::Register { name, version } = command;
         Ok(vec![SchemaRegistryEvent::VersionUpdated { name, version }])
     }
 
-    async fn transition(
+    fn transition(
         &self,
         command: Self::Command,
-        _services: &Self::Services,
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         let SchemaRegistryCommand::Register { name, version } = command;
         if self.version_of(&name) == Some(version) {
@@ -489,13 +487,12 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl EventSourced for CompactableWidget {
         type Id = String;
         type Event = CompactableEvent;
         type Command = ();
         type Error = Never;
-        type Services = ();
+        type Jobs = Nil;
         type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "CompactableWidget";
@@ -511,17 +508,17 @@ mod tests {
             Ok(Some(Self))
         }
 
-        async fn initialize(
+        fn initialize(
             _command: Self::Command,
-            _services: &Self::Services,
+            _jobs: &mut JobQueue<Self::Jobs>,
         ) -> Result<Vec<Self::Event>, Never> {
             Ok(vec![CompactableEvent::Created])
         }
 
-        async fn transition(
+        fn transition(
             &self,
             _command: Self::Command,
-            _services: &Self::Services,
+            _jobs: &mut JobQueue<Self::Jobs>,
         ) -> Result<Vec<Self::Event>, Never> {
             Ok(vec![])
         }

@@ -1,16 +1,14 @@
-//! `SupportTicket` aggregate: an `Open -> Pending -> Closed` state machine
-//! with an injected `Clock` service and a materialized view that exposes
-//! `status` as a generated column for filtered queries.
+//! `SupportTicket` aggregate: an `Open -> Pending -> Closed` state machine with
+//! a materialized view that exposes `status` as a generated column for filtered
+//! queries.
 
 use std::fmt::{self, Display};
 use std::str::FromStr;
-use std::sync::Arc;
 
-use async_trait::async_trait;
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
-use event_sorcery::{Column, EventSourced, Table};
+use event_sorcery::{Column, EventSourced, JobQueue, Nil, Table};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TicketId(pub u64);
@@ -101,39 +99,24 @@ pub enum SupportTicketError {
     AlreadyClosed,
 }
 
-/// Source of event timestamps. A real consumer wires `WallClock`; tests wire
-/// `FrozenClock` for reproducible event payloads. Modeling each behavior as a
-/// distinct type rather than configuring one mock with flags keeps the call
-/// site obvious about which behavior is in play.
-pub trait Clock: Send + Sync {
-    fn now(&self) -> chrono::DateTime<chrono::Utc>;
-}
-
-pub struct WallClock;
-
-impl Clock for WallClock {
-    fn now(&self) -> chrono::DateTime<chrono::Utc> {
-        chrono::Utc::now()
-    }
-}
-
 #[cfg(test)]
-pub struct FrozenClock(pub chrono::DateTime<chrono::Utc>);
-
-#[cfg(test)]
-impl Clock for FrozenClock {
-    fn now(&self) -> chrono::DateTime<chrono::Utc> {
-        self.0
-    }
+fn now() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc)
 }
 
-#[async_trait]
+#[cfg(not(test))]
+fn now() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now()
+}
+
 impl EventSourced for SupportTicket {
     type Id = TicketId;
     type Event = SupportTicketEvent;
     type Command = SupportTicketCommand;
     type Error = SupportTicketError;
-    type Services = Arc<dyn Clock>;
+    type Jobs = Nil;
     type Materialized = Table;
 
     const AGGREGATE_TYPE: &'static str = "SupportTicket";
@@ -170,38 +153,37 @@ impl EventSourced for SupportTicket {
         }
     }
 
-    async fn initialize(
+    fn initialize(
         command: SupportTicketCommand,
-        services: &Arc<dyn Clock>,
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<SupportTicketEvent>, SupportTicketError> {
         match command {
-            SupportTicketCommand::Open { subject } => Ok(vec![SupportTicketEvent::Opened {
-                subject,
-                at: services.now(),
-            }]),
+            SupportTicketCommand::Open { subject } => {
+                Ok(vec![SupportTicketEvent::Opened { subject, at: now() }])
+            }
             SupportTicketCommand::AwaitCustomer | SupportTicketCommand::Close => {
                 Err(SupportTicketError::NotOpen)
             }
         }
     }
 
-    async fn transition(
+    fn transition(
         &self,
         command: SupportTicketCommand,
-        services: &Arc<dyn Clock>,
+        _jobs: &mut JobQueue<Self::Jobs>,
     ) -> Result<Vec<SupportTicketEvent>, SupportTicketError> {
         match command {
             SupportTicketCommand::Open { .. } => Err(SupportTicketError::AlreadyOpen),
             SupportTicketCommand::AwaitCustomer => match self.status {
                 Status::Closed => Err(SupportTicketError::AlreadyClosed),
-                Status::Open | Status::Pending => Ok(vec![SupportTicketEvent::AwaitingCustomer {
-                    at: services.now(),
-                }]),
+                Status::Open | Status::Pending => {
+                    Ok(vec![SupportTicketEvent::AwaitingCustomer { at: now() }])
+                }
             },
             SupportTicketCommand::Close => match self.status {
                 Status::Closed => Err(SupportTicketError::AlreadyClosed),
                 Status::Open | Status::Pending => {
-                    Ok(vec![SupportTicketEvent::Closed { at: services.now() }])
+                    Ok(vec![SupportTicketEvent::Closed { at: now() }])
                 }
             },
         }
@@ -222,10 +204,6 @@ mod tests {
         chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc)
-    }
-
-    fn clock() -> Arc<dyn Clock> {
-        Arc::new(FrozenClock(fixed_instant()))
     }
 
     #[test]
@@ -258,7 +236,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_then_close_emits_closed_event() {
-        TestHarness::<SupportTicket>::with(clock())
+        TestHarness::<SupportTicket>::with()
             .given(vec![SupportTicketEvent::Opened {
                 subject: "login broken".to_string(),
                 at: fixed_instant(),
@@ -272,7 +250,7 @@ mod tests {
 
     #[tokio::test]
     async fn closing_twice_returns_already_closed() {
-        let error = TestHarness::<SupportTicket>::with(clock())
+        let error = TestHarness::<SupportTicket>::with()
             .given(vec![
                 SupportTicketEvent::Opened {
                     subject: "login broken".to_string(),
@@ -294,7 +272,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_round_trip_against_in_memory_store() {
-        let store = TestStore::<SupportTicket>::new(clock());
+        let store = TestStore::<SupportTicket>::new();
         let id = TicketId(1);
 
         store
@@ -321,7 +299,7 @@ mod tests {
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
 
         let (store, projection) = StoreBuilder::<SupportTicket>::new(pool.clone())
-            .build(clock())
+            .build()
             .await
             .unwrap();
 
@@ -361,7 +339,7 @@ mod tests {
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
 
         let (store, projection) = StoreBuilder::<SupportTicket>::new(pool.clone())
-            .build(clock())
+            .build()
             .await
             .unwrap();
 

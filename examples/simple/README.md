@@ -1,8 +1,8 @@
 # simple
 
 Single-entity event-sourced example: a `SupportTicket` aggregate moving through
-`Open -> Pending -> Closed`, with an injected `Clock` service and a materialized
-view backed by a SQLite generated column for filtered queries.
+`Open -> Pending -> Closed`, with a materialized view backed by a SQLite
+generated column for filtered queries.
 
 ## Run
 
@@ -19,9 +19,9 @@ cargo nextest run --manifest-path examples/simple/Cargo.toml
 | Typed `Id` with `Display` + `FromStr`                 | `TicketId`                                   |
 | Domain error with `thiserror`                         | `SupportTicketError`                         |
 | `type Materialized = Table` + `PROJECTION = Table`    | trait consts                                 |
-| Domain service injected via `type Services = Arc<…>`  | `Clock`, `WallClock`, `FrozenClock`          |
+| No side-effect jobs: `type Jobs = Nil`                | `support_ticket.rs`                          |
 | View-table SQL with a generated column                | `migrations/*_support_ticket_view.sql`       |
-| `StoreBuilder::build(clock)` returning a tuple        | `main.rs`                                    |
+| `StoreBuilder::build()` returning a tuple             | `main.rs`                                    |
 | `Projection::load`, `load_all`, `filter`, `rebuild_*` | `main.rs`                                    |
 | `Column` constant pattern                             | `const STATUS: Column = …`                   |
 | `replay`, `TestHarness`, `TestStore`                  | `#[cfg(test)] mod tests` in `support_ticket` |
@@ -47,11 +47,6 @@ the real consumer layout: a downstream project copies the event-sorcery schema
 into its own migration directory next to its own view tables, rather than
 depending on a path inside the library's source tree.
 
-**`Services = Arc<dyn Clock>`.** Demonstrates how to inject an external
-dependency into command handlers. The example uses a deterministic stub in tests
-for reproducible event payloads; production wires `chrono::Utc::now()` through
-the same trait. `()` is fine when an entity needs no service.
-
-**Two named `Clock` impls (`WallClock`, `FrozenClock`)** instead of one
-configurable mock with booleans — distinct types make it obvious at the call
-site which behavior is in play.
+**`Jobs = Nil`.** This example has no durable side effects, so command handlers
+receive a no-op job queue. Tests use a local deterministic timestamp helper for
+reproducible event payloads.
