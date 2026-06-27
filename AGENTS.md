@@ -113,6 +113,16 @@ An epic is a roadmap subsection grouping related issues toward a single goal.
 - **Mark progress inline**: `[x]` with PR link as branches merge. When all items
   complete, move the section to "Completed."
 
+### Pull Requests and Linear
+
+- **Every pull request must be associated with at least one Linear issue.** Add
+  the issue reference to the PR body and attach/link the GitHub PR URL from the
+  Linear issue so Linear shows the PR under the issue's attachments.
+- **Split PRs require split issues.** If one planned issue is broken into
+  multiple PRs, create or use Linear sub-issues for the split work and parent
+  them under the original issue. Each PR should then close or reference its own
+  sub-issue, not only the broad parent.
+
 ## Plan & Review
 
 ### Task management
