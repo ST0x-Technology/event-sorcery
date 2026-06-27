@@ -1,6 +1,6 @@
-//! Single-entity `event-sorcery` example: a support-ticket aggregate with a
-//! materialized view that supports filtered queries via a SQLite generated
-//! column.
+//! Single-entity `event-sorcery` example: a support-ticket aggregate whose
+//! commands carry their own timestamp and a materialized view that supports
+//! filtered queries via a SQLite generated column.
 //!
 //! Run with: `cargo run --manifest-path examples/simple/Cargo.toml`
 //!
@@ -40,15 +40,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 &id,
                 SupportTicketCommand::Open {
                     subject: subject.to_string(),
+                    at: chrono::Utc::now(),
                 },
             )
             .await?;
     }
 
     store
-        .send(&feature, SupportTicketCommand::AwaitCustomer)
+        .send(
+            &feature,
+            SupportTicketCommand::AwaitCustomer {
+                at: chrono::Utc::now(),
+            },
+        )
         .await?;
-    store.send(&billing, SupportTicketCommand::Close).await?;
+    store
+        .send(
+            &billing,
+            SupportTicketCommand::Close {
+                at: chrono::Utc::now(),
+            },
+        )
+        .await?;
 
     let one = projection.load(&login).await?.ok_or("login missing")?;
     println!(
