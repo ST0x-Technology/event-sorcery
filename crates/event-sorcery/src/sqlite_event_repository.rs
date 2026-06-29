@@ -18,6 +18,8 @@ enum SqliteEventRepositoryError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Integer(#[from] std::num::TryFromIntError),
+    #[error(transparent)]
+    JobFlush(#[from] crate::job::JobStoreError),
 }
 
 impl From<SqliteEventRepositoryError> for PersistenceError {
@@ -29,6 +31,7 @@ impl From<SqliteEventRepositoryError> for PersistenceError {
             Sql(source) => Self::ConnectionError(Box::new(source)),
             Json(source) => Self::DeserializationError(Box::new(source)),
             Integer(source) => Self::UnknownError(Box::new(source)),
+            JobFlush(source) => Self::UnknownError(Box::new(source)),
         }
     }
 }
@@ -136,6 +139,11 @@ impl SqliteEventRepository {
             .execute(&mut *tx)
             .await?;
         }
+
+        // Drain any jobs the command buffered, appending them as Enqueued
+        // events in this same transaction so a job is enqueued iff the
+        // triggering events commit.
+        crate::job::flush_pending_jobs(&mut tx).await?;
 
         tx.commit().await?;
         Ok(())
