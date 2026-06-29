@@ -116,7 +116,9 @@ pub use dependency::Cons;
 pub use dependency::Nil;
 pub use dependency::{Dependent, EntityList, Fold, HasEntity, OneOf};
 pub use job::{Contains, Here, Job, JobList, JobQueue, JobStoreError, Label, There};
-pub use job_backend::{Backoff, Clock, EventStoreBackend, JobRuntime, JobWorkerConfig, run_job};
+pub use job_backend::{
+    Backoff, Clock, EventStoreBackend, JobEnqueueError, JobRuntime, JobWorkerConfig, run_job,
+};
 pub use job_sqlite::{SqliteBackend, SqliteJobError};
 pub use job_store::{ClaimDecision, ClaimOutcome, ClaimRead, EventBackend, LeaseRenewal};
 use lifecycle::Lifecycle;

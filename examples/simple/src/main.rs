@@ -88,6 +88,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Durable jobs: closing `billing` enqueued a NotifyClosed job. Wire a
     // supervised worker over the same database and run it briefly to drain it.
     let runtime = JobRuntime::build(pool.clone()).await?;
+
+    // Standalone enqueue (ADR-0007): a job can also be enqueued directly on the
+    // runtime, outside any command -- the path reactors, pollers, and startup
+    // recovery use, since they have no command commit to ride.
+    runtime
+        .enqueue(NotifyClosed {
+            subject: "startup sweep".to_string(),
+        })
+        .await?;
+
     let monitor = build_supervised_worker!(
         runtime,
         JobWorkerConfig::default(),

@@ -65,12 +65,19 @@ over one `JobRuntime`, so the consumer supplies only the `Job::Input` bundle
 (`Notifier`) and the macro builds the claim/run/ack pipeline. `main` runs the
 monitor briefly to drain the queue the `Close` command filled.
 
+**Standalone enqueue.** Besides the handler path, a job can be enqueued directly
+on the runtime with `runtime.enqueue(job)` (ADR-0007) — the path reactors,
+pollers, and startup recovery use, since they have no command commit to ride.
+`main` enqueues one `NotifyClosed` this way, and the worker drains it alongside
+the command-born one. (Unlike the handler push, a standalone enqueue is its own
+transaction, not atomic with whatever event or poll prompted it.)
+
 ## Migrating from an existing job system
 
-This example enqueues jobs from a command handler (the atomic-with-events path).
-If you are moving an existing manual or apalis-backed job system onto
-event-sorcery durable jobs — where jobs are enqueued from reactors, polling
-loops, or other jobs, not command handlers — see
+This example enqueues jobs both from a command handler (the atomic-with-events
+path) and standalone on the runtime. If you are moving an existing manual or
+apalis-backed job system onto event-sorcery durable jobs — where jobs are
+enqueued from reactors, polling loops, or other jobs, not command handlers — see
 [`docs/migrating-to-durable-jobs.md`](../../docs/migrating-to-durable-jobs.md):
-what event-sorcery covers, the enqueue-side prerequisites it does not ship yet,
-and the safe per-kind cutover.
+what event-sorcery covers, the enqueue-side prerequisites still landing, and the
+safe per-kind cutover.

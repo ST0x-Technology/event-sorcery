@@ -52,6 +52,14 @@ pub enum SqliteJobError {
     /// A sequence value exceeded the storable range.
     #[error("job sequence out of range")]
     Sequence(#[from] std::num::TryFromIntError),
+    /// A standalone [`enqueue`](EventBackend::enqueue) hit an existing stream for
+    /// its `view_id` -- the caller reused a job id (a freshly minted id never
+    /// collides).
+    #[error("duplicate enqueue: job id {job_id} already has an event stream")]
+    DuplicateEnqueue {
+        /// The reused job id.
+        job_id: String,
+    },
 }
 
 impl EventBackend for SqliteBackend {
@@ -125,6 +133,30 @@ impl EventBackend for SqliteBackend {
             Ok(LeaseRenewal::Lost)
         } else {
             Ok(LeaseRenewal::Held)
+        }
+    }
+
+    async fn enqueue(&self, event: SerializedEvent, payload: String) -> Result<(), SqliteJobError> {
+        let job_id = event.aggregate_id.clone();
+        let mut tx = self.pool.begin().await?;
+
+        let seeded = match append(&mut tx, &event).await? {
+            // The Enqueued event committed at sequence 1; seed the pending row.
+            Some(version) => write_row(&mut tx, &job_id, version, &payload, None).await,
+            // The events UNIQUE rejected sequence 1 -- this view_id already has a
+            // stream, i.e. the caller reused a job id.
+            None => Err(SqliteJobError::DuplicateEnqueue { job_id }),
+        };
+
+        match seeded {
+            Ok(()) => {
+                tx.commit().await?;
+                Ok(())
+            }
+            Err(error) => {
+                tx.rollback().await?;
+                Err(error)
+            }
         }
     }
 }
