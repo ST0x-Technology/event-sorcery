@@ -66,10 +66,27 @@ pub trait Job: Serialize + DeserializeOwned + Send + 'static {
     fn label(&self) -> Label;
 
     /// Execute this job against the injected input.
+    ///
+    /// Return [`JobOutcome::Done`] when finished, or [`JobOutcome::Defer`] to
+    /// re-run later without counting an attempt (a poll-while-pending or
+    /// external-wait snooze). An `Err` is a failure that counts an attempt and is
+    /// retried/dead-lettered per the worker config.
     fn perform(
         &self,
         input: &Self::Input,
-    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<JobOutcome<Self::Output>, Self::Error>> + Send;
+}
+
+/// What a [`Job::perform`] reports back to the worker (ADR-0007).
+#[derive(Debug)]
+pub enum JobOutcome<Output> {
+    /// The job finished; the worker records success and acks it (terminal).
+    Done(Output),
+    /// The job is not done but did not fail -- re-run it after this delay WITHOUT
+    /// counting an attempt or recording a failure (distinct from a retry). The
+    /// claim budget resets on a defer, so a poller may defer indefinitely; the
+    /// job keeps its id, attempt, and payload across the snooze.
+    Defer(Duration),
 }
 
 /// Human-readable identifier for a job instance, used in logs.
@@ -162,6 +179,12 @@ pub(crate) enum JobEvent {
         attempt: u32,
         error: String,
     },
+    /// A successful defer: the job runs again at `run_at` without counting an
+    /// attempt or recording a failure (ADR-0007). The claim budget resets.
+    Rescheduled {
+        #[serde(with = "chrono::serde::ts_milliseconds")]
+        run_at: DateTime<Utc>,
+    },
     /// An attempt failed terminally (terminal).
     Dead { reason: DeadReason, error: String },
 }
@@ -173,6 +196,7 @@ impl JobEvent {
             Self::Claimed { .. } => "JobClaimed",
             Self::Succeeded => "JobSucceeded",
             Self::RetryScheduled { .. } => "JobRetryScheduled",
+            Self::Rescheduled { .. } => "JobRescheduled",
             Self::Dead { .. } => "JobDead",
         }
     }
@@ -252,6 +276,12 @@ pub(crate) enum JobCommand {
         attempt: u32,
         error: String,
     },
+    /// The attempt deferred (success): re-run at `run_at` without counting an
+    /// attempt or recording a failure.
+    Reschedule {
+        claim_id: ClaimId,
+        run_at: DateTime<Utc>,
+    },
     /// The attempt failed terminally; dead-letter it.
     Kill {
         claim_id: ClaimId,
@@ -265,6 +295,7 @@ impl JobCommand {
         match self {
             Self::Succeed { claim_id }
             | Self::RetrySchedule { claim_id, .. }
+            | Self::Reschedule { claim_id, .. }
             | Self::Kill { claim_id, .. } => claim_id,
         }
     }
@@ -361,6 +392,24 @@ impl EventSourced for JobState {
                 attempt: *attempt,
                 claims: *claims,
             },
+            // A defer is a productive checkpoint, not a failure: keep the attempt,
+            // re-arm run_at, and reset the claim budget so a poller may defer
+            // indefinitely (the budget only catches claims with no outcome).
+            (
+                Self::Claimed {
+                    kind,
+                    payload,
+                    attempt,
+                    ..
+                },
+                JobEvent::Rescheduled { run_at },
+            ) => Self::Pending {
+                kind: kind.clone(),
+                payload: payload.clone(),
+                run_at: *run_at,
+                attempt: *attempt,
+                claims: 0,
+            },
             (Self::Pending { .. } | Self::Claimed { .. }, JobEvent::Dead { reason, .. }) => {
                 Self::Dead {
                     reason: reason.clone(),
@@ -405,6 +454,7 @@ impl EventSourced for JobState {
                 attempt,
                 error,
             },
+            JobCommand::Reschedule { run_at, .. } => JobEvent::Rescheduled { run_at },
             JobCommand::Kill { reason, error, .. } => JobEvent::Dead { reason, error },
         };
         Ok(vec![event])
@@ -826,8 +876,8 @@ mod tests {
             }
         }
 
-        async fn perform(&self, _input: &()) -> Result<(), Infallible> {
-            Ok(())
+        async fn perform(&self, _input: &()) -> Result<JobOutcome<()>, Infallible> {
+            Ok(JobOutcome::Done(()))
         }
     }
 

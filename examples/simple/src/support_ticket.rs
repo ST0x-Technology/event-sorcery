@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
-use event_sorcery::{Column, EventSourced, Job, JobQueue, Label, Table};
+use event_sorcery::{Column, EventSourced, Job, JobOutcome, JobQueue, Label, Table};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TicketId(pub u64);
@@ -140,12 +140,12 @@ impl Job for NotifyClosed {
         Label::new(format!("notify-closed:{}", self.subject))
     }
 
-    async fn perform(&self, _input: &Notifier) -> Result<(), Self::Error> {
+    async fn perform(&self, _input: &Notifier) -> Result<JobOutcome<()>, Self::Error> {
         println!(
             "  [worker] notified customer that '{}' was closed",
             self.subject
         );
-        Ok(())
+        Ok(JobOutcome::Done(()))
     }
 }
 

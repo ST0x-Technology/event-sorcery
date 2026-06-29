@@ -37,8 +37,8 @@ use tracing::{error, warn};
 use sqlite_es::{Cmp, Order, Predicate, Term, Value};
 
 use crate::job::{
-    ClaimId, DeadReason, Job, JobCommand, JobError, JobState, JobStoreError, WonClaim, WorkerId,
-    enqueue_request, enqueued_event, pending_seed_payload, plan_claim,
+    ClaimId, DeadReason, Job, JobCommand, JobError, JobOutcome, JobState, JobStoreError, WonClaim,
+    WorkerId, enqueue_request, enqueued_event, pending_seed_payload, plan_claim,
 };
 use crate::job_sqlite::SqliteBackend;
 use crate::job_store::{ClaimOutcome, EventBackend, LeaseRenewal};
@@ -214,7 +214,10 @@ fn build_task<J: Job>(job_id: String, won: WonClaim) -> Option<Task<J, JobContex
 /// The worker's middleware (claim, lease renewal, fenced ack) wraps this; the
 /// handler itself only performs the side effect. Used by
 /// [`build_supervised_worker!`](crate::build_supervised_worker).
-pub async fn run_job<J: Job>(job: J, input: Data<Arc<J::Input>>) -> Result<J::Output, J::Error> {
+pub async fn run_job<J: Job>(
+    job: J,
+    input: Data<Arc<J::Input>>,
+) -> Result<JobOutcome<J::Output>, J::Error> {
     job.perform(&input).await
 }
 
@@ -494,13 +497,13 @@ impl<S, J, Backend> Service<Task<J, JobContext, String>> for AckService<S, J, Ba
 where
     J: Job,
     Backend: EventBackend,
-    S: Service<Task<J, JobContext, String>, Response = J::Output>,
+    S: Service<Task<J, JobContext, String>, Response = JobOutcome<J::Output>>,
     S::Error: Into<BoxDynError> + Send + Sync + 'static,
     S::Future: Send + 'static,
 {
-    type Response = J::Output;
+    type Response = JobOutcome<J::Output>;
     type Error = BoxDynError;
-    type Future = BoxFuture<'static, Result<J::Output, BoxDynError>>;
+    type Future = BoxFuture<'static, Result<JobOutcome<J::Output>, BoxDynError>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx).map_err(Into::into)
@@ -529,9 +532,9 @@ where
             // Normalize to a single boxed-error result up front (the inner stack's
             // error type is apalis's BoxDynError, not a concrete Error), so the
             // ack and the returned future share one type.
-            let result: Result<J::Output, BoxDynError> =
+            let result: Result<JobOutcome<J::Output>, BoxDynError> =
                 match timeout(config.execution_timeout, run).await {
-                    Ok(Ok(output)) => Ok(output),
+                    Ok(Ok(outcome)) => Ok(outcome),
                     Ok(Err(error)) => Err(error.into()),
                     Err(_elapsed) => Err(format!(
                         "job execution exceeded {:?}",
@@ -539,15 +542,16 @@ where
                     )
                     .into()),
                 };
-            let (succeeded, error_text) = match &result {
-                Ok(_) => (true, String::new()),
-                Err(error) => (false, error_chain(&**error)),
+            let plan = match &result {
+                Ok(JobOutcome::Done(_)) => AckPlan::Succeeded,
+                Ok(JobOutcome::Defer(delay)) => AckPlan::Deferred(*delay),
+                Err(error) => AckPlan::Failed(error_chain(&**error)),
             };
 
             if lost.load(Ordering::Relaxed) {
                 warn!(target: "cqrs", job_id = %ctx.job_id, "lease lost during execution; re-claimer owns the outcome");
             } else {
-                ack(&jobs, &config, &clock, &ctx, succeeded, error_text).await;
+                ack(&jobs, &config, &clock, &ctx, plan).await;
             }
 
             cancel.cancel();
@@ -557,6 +561,16 @@ where
         }
         .boxed()
     }
+}
+
+/// What the worker decided to record for a finished attempt.
+enum AckPlan {
+    /// Ran to success -> `Succeed`.
+    Succeeded,
+    /// Deferred (success): re-run after the delay -> `Reschedule`, no attempt.
+    Deferred(Duration),
+    /// Failed with this error chain -> `RetrySchedule` or `Kill`.
+    Failed(String),
 }
 
 fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
@@ -614,10 +628,10 @@ async fn ack<Backend: EventBackend>(
     config: &JobWorkerConfig,
     clock: &Clock,
     ctx: &JobContext,
-    succeeded: bool,
-    error_text: String,
+    plan: AckPlan,
 ) {
-    let command = ack_command(config, clock, ctx, succeeded, error_text);
+    let command = ack_command(config, clock, ctx, plan);
+    let succeeded = matches!(command, JobCommand::Succeed { .. });
 
     loop {
         match jobs.send(&ctx.job_id, command.clone()).await {
@@ -657,14 +671,22 @@ fn ack_command(
     config: &JobWorkerConfig,
     clock: &Clock,
     ctx: &JobContext,
-    succeeded: bool,
-    error_text: String,
+    plan: AckPlan,
 ) -> JobCommand {
-    if succeeded {
-        return JobCommand::Succeed {
-            claim_id: ctx.claim_id.clone(),
-        };
-    }
+    let error_text = match plan {
+        AckPlan::Succeeded => {
+            return JobCommand::Succeed {
+                claim_id: ctx.claim_id.clone(),
+            };
+        }
+        AckPlan::Deferred(delay) => {
+            return JobCommand::Reschedule {
+                claim_id: ctx.claim_id.clone(),
+                run_at: clock.now() + lease_delta(delay),
+            };
+        }
+        AckPlan::Failed(error_text) => error_text,
+    };
     let failed = ctx.attempt + 1;
     if failed >= config.max_attempts {
         return JobCommand::Kill {
@@ -772,8 +794,8 @@ mod tests {
             Label::new(format!("test:{}", self.n))
         }
 
-        async fn perform(&self, _input: &()) -> Result<(), std::convert::Infallible> {
-            Ok(())
+        async fn perform(&self, _input: &()) -> Result<JobOutcome<()>, std::convert::Infallible> {
+            Ok(JobOutcome::Done(()))
         }
     }
 
@@ -960,6 +982,70 @@ mod tests {
             error,
             crate::job_sqlite::SqliteJobError::DuplicateEnqueue { job_id } if job_id == request.job_id
         ));
+    }
+
+    #[tokio::test]
+    async fn deferred_job_reschedules_to_pending_and_resets_the_claim_budget() {
+        let pool = one_db_pool().await;
+        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let backend = SqliteBackend::new(pool.clone());
+
+        let job_id = runtime.enqueue(TestJob { n: 1 }).await.unwrap();
+        let now_ms = Utc::now().timestamp_millis() + 1_000;
+
+        let ClaimOutcome::Won(won) = claim(&backend, &job_id, "w1", now_ms, 50).await else {
+            panic!("expected to win the claim");
+        };
+        let ctx = JobContext {
+            job_id: job_id.clone(),
+            claim_seq: won.claim_seq,
+            claim_id: won.claim_id,
+            attempt: won.attempt,
+        };
+
+        ack(
+            &runtime.jobs,
+            &JobWorkerConfig::default(),
+            &Clock::system(),
+            &ctx,
+            AckPlan::Deferred(Duration::from_secs(3600)),
+        )
+        .await;
+
+        // A defer records Rescheduled (not Succeeded) and returns the row to pending.
+        assert_eq!(
+            event_types(&pool, &job_id).await,
+            ["JobEnqueued", "JobClaimed", "JobRescheduled"]
+        );
+        assert_eq!(
+            queue_status(&pool, &job_id).await.as_deref(),
+            Some("pending")
+        );
+
+        // The claim budget reset to 0 so a poller may defer indefinitely.
+        let payload: String =
+            sqlx::query_scalar("SELECT payload FROM job_queue WHERE view_id = ?1")
+                .bind(&job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let state: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(state["Live"]["Pending"]["claims"], 0);
+
+        // run_at is an hour out, so the deferred job is not runnable yet.
+        let projection = Projection::<JobState>::sqlite(pool.clone());
+        let found = projection
+            .find(
+                &poll_predicate(TestJob::KIND, Utc::now().timestamp_millis()),
+                Some(&poll_order()),
+                16,
+            )
+            .await
+            .unwrap();
+        assert!(
+            found.is_empty(),
+            "a deferred job must not be runnable before its new run_at"
+        );
     }
 
     #[tokio::test]
