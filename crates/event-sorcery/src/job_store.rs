@@ -66,6 +66,18 @@ pub trait EventBackend: Clone + Send + Sync + 'static {
         claim_seq: i64,
         new_lease_until_ms: i64,
     ) -> impl Future<Output = Result<LeaseRenewal, Self::Error>> + Send;
+
+    /// Standalone durable enqueue (ADR-0007): append the `Enqueued` `event` and
+    /// seed its `job_queue` row (`view_id = event.aggregate_id`, version 1,
+    /// `payload`, no lease) in the backend's OWN transaction -- for enqueues from
+    /// reactors, pollers, job-chains, and startup, which have no command commit to
+    /// ride. A uniqueness violation on the event (the `view_id` already has a
+    /// stream) surfaces as the backend error; callers mint a fresh id per enqueue.
+    fn enqueue(
+        &self,
+        event: SerializedEvent,
+        payload: String,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
 /// The `job_queue` row as the claim transaction re-reads it, raw. The crate

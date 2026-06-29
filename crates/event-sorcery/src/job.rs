@@ -760,22 +760,41 @@ pub(crate) fn take_pending() -> Result<Vec<EnqueueRequest>, JobStoreError> {
     pending
         .into_iter()
         .map(|push| {
-            let run_at = match push.delay {
-                None => Utc::now(),
-                Some(delay) => {
-                    Utc::now()
-                        + chrono::Duration::from_std(delay)
-                            .map_err(|_| JobStoreError::DelayOverflow)?
-                }
-            };
             Ok(EnqueueRequest {
                 job_id: Ulid::new().to_string(),
                 kind: push.job.kind(),
                 payload: push.job.encode()?,
-                run_at_ms: run_at.timestamp_millis(),
+                run_at_ms: resolve_run_at_ms(push.delay)?,
             })
         })
         .collect()
+}
+
+/// Builds a standalone [`EnqueueRequest`] (fresh ULID, resolved `run_at`) for one
+/// `job` -- the reactor / poller / job-chain enqueue path, without the
+/// command-scope buffer [`take_pending`] drains.
+pub(crate) fn enqueue_request<J: Job>(
+    job: &J,
+    delay: Option<Duration>,
+) -> Result<EnqueueRequest, JobStoreError> {
+    Ok(EnqueueRequest {
+        job_id: Ulid::new().to_string(),
+        kind: JobKind::new(J::KIND),
+        payload: serde_json::to_value(job)?,
+        run_at_ms: resolve_run_at_ms(delay)?,
+    })
+}
+
+/// Resolves a job's `run_at` (epoch millis) from an optional delay-from-now.
+fn resolve_run_at_ms(delay: Option<Duration>) -> Result<i64, JobStoreError> {
+    let run_at = match delay {
+        None => Utc::now(),
+        Some(delay) => {
+            Utc::now()
+                + chrono::Duration::from_std(delay).map_err(|_| JobStoreError::DelayOverflow)?
+        }
+    };
+    Ok(run_at.timestamp_millis())
 }
 
 #[cfg(test)]

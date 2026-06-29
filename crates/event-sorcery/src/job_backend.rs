@@ -37,7 +37,8 @@ use tracing::{error, warn};
 use sqlite_es::{Cmp, Order, Predicate, Term, Value};
 
 use crate::job::{
-    ClaimId, DeadReason, Job, JobCommand, JobError, JobState, WonClaim, WorkerId, plan_claim,
+    ClaimId, DeadReason, Job, JobCommand, JobError, JobState, JobStoreError, WonClaim, WorkerId,
+    enqueue_request, enqueued_event, pending_seed_payload, plan_claim,
 };
 use crate::job_sqlite::SqliteBackend;
 use crate::job_store::{ClaimOutcome, EventBackend, LeaseRenewal};
@@ -63,6 +64,60 @@ impl<Backend: EventBackend> Clone for JobRuntime<Backend> {
             queue: self.queue.clone(),
         }
     }
+}
+
+impl<Backend: EventBackend> JobRuntime<Backend> {
+    /// Standalone durable enqueue (ADR-0007): append `job`'s `Enqueued` event and
+    /// seed its pending `job_queue` row in the backend's own transaction. This is
+    /// the reactor / poller / job-chain / startup enqueue path -- there is no
+    /// command commit for the job to ride. Returns the new job's id.
+    ///
+    /// Contrast the handler-side [`JobQueue::push`](crate::JobQueue::push), which
+    /// buffers into the command's commit so the job is atomic with the triggering
+    /// events. Use that for command-born jobs; use this for everything else. A
+    /// standalone enqueue is its own transaction -- NOT atomic with whatever event
+    /// or poll prompted it (that has already committed).
+    pub async fn enqueue<J: Job>(&self, job: J) -> Result<String, JobEnqueueError<Backend::Error>> {
+        self.enqueue_resolved(job, None).await
+    }
+
+    /// Like [`enqueue`](Self::enqueue) but the job becomes runnable only after
+    /// `delay` from now -- for self-rescheduling pollers and deferred work.
+    pub async fn enqueue_with_delay<J: Job>(
+        &self,
+        job: J,
+        delay: std::time::Duration,
+    ) -> Result<String, JobEnqueueError<Backend::Error>> {
+        self.enqueue_resolved(job, Some(delay)).await
+    }
+
+    // Takes `job` by value (not `&J`): an owned `Job` is `Send` and so the future
+    // is `Send`, whereas a `&J` held across the await would demand `J: Sync`.
+    async fn enqueue_resolved<J: Job>(
+        &self,
+        job: J,
+        delay: Option<std::time::Duration>,
+    ) -> Result<String, JobEnqueueError<Backend::Error>> {
+        let request = enqueue_request(&job, delay)?;
+        let event = enqueued_event(&request)?;
+        let payload = pending_seed_payload(&request)?;
+        self.backend
+            .enqueue(event, payload)
+            .await
+            .map_err(JobEnqueueError::Backend)?;
+        Ok(request.job_id)
+    }
+}
+
+/// Why a standalone [`JobRuntime::enqueue`] failed.
+#[derive(Debug, thiserror::Error)]
+pub enum JobEnqueueError<BackendError> {
+    /// The `Enqueued` event or seed payload could not be built (es-side encoding).
+    #[error("failed to build the job enqueue payload")]
+    Build(#[from] JobStoreError),
+    /// The backend rejected the append + seed transaction (e.g. a reused job id).
+    #[error("the job backend rejected the enqueue")]
+    Backend(#[source] BackendError),
 }
 
 impl JobRuntime<SqliteBackend> {
@@ -821,6 +876,90 @@ mod tests {
             queue_status(&pool, &job_id).await.as_deref(),
             Some("claimed")
         );
+    }
+
+    #[tokio::test]
+    async fn standalone_enqueue_seeds_a_claimable_pending_job() {
+        let pool = one_db_pool().await;
+        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+
+        let job_id = runtime.enqueue(TestJob { n: 7 }).await.unwrap();
+
+        assert_eq!(event_types(&pool, &job_id).await, ["JobEnqueued"]);
+        assert_eq!(
+            queue_status(&pool, &job_id).await.as_deref(),
+            Some("pending")
+        );
+
+        // A standalone-enqueued job is claimable like any handler-pushed one.
+        let backend = SqliteBackend::new(pool.clone());
+        let now_ms = Utc::now().timestamp_millis() + 1_000;
+        let outcome = claim(&backend, &job_id, "w1", now_ms, 50).await;
+        assert!(matches!(outcome, ClaimOutcome::Won(_)));
+        assert_eq!(
+            event_types(&pool, &job_id).await,
+            ["JobEnqueued", "JobClaimed"]
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_enqueue_with_delay_is_not_runnable_until_run_at() {
+        let pool = one_db_pool().await;
+        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+
+        let job_id = runtime
+            .enqueue_with_delay(TestJob { n: 1 }, std::time::Duration::from_secs(3600))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            queue_status(&pool, &job_id).await.as_deref(),
+            Some("pending")
+        );
+
+        // run_at is an hour out, so a poll at "now" finds nothing runnable.
+        let projection = Projection::<JobState>::sqlite(pool.clone());
+        let now_ms = Utc::now().timestamp_millis();
+        let found = projection
+            .find(
+                &poll_predicate(TestJob::KIND, now_ms),
+                Some(&poll_order()),
+                16,
+            )
+            .await
+            .unwrap();
+        assert!(
+            found.is_empty(),
+            "a delayed standalone enqueue must not be runnable before its run_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_rejects_a_reused_job_id() {
+        let pool = one_db_pool().await;
+        let backend = SqliteBackend::new(pool.clone());
+
+        let request = EnqueueRequest {
+            job_id: Ulid::new().to_string(),
+            kind: JobKind::new(TestJob::KIND),
+            payload: serde_json::to_value(TestJob { n: 1 }).unwrap(),
+            run_at_ms: 1000,
+        };
+        let payload = pending_seed_payload(&request).unwrap();
+
+        backend
+            .enqueue(enqueued_event(&request).unwrap(), payload.clone())
+            .await
+            .unwrap();
+        let error = backend
+            .enqueue(enqueued_event(&request).unwrap(), payload)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::job_sqlite::SqliteJobError::DuplicateEnqueue { job_id } if job_id == request.job_id
+        ));
     }
 
     #[tokio::test]
