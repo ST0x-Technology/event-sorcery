@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
-use event_sorcery::{EventSourced, Table};
+use event_sorcery::{EventSourced, JobQueue, Nil, Table};
 
 /// Stock-keeping unit. Used both as `Inventory::Id` and as the foreign-key
 /// payload on `Order::item`, so the two entities share an identifier currency.
@@ -83,7 +83,7 @@ impl EventSourced for Inventory {
     type Event = InventoryEvent;
     type Command = InventoryCommand;
     type Error = InventoryError;
-    type Services = ();
+    type Jobs = Nil;
     type Materialized = Table;
 
     const AGGREGATE_TYPE: &'static str = "Inventory";
@@ -131,7 +131,7 @@ impl EventSourced for Inventory {
 
     async fn initialize(
         command: InventoryCommand,
-        _services: &(),
+        _jobs: &JobQueue<Self::Jobs>,
     ) -> Result<Vec<InventoryEvent>, InventoryError> {
         match command {
             InventoryCommand::Initialize { item, on_hand } => {
@@ -146,7 +146,7 @@ impl EventSourced for Inventory {
     async fn transition(
         &self,
         command: InventoryCommand,
-        _services: &(),
+        _jobs: &JobQueue<Self::Jobs>,
     ) -> Result<Vec<InventoryEvent>, InventoryError> {
         match command {
             InventoryCommand::Initialize { .. } => Err(InventoryError::AlreadyInitialized),
@@ -181,7 +181,7 @@ mod tests {
 
     #[tokio::test]
     async fn consume_more_than_on_hand_returns_underflow() {
-        let error = TestHarness::<Inventory>::with(())
+        let error = TestHarness::<Inventory>::new()
             .given(vec![InventoryEvent::Initialized {
                 item: widgets(),
                 on_hand: 2,
@@ -201,7 +201,7 @@ mod tests {
 
     #[tokio::test]
     async fn restock_then_consume_settles_on_expected_balance() {
-        TestHarness::<Inventory>::with(())
+        TestHarness::<Inventory>::new()
             .given(vec![
                 InventoryEvent::Initialized {
                     item: widgets(),

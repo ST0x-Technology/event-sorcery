@@ -6,10 +6,7 @@ license.workspace = true
 homepage.workspace = true
 
 [dependencies]
-apalis.workspace = true
-apalis-codec.workspace = true
 apalis-core.workspace = true
-apalis-sqlite.workspace = true
 async-trait.workspace = true
 cqrs-es.workspace = true
 sqlite-es.workspace = true
@@ -21,6 +18,12 @@ tokio.workspace = true
 tracing.workspace = true
 chrono = { version = "0.4.45", features = ["serde"] }
 ulid = "1.2.1"
+tokio-util = "0.7.18"
+tokio-stream = "0.1.18"
+tower-layer = "0.3.3"
+tower-service = "0.3.3"
+tower = { version = "0.5.3", features = ["limit"] }
+futures-util = "0.3.32"
 
 [features]
 test-support = []

@@ -5,6 +5,9 @@ use cqrs_es::persist::{
 use serde_json::Value;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqlitePool};
+use tracing::warn;
+
+use crate::CompactionPolicy;
 
 #[derive(Debug, thiserror::Error)]
 enum SqliteEventRepositoryError {
@@ -36,15 +39,21 @@ impl From<SqliteEventRepositoryError> for PersistenceError {
     }
 }
 
-pub(crate) struct SqliteEventRepository {
+/// SQLite implementation of the cqrs-es [`PersistedEventRepository`].
+///
+/// Public so it can be the [`crate::EventBackend::EventRepo`] of
+/// [`crate::SqliteBackend`]; consumers obtain it via the backend, not directly.
+pub struct SqliteEventRepository {
     pool: SqlitePool,
+    compaction_policy: CompactionPolicy,
     stream_channel_size: usize,
 }
 
 impl SqliteEventRepository {
-    pub(crate) fn new(pool: SqlitePool) -> Self {
+    pub(crate) fn new(pool: SqlitePool, compaction_policy: CompactionPolicy) -> Self {
         Self {
             pool,
+            compaction_policy,
             stream_channel_size: 1000,
         }
     }
@@ -140,10 +149,30 @@ impl SqliteEventRepository {
             .await?;
         }
 
-        // Drain any jobs the command buffered, appending them as Enqueued
-        // events in this same transaction so a job is enqueued iff the
-        // triggering events commit.
-        crate::job::flush_pending_jobs(&mut tx).await?;
+        // Drain any jobs the command buffered: append each as an Enqueued event
+        // AND seed its job_queue projection row (version 1), both in this
+        // transaction, so a job becomes durable and pollable iff the triggering
+        // events commit.
+        for request in crate::job::take_pending()? {
+            let event = crate::job::enqueued_event(&request)?;
+            sqlite_es::insert_serialized_events_batch(
+                &mut tx,
+                "events",
+                std::slice::from_ref(&event),
+            )
+            .await
+            .map_err(map_sqlite_aggregate_error)?;
+
+            let payload = crate::job::pending_seed_payload(&request)?;
+            sqlx::query(
+                "INSERT INTO job_queue (view_id, version, payload, lease_until) \
+                 VALUES (?1, 1, ?2, NULL)",
+            )
+            .bind(&request.job_id)
+            .bind(&payload)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         tx.commit().await?;
         Ok(())
@@ -243,7 +272,38 @@ impl PersistedEventRepository for SqliteEventRepository {
         &self,
         aggregate_id: &str,
     ) -> Result<Option<SerializedSnapshot>, PersistenceError> {
-        Ok(self.load_snapshot::<A>(aggregate_id).await?)
+        let snapshot = self.load_snapshot::<A>(aggregate_id).await?;
+        let Some(snapshot) = snapshot else {
+            return Ok(None);
+        };
+
+        // Whether an incompatible snapshot must be guarded depends on the
+        // entity's compaction policy (ADR-0003).
+        match self.compaction_policy {
+            // A `Retain` aggregate keeps its full event history, so cqrs-es
+            // safely rebuilds from events on a deserialize failure. The snapshot
+            // is returned as stored -- no shape check is needed here, and doing
+            // one would only duplicate the deserialize cqrs-es already performs.
+            CompactionPolicy::Retain => Ok(Some(snapshot)),
+            // A `CompactAfterSnapshot` aggregate may have lost the events behind
+            // the snapshot, making the snapshot the only durable record of
+            // state. An incompatible payload must surface an error rather than
+            // letting cqrs-es silently rebuild from an incomplete history.
+            CompactionPolicy::CompactAfterSnapshot => match A::deserialize(&snapshot.aggregate) {
+                Ok(_) => Ok(Some(snapshot)),
+                Err(source) => {
+                    warn!(
+                        target: "cqrs",
+                        aggregate_type = A::TYPE,
+                        aggregate_id,
+                        %source,
+                        "Incompatible snapshot for a compactable aggregate cannot be \
+                         safely rebuilt from events; surfacing error"
+                    );
+                    Err(SqliteEventRepositoryError::Json(source).into())
+                }
+            },
+        }
     }
 
     async fn persist<A: Aggregate>(
@@ -316,5 +376,224 @@ fn map_sqlite_aggregate_error(
         sqlite_es::SqliteAggregateError::EmptySnapshotUpdate => {
             SqliteEventRepositoryError::EmptySnapshotUpdate
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cqrs_es::event_sink::EventSink;
+    use cqrs_es::persist::PersistedEventStore;
+    use cqrs_es::{AggregateContext, AggregateError, DomainEvent, EventStore};
+    use serde::{Deserialize, Serialize};
+    use std::fmt::{self, Display};
+
+    use super::*;
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+    struct TestAggregate {
+        events: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    enum TestEvent {
+        Created,
+    }
+
+    impl DomainEvent for TestEvent {
+        fn event_type(&self) -> String {
+            "Created".to_string()
+        }
+
+        fn event_version(&self) -> String {
+            "1.0".to_string()
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestError;
+
+    impl Display for TestError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "test error")
+        }
+    }
+
+    impl std::error::Error for TestError {}
+
+    impl Aggregate for TestAggregate {
+        const TYPE: &'static str = "TestAggregate";
+        type Command = ();
+        type Event = TestEvent;
+        type Error = TestError;
+        type Services = ();
+
+        async fn handle(
+            &mut self,
+            _command: Self::Command,
+            _services: &Self::Services,
+            _sink: &EventSink<Self>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn apply(&mut self, event: Self::Event) {
+            self.events.push(event.event_type());
+        }
+    }
+
+    async fn test_pool() -> SqlitePool {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    fn covering_events(aggregate_id: &str, through: usize) -> Vec<SerializedEvent> {
+        (1..=through)
+            .map(|sequence| SerializedEvent {
+                aggregate_type: TestAggregate::TYPE.to_string(),
+                aggregate_id: aggregate_id.to_string(),
+                sequence,
+                event_type: "Created".to_string(),
+                event_version: "1.0".to_string(),
+                payload: serde_json::json!("Created"),
+                metadata: serde_json::json!({}),
+            })
+            .collect()
+    }
+
+    /// For a `Retain` entity, get_snapshot returns the incompatible snapshot
+    /// unchanged (no shape check, no discard); cqrs-es then rebuilds from the
+    /// always-complete event history. See the end-to-end rebuild test below.
+    #[tokio::test]
+    async fn incompatible_snapshot_returned_unchanged_for_retain_entity() {
+        let pool = test_pool().await;
+        let repo = SqliteEventRepository::new(pool.clone(), CompactionPolicy::Retain);
+
+        repo.persist::<TestAggregate>(
+            &covering_events("agg-replayable", 3),
+            Some((
+                "agg-replayable".to_string(),
+                serde_json::json!({"events": "not-a-list"}),
+                1,
+            )),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = repo
+            .get_snapshot::<TestAggregate>("agg-replayable")
+            .await
+            .unwrap()
+            .expect("Retain returns the snapshot unchanged");
+        assert_eq!(snapshot.current_sequence, 3);
+        assert_eq!(
+            snapshot.aggregate,
+            serde_json::json!({"events": "not-a-list"})
+        );
+    }
+
+    /// For a `CompactAfterSnapshot` entity, the events behind the snapshot may
+    /// have been compacted away, so an incompatible snapshot is preserved and an
+    /// error surfaced rather than silently rebuilding from an incomplete history.
+    /// The policy alone decides this -- no inspection of the event rows.
+    #[tokio::test]
+    async fn incompatible_snapshot_preserved_for_compactable_entity() {
+        let pool = test_pool().await;
+        let repo = SqliteEventRepository::new(pool.clone(), CompactionPolicy::CompactAfterSnapshot);
+
+        repo.persist::<TestAggregate>(
+            &covering_events("agg-compacted", 3),
+            Some((
+                "agg-compacted".to_string(),
+                serde_json::json!({"events": "not-a-list"}),
+                1,
+            )),
+        )
+        .await
+        .unwrap();
+
+        let result = repo.get_snapshot::<TestAggregate>("agg-compacted").await;
+        assert!(matches!(
+            result,
+            Err(PersistenceError::DeserializationError(_))
+        ));
+
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM snapshots WHERE aggregate_id = 'agg-compacted'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 1);
+    }
+
+    /// End-to-end: loading a `Retain` aggregate whose snapshot is incompatible
+    /// discards it and reconstructs correct state from the full event history.
+    #[tokio::test]
+    async fn load_aggregate_rebuilds_after_discard_for_retain_entity() {
+        let pool = test_pool().await;
+        let repo = SqliteEventRepository::new(pool.clone(), CompactionPolicy::Retain);
+
+        repo.persist::<TestAggregate>(
+            &covering_events("agg-load", 3),
+            Some((
+                "agg-load".to_string(),
+                serde_json::json!({"events": "not-a-list"}),
+                1,
+            )),
+        )
+        .await
+        .unwrap();
+
+        // load_aggregate must discard the incompatible snapshot and replay the
+        // events, reconstructing the correct state rather than Default.
+        let store = PersistedEventStore::<_, TestAggregate>::new_snapshot_store(
+            SqliteEventRepository::new(pool.clone(), CompactionPolicy::Retain),
+            100,
+        );
+        let mut context = store.load_aggregate("agg-load").await.unwrap();
+        assert_eq!(
+            *context.aggregate(),
+            TestAggregate {
+                events: vec![
+                    "Created".to_string(),
+                    "Created".to_string(),
+                    "Created".to_string(),
+                ],
+            }
+        );
+    }
+
+    /// End-to-end: loading a `CompactAfterSnapshot` aggregate whose snapshot is
+    /// incompatible surfaces a `DeserializationError` through cqrs-es rather than
+    /// silently rebuilding from a possibly-incomplete history. This pins the
+    /// guard's reliance on cqrs-es propagating the `Err` returned by
+    /// `get_snapshot` (instead of falling through to its rebuild-from-events
+    /// recovery, which fires only on `Ok(Some(..))`/`Ok(None)`).
+    #[tokio::test]
+    async fn load_aggregate_errors_for_compactable_entity_with_incompatible_snapshot() {
+        let pool = test_pool().await;
+        let repo = SqliteEventRepository::new(pool.clone(), CompactionPolicy::CompactAfterSnapshot);
+
+        repo.persist::<TestAggregate>(
+            &covering_events("agg-compact-load", 3),
+            Some((
+                "agg-compact-load".to_string(),
+                serde_json::json!({"events": "not-a-list"}),
+                1,
+            )),
+        )
+        .await
+        .unwrap();
+
+        let store = PersistedEventStore::<_, TestAggregate>::new_snapshot_store(
+            SqliteEventRepository::new(pool.clone(), CompactionPolicy::CompactAfterSnapshot),
+            100,
+        );
+        let result = store.load_aggregate("agg-compact-load").await;
+        assert!(matches!(
+            result,
+            Err(AggregateError::DeserializationError(_))
+        ));
     }
 }

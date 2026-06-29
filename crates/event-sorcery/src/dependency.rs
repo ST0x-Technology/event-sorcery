@@ -387,6 +387,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
+    use crate::JobQueue;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct Alpha {
@@ -417,7 +418,7 @@ mod tests {
         type Event = AlphaEvent;
         type Command = ();
         type Error = AlphaError;
-        type Services = ();
+        type Jobs = Nil;
         type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "Alpha";
@@ -436,11 +437,18 @@ mod tests {
             Ok(None)
         }
 
-        async fn initialize((): (), (): &()) -> Result<Vec<AlphaEvent>, AlphaError> {
+        async fn initialize(
+            (): (),
+            _jobs: &JobQueue<Self::Jobs>,
+        ) -> Result<Vec<AlphaEvent>, AlphaError> {
             Ok(vec![AlphaEvent::Born])
         }
 
-        async fn transition(&self, (): (), (): &()) -> Result<Vec<AlphaEvent>, AlphaError> {
+        async fn transition(
+            &self,
+            (): (),
+            _jobs: &JobQueue<Self::Jobs>,
+        ) -> Result<Vec<AlphaEvent>, AlphaError> {
             Ok(vec![])
         }
     }
@@ -474,7 +482,7 @@ mod tests {
         type Event = BetaEvent;
         type Command = ();
         type Error = BetaError;
-        type Services = ();
+        type Jobs = Nil;
         type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "Beta";
@@ -491,11 +499,18 @@ mod tests {
             Ok(None)
         }
 
-        async fn initialize((): (), (): &()) -> Result<Vec<BetaEvent>, BetaError> {
+        async fn initialize(
+            (): (),
+            _jobs: &JobQueue<Self::Jobs>,
+        ) -> Result<Vec<BetaEvent>, BetaError> {
             Ok(vec![BetaEvent::Spawned])
         }
 
-        async fn transition(&self, (): (), (): &()) -> Result<Vec<BetaEvent>, BetaError> {
+        async fn transition(
+            &self,
+            (): (),
+            _jobs: &JobQueue<Self::Jobs>,
+        ) -> Result<Vec<BetaEvent>, BetaError> {
             Ok(vec![])
         }
     }

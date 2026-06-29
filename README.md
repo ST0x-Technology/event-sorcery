@@ -35,7 +35,13 @@ explaining what it covers. Run any of them with
 - [`docs/domain.md`](docs/domain.md) — domain terminology and naming
   conventions.
 - [`docs/cqrs.md`](docs/cqrs.md) — event-sourcing patterns, the `EventSourced`
-  trait, projections, services, schema registry.
+  trait, projections, typed jobs, schema registry.
+- [`docs/event-sourced-job-backend-spec.md`](docs/event-sourced-job-backend-spec.md)
+  — the durable-jobs backend: claim/ack/fence/lease, the worker, the concurrency
+  rationale.
+- [`docs/migrating-to-durable-jobs.md`](docs/migrating-to-durable-jobs.md) —
+  moving an existing manual / apalis job system onto event-sorcery durable jobs:
+  what's covered, the prerequisites, and the safe per-kind cutover.
 - [`docs/sqlx.md`](docs/sqlx.md) — `SQLX_OFFLINE`, `query!` vs runtime queries,
   regenerating the query cache.
 - [`docs/ttdd.md`](docs/ttdd.md) — type-driven TDD methodology used in this

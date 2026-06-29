@@ -1,9 +1,17 @@
 //! Schema version registry for detecting stale snapshots.
 //!
 //! Tracks the last-known [`SCHEMA_VERSION`] for each aggregate type
-//! in the event store. On startup, [`Reconciler::reconcile`] compares
-//! the stored version against the current code version and clears
-//! snapshots when they diverge.
+//! in the event store. Startup reconciliation is a two-step contract:
+//! [`Reconciler::reconcile`] compares the stored version against the
+//! current code version and clears snapshots when they diverge, then
+//! the caller runs any further version-change recovery it owns (for
+//! projected entities, a view rebuild) and finally calls
+//! [`Reconciler::record_version`] to mark the version handled.
+//! Recording is deferred to the end so a crash mid-recovery re-runs the
+//! whole idempotent sequence on restart instead of stranding
+//! half-reconciled state behind an already-advanced version. The
+//! `StoreBuilder` wires this sequence; callers driving [`Reconciler`]
+//! directly must follow the same order.
 //!
 //! This is itself an event-sourced aggregate whose state is rebuilt
 //! from the full event log on every startup -- no views, no
@@ -23,6 +31,7 @@ use std::collections::BTreeMap;
 use tracing::{debug, info};
 
 use crate::CompactionPolicy;
+use crate::job::JobQueue;
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::{DomainEvent, EventSourced, Nil};
 
@@ -67,7 +76,7 @@ impl EventSourced for SchemaRegistry {
     type Event = SchemaRegistryEvent;
     type Command = SchemaRegistryCommand;
     type Error = Never;
-    type Services = ();
+    type Jobs = Nil;
     type Materialized = Nil;
 
     const AGGREGATE_TYPE: &'static str = "SchemaRegistry";
@@ -90,7 +99,7 @@ impl EventSourced for SchemaRegistry {
 
     async fn initialize(
         command: Self::Command,
-        _services: &Self::Services,
+        _jobs: &JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         let SchemaRegistryCommand::Register { name, version } = command;
         Ok(vec![SchemaRegistryEvent::VersionUpdated { name, version }])
@@ -99,7 +108,7 @@ impl EventSourced for SchemaRegistry {
     async fn transition(
         &self,
         command: Self::Command,
-        _services: &Self::Services,
+        _jobs: &JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         let SchemaRegistryCommand::Register { name, version } = command;
         if self.version_of(&name) == Some(version) {
@@ -108,6 +117,25 @@ impl EventSourced for SchemaRegistry {
             Ok(vec![SchemaRegistryEvent::VersionUpdated { name, version }])
         }
     }
+}
+
+/// Outcome of [`Reconciler::reconcile`]: whether the stored schema version
+/// diverged from the code's [`SCHEMA_VERSION`] for an entity.
+///
+/// Callers branch on this to choose recovery: a `Changed` projected entity
+/// rebuilds its views, an `Unchanged` one only catches up on missed events.
+///
+/// [`SCHEMA_VERSION`]: crate::EventSourced::SCHEMA_VERSION
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "reconciliation must be completed by calling `Reconciler::record_version` after \
+              recovery; dropping the outcome usually means that call was forgotten, leaving the \
+              schema version unadvanced and the recovery re-running on every startup"]
+pub enum SchemaReconciliation {
+    /// The stored version did not match the current code version; any existing
+    /// snapshots were cleared.
+    Changed,
+    /// The stored version matched the code version; nothing was cleared.
+    Unchanged,
 }
 
 /// Handles schema version reconciliation at startup.
@@ -155,13 +183,21 @@ impl Reconciler {
         Ok(state)
     }
 
-    /// Checks the stored schema version for `Entity` and clears
-    /// snapshots if the version has changed.
+    /// Clears version-mismatched snapshots for `Entity` and reports whether the
+    /// schema version [`Changed`](SchemaReconciliation::Changed) (snapshots
+    /// cleared) or was [`Unchanged`](SchemaReconciliation::Unchanged).
     ///
-    /// Returns `true` if snapshots were cleared (schema changed),
-    /// `false` if versions matched.
+    /// Does NOT record the new version. The caller must call
+    /// [`Reconciler::record_version`] only after every version-change recovery
+    /// it owns (the snapshot clear here, plus any view rebuild the caller
+    /// performs) has durably completed -- recording the version is the "done"
+    /// marker, and a crash before it leaves the version unadvanced so the whole
+    /// recovery re-runs on the next startup. The snapshot clear is idempotent,
+    /// so re-running is safe.
     #[allow(clippy::cognitive_complexity)]
-    pub async fn reconcile<Entity: EventSourced>(&self) -> Result<bool, ReconcileError> {
+    pub async fn reconcile<Entity: EventSourced>(
+        &self,
+    ) -> Result<SchemaReconciliation, ReconcileError> {
         let name = Entity::AGGREGATE_TYPE;
         let current_version = Entity::SCHEMA_VERSION;
 
@@ -207,21 +243,33 @@ impl Reconciler {
                 new_version = current_version,
                 "Cleared stale snapshots for schema version change"
             );
+
+            Ok(SchemaReconciliation::Changed)
         } else {
             debug!(target: "cqrs", aggregate = %name, version = current_version, "Schema version unchanged");
-        }
 
+            Ok(SchemaReconciliation::Unchanged)
+        }
+    }
+
+    /// Records that `Entity`'s current [`SCHEMA_VERSION`] has been fully
+    /// reconciled. Call only after all version-change recovery (snapshot clear
+    /// and, for projected entities, view rebuild) has durably completed, so a
+    /// recorded version always implies its recovery finished.
+    ///
+    /// [`SCHEMA_VERSION`]: crate::EventSourced::SCHEMA_VERSION
+    pub async fn record_version<Entity: EventSourced>(&self) -> Result<(), ReconcileError> {
         self.cqrs
             .execute(
                 REGISTRY_ID,
                 SchemaRegistryCommand::Register {
-                    name: name.to_string(),
-                    version: current_version,
+                    name: Entity::AGGREGATE_TYPE.to_string(),
+                    version: Entity::SCHEMA_VERSION,
                 },
             )
             .await?;
 
-        Ok(needs_clear)
+        Ok(())
     }
 }
 
@@ -388,13 +436,20 @@ mod tests {
 
         let reconciler = Reconciler::new(pool);
 
-        // First run: no stored version -> needs clear
-        let cleared = reconciler.reconcile::<SchemaRegistry>().await.unwrap();
-        assert!(cleared);
+        // First run: no stored version -> changed.
+        let outcome = reconciler.reconcile::<SchemaRegistry>().await.unwrap();
+        assert_eq!(outcome, SchemaReconciliation::Changed);
 
-        // Second run: version matches -> no clear
-        let cleared = reconciler.reconcile::<SchemaRegistry>().await.unwrap();
-        assert!(!cleared);
+        // Until the version is recorded, every reconcile still reports a change
+        // -- a crash before record_version re-runs the whole recovery.
+        let outcome = reconciler.reconcile::<SchemaRegistry>().await.unwrap();
+        assert_eq!(outcome, SchemaReconciliation::Changed);
+
+        reconciler.record_version::<SchemaRegistry>().await.unwrap();
+
+        // After recording, the version matches -> unchanged.
+        let outcome = reconciler.reconcile::<SchemaRegistry>().await.unwrap();
+        assert_eq!(outcome, SchemaReconciliation::Unchanged);
     }
 
     #[tokio::test]
@@ -408,8 +463,9 @@ mod tests {
         let registry = reconciler.load_registry().await.unwrap();
         assert!(registry.is_none());
 
-        // Register two aggregates
-        reconciler.reconcile::<SchemaRegistry>().await.unwrap();
+        // Reconcile then record the version into the registry.
+        let _ = reconciler.reconcile::<SchemaRegistry>().await.unwrap();
+        reconciler.record_version::<SchemaRegistry>().await.unwrap();
 
         // Should have SchemaRegistry at version 1
         let registry = reconciler.load_registry().await.unwrap().unwrap();
@@ -440,7 +496,7 @@ mod tests {
         type Event = CompactableEvent;
         type Command = ();
         type Error = Never;
-        type Services = ();
+        type Jobs = Nil;
         type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "CompactableWidget";
@@ -458,7 +514,7 @@ mod tests {
 
         async fn initialize(
             _command: Self::Command,
-            _services: &Self::Services,
+            _jobs: &JobQueue<Self::Jobs>,
         ) -> Result<Vec<Self::Event>, Never> {
             Ok(vec![CompactableEvent::Created])
         }
@@ -466,7 +522,7 @@ mod tests {
         async fn transition(
             &self,
             _command: Self::Command,
-            _services: &Self::Services,
+            _jobs: &JobQueue<Self::Jobs>,
         ) -> Result<Vec<Self::Event>, Never> {
             Ok(vec![])
         }
@@ -481,9 +537,9 @@ mod tests {
 
         // First reconcile: stored=None, current=2. No prior snapshots
         // exist, so this should succeed even for compactable entities.
-        let cleared = reconciler.reconcile::<CompactableWidget>().await.unwrap();
+        let outcome = reconciler.reconcile::<CompactableWidget>().await.unwrap();
 
-        assert!(cleared);
+        assert_eq!(outcome, SchemaReconciliation::Changed);
     }
 
     #[tokio::test]
@@ -493,8 +549,12 @@ mod tests {
 
         let reconciler = Reconciler::new(pool.clone());
 
-        // First registration succeeds (stored=None)
-        reconciler.reconcile::<CompactableWidget>().await.unwrap();
+        // First registration succeeds (stored=None) and records version 2.
+        let _ = reconciler.reconcile::<CompactableWidget>().await.unwrap();
+        reconciler
+            .record_version::<CompactableWidget>()
+            .await
+            .unwrap();
 
         // Manually update the stored version to simulate a version
         // bump (we can't change the const at runtime).

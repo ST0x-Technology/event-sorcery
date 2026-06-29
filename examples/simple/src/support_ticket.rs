@@ -1,16 +1,21 @@
-//! `SupportTicket` aggregate: an `Open -> Pending -> Closed` state machine
-//! with an injected `Clock` service and a materialized view that exposes
-//! `status` as a generated column for filtered queries.
+//! `SupportTicket` aggregate: an `Open -> Pending -> Closed` state machine with a
+//! materialized view that exposes `status` as a generated column for filtered
+//! queries. Closing a ticket enqueues a durable [`NotifyClosed`] job -- the
+//! command stays a pure `(state, command) -> events` function and the side
+//! effect (notifying the customer) runs in a supervised worker.
+//!
+//! Event timestamps are caller-provided (carried on the command) rather than
+//! read from an injected clock: handlers take only a typed [`JobQueue`], not
+//! services, so the only non-determinism is what the command brings in.
 
 use std::fmt::{self, Display};
 use std::str::FromStr;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
-use event_sorcery::{Column, EventSourced, Table};
+use event_sorcery::{Column, EventSourced, Job, JobQueue, Label, Table};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TicketId(pub u64);
@@ -84,11 +89,19 @@ impl DomainEvent for SupportTicketEvent {
     }
 }
 
+/// Commands carry the timestamp the caller wants stamped on the resulting event.
 #[derive(Debug, Clone)]
 pub enum SupportTicketCommand {
-    Open { subject: String },
-    AwaitCustomer,
-    Close,
+    Open {
+        subject: String,
+        at: chrono::DateTime<chrono::Utc>,
+    },
+    AwaitCustomer {
+        at: chrono::DateTime<chrono::Utc>,
+    },
+    Close {
+        at: chrono::DateTime<chrono::Utc>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -101,29 +114,38 @@ pub enum SupportTicketError {
     AlreadyClosed,
 }
 
-/// Source of event timestamps. A real consumer wires `WallClock`; tests wire
-/// `FrozenClock` for reproducible event payloads. Modeling each behavior as a
-/// distinct type rather than configuring one mock with flags keeps the call
-/// site obvious about which behavior is in play.
-pub trait Clock: Send + Sync {
-    fn now(&self) -> chrono::DateTime<chrono::Utc>;
+/// Durable side effect dispatched when a ticket closes: notify the customer.
+///
+/// The handler enqueues this on the typed [`JobQueue`]; a supervised worker runs
+/// it later, exactly once per close, atomically with the `Closed` event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotifyClosed {
+    pub subject: String,
 }
 
-pub struct WallClock;
+/// Dependency bundle the worker injects into [`NotifyClosed::perform`]. A real
+/// app would hold an email client; here it just records sent notifications.
+#[derive(Clone, Default)]
+pub struct Notifier;
 
-impl Clock for WallClock {
-    fn now(&self) -> chrono::DateTime<chrono::Utc> {
-        chrono::Utc::now()
+impl Job for NotifyClosed {
+    type Input = Notifier;
+    type Output = ();
+    type Error = std::convert::Infallible;
+
+    const WORKER_NAME: &'static str = "notify-closed";
+    const KIND: &'static str = "notify-closed";
+
+    fn label(&self) -> Label {
+        Label::new(format!("notify-closed:{}", self.subject))
     }
-}
 
-#[cfg(test)]
-pub struct FrozenClock(pub chrono::DateTime<chrono::Utc>);
-
-#[cfg(test)]
-impl Clock for FrozenClock {
-    fn now(&self) -> chrono::DateTime<chrono::Utc> {
-        self.0
+    async fn perform(&self, _input: &Notifier) -> Result<(), Self::Error> {
+        println!(
+            "  [worker] notified customer that '{}' was closed",
+            self.subject
+        );
+        Ok(())
     }
 }
 
@@ -133,7 +155,7 @@ impl EventSourced for SupportTicket {
     type Event = SupportTicketEvent;
     type Command = SupportTicketCommand;
     type Error = SupportTicketError;
-    type Services = Arc<dyn Clock>;
+    type Jobs = event_sorcery::jobs![NotifyClosed];
     type Materialized = Table;
 
     const AGGREGATE_TYPE: &'static str = "SupportTicket";
@@ -172,14 +194,13 @@ impl EventSourced for SupportTicket {
 
     async fn initialize(
         command: SupportTicketCommand,
-        services: &Arc<dyn Clock>,
+        _jobs: &JobQueue<Self::Jobs>,
     ) -> Result<Vec<SupportTicketEvent>, SupportTicketError> {
         match command {
-            SupportTicketCommand::Open { subject } => Ok(vec![SupportTicketEvent::Opened {
-                subject,
-                at: services.now(),
-            }]),
-            SupportTicketCommand::AwaitCustomer | SupportTicketCommand::Close => {
+            SupportTicketCommand::Open { subject, at } => {
+                Ok(vec![SupportTicketEvent::Opened { subject, at }])
+            }
+            SupportTicketCommand::AwaitCustomer { .. } | SupportTicketCommand::Close { .. } => {
                 Err(SupportTicketError::NotOpen)
             }
         }
@@ -188,20 +209,25 @@ impl EventSourced for SupportTicket {
     async fn transition(
         &self,
         command: SupportTicketCommand,
-        services: &Arc<dyn Clock>,
+        jobs: &JobQueue<Self::Jobs>,
     ) -> Result<Vec<SupportTicketEvent>, SupportTicketError> {
         match command {
             SupportTicketCommand::Open { .. } => Err(SupportTicketError::AlreadyOpen),
-            SupportTicketCommand::AwaitCustomer => match self.status {
-                Status::Closed => Err(SupportTicketError::AlreadyClosed),
-                Status::Open | Status::Pending => Ok(vec![SupportTicketEvent::AwaitingCustomer {
-                    at: services.now(),
-                }]),
-            },
-            SupportTicketCommand::Close => match self.status {
+            SupportTicketCommand::AwaitCustomer { at } => match self.status {
                 Status::Closed => Err(SupportTicketError::AlreadyClosed),
                 Status::Open | Status::Pending => {
-                    Ok(vec![SupportTicketEvent::Closed { at: services.now() }])
+                    Ok(vec![SupportTicketEvent::AwaitingCustomer { at }])
+                }
+            },
+            SupportTicketCommand::Close { at } => match self.status {
+                Status::Closed => Err(SupportTicketError::AlreadyClosed),
+                Status::Open | Status::Pending => {
+                    // Enqueue the notification side effect; it flushes atomically
+                    // with the Closed event and runs in a supervised worker.
+                    jobs.push(NotifyClosed {
+                        subject: self.subject.clone(),
+                    });
+                    Ok(vec![SupportTicketEvent::Closed { at }])
                 }
             },
         }
@@ -222,10 +248,6 @@ mod tests {
         chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc)
-    }
-
-    fn clock() -> Arc<dyn Clock> {
-        Arc::new(FrozenClock(fixed_instant()))
     }
 
     #[test]
@@ -258,12 +280,14 @@ mod tests {
 
     #[tokio::test]
     async fn open_then_close_emits_closed_event() {
-        TestHarness::<SupportTicket>::with(clock())
+        TestHarness::<SupportTicket>::new()
             .given(vec![SupportTicketEvent::Opened {
                 subject: "login broken".to_string(),
                 at: fixed_instant(),
             }])
-            .when(SupportTicketCommand::Close)
+            .when(SupportTicketCommand::Close {
+                at: fixed_instant(),
+            })
             .await
             .then_expect_events(&[SupportTicketEvent::Closed {
                 at: fixed_instant(),
@@ -272,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn closing_twice_returns_already_closed() {
-        let error = TestHarness::<SupportTicket>::with(clock())
+        let error = TestHarness::<SupportTicket>::new()
             .given(vec![
                 SupportTicketEvent::Opened {
                     subject: "login broken".to_string(),
@@ -282,7 +306,9 @@ mod tests {
                     at: fixed_instant(),
                 },
             ])
-            .when(SupportTicketCommand::Close)
+            .when(SupportTicketCommand::Close {
+                at: fixed_instant(),
+            })
             .await
             .then_expect_error();
 
@@ -294,7 +320,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_round_trip_against_in_memory_store() {
-        let store = TestStore::<SupportTicket>::new(clock());
+        let store = TestStore::<SupportTicket>::new();
         let id = TicketId(1);
 
         store
@@ -302,12 +328,18 @@ mod tests {
                 &id,
                 SupportTicketCommand::Open {
                     subject: "x".to_string(),
+                    at: fixed_instant(),
                 },
             )
             .await
             .unwrap();
         store
-            .send(&id, SupportTicketCommand::AwaitCustomer)
+            .send(
+                &id,
+                SupportTicketCommand::AwaitCustomer {
+                    at: fixed_instant(),
+                },
+            )
             .await
             .unwrap();
 
@@ -321,7 +353,7 @@ mod tests {
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
 
         let (store, projection) = StoreBuilder::<SupportTicket>::new(pool.clone())
-            .build(clock())
+            .build()
             .await
             .unwrap();
 
@@ -335,13 +367,19 @@ mod tests {
                     &id,
                     SupportTicketCommand::Open {
                         subject: "x".to_string(),
+                        at: fixed_instant(),
                     },
                 )
                 .await
                 .unwrap();
         }
         store
-            .send(&bravo, SupportTicketCommand::Close)
+            .send(
+                &bravo,
+                SupportTicketCommand::Close {
+                    at: fixed_instant(),
+                },
+            )
             .await
             .unwrap();
 
@@ -356,34 +394,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_all_replays_views_from_events_idempotently() {
+    async fn closing_enqueues_a_notify_job() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
 
-        let (store, projection) = StoreBuilder::<SupportTicket>::new(pool.clone())
-            .build(clock())
+        let (store, _projection) = StoreBuilder::<SupportTicket>::new(pool.clone())
+            .build()
             .await
             .unwrap();
 
-        let alpha = TicketId(1);
+        let id = TicketId(1);
         store
             .send(
-                &alpha,
+                &id,
                 SupportTicketCommand::Open {
-                    subject: "x".to_string(),
+                    subject: "billing".to_string(),
+                    at: fixed_instant(),
                 },
             )
             .await
             .unwrap();
         store
-            .send(&alpha, SupportTicketCommand::AwaitCustomer)
+            .send(
+                &id,
+                SupportTicketCommand::Close {
+                    at: fixed_instant(),
+                },
+            )
             .await
             .unwrap();
 
-        projection.rebuild_all().await.unwrap();
-        projection.rebuild_all().await.unwrap();
-
-        let ticket = projection.load(&alpha).await.unwrap().unwrap();
-        assert_eq!(ticket.status, Status::Pending);
+        // The Close handler enqueued a NotifyClosed job; it is a pending row in
+        // the job_queue, flushed in the same transaction as the Closed event.
+        let pending: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM job_queue WHERE kind = 'notify-closed'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pending, 1);
     }
 }

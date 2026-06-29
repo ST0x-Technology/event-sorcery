@@ -79,6 +79,15 @@ impl PersistedEventRepository for SqliteEventRepository {
         &self,
         aggregate_id: &str,
     ) -> Result<Option<SerializedSnapshot>, PersistenceError> {
+        // This layer is generic over `cqrs_es::Aggregate` and never deletes
+        // events, so for the stores it manages the full history is always
+        // present and replaying it is safe. It returns the snapshot as stored;
+        // on a deserialize failure `cqrs_es::EventStore::load_aggregate` ignores
+        // the stale snapshot and rebuilds from events (its built-in corruption
+        // recovery). The compaction-aware override -- needed only where events
+        // CAN be deleted, so that an unrecoverable snapshot surfaces an error
+        // instead of a silent rebuild from incomplete history (ADR-0003) -- lives
+        // in the event-sorcery layer that knows `EventSourced::COMPACTION_POLICY`.
         Ok(self.load_snapshot::<A>(aggregate_id).await?)
     }
 
@@ -686,6 +695,66 @@ mod tests {
         assert_eq!(loaded.current_sequence, 9);
         assert_eq!(loaded.current_snapshot, 2);
         assert_eq!(loaded.aggregate, aggregate);
+    }
+
+    #[tokio::test]
+    async fn incompatible_snapshot_is_returned_unchanged_and_load_rebuilds() {
+        let pool = create_test_pool().await.unwrap();
+        let repo = SqliteEventRepository::new(pool.clone());
+
+        // sqlite-es never deletes events and cannot see a compaction policy, so
+        // it does not discard an incompatible snapshot (ADR-0003): get_snapshot
+        // returns the stored row unchanged, and cqrs-es then ignores the stale
+        // snapshot and rebuilds from the always-complete event history.
+        let events: Vec<SerializedEvent> = (1..=3)
+            .map(|sequence| SerializedEvent {
+                aggregate_type: TestAggregate::TYPE.to_string(),
+                aggregate_id: "agg-incompatible".to_string(),
+                sequence,
+                event_type: "Created".to_string(),
+                event_version: "1.0".to_string(),
+                payload: serde_json::json!("Created"),
+                metadata: serde_json::json!({}),
+            })
+            .collect();
+        repo.insert_events(&events).await.unwrap();
+        repo.update_snapshot::<TestAggregate>(
+            "agg-incompatible",
+            3,
+            1,
+            serde_json::json!({"events": "not-a-list"}),
+        )
+        .await
+        .unwrap();
+
+        // get_snapshot returns the incompatible row unchanged, not discarded.
+        let snapshot = repo
+            .get_snapshot::<TestAggregate>("agg-incompatible")
+            .await
+            .unwrap()
+            .expect("snapshot returned unchanged, not discarded");
+        assert_eq!(snapshot.current_sequence, 3);
+        assert_eq!(
+            snapshot.aggregate,
+            serde_json::json!({"events": "not-a-list"})
+        );
+
+        // Loading through the framework rebuilds correct state from events.
+        let store = PersistedEventStore::<_, TestAggregate>::new_snapshot_store(
+            SqliteEventRepository::new(pool.clone()),
+            100,
+        );
+        let mut context = store.load_aggregate("agg-incompatible").await.unwrap();
+        assert_eq!(
+            *context.aggregate(),
+            TestAggregate {
+                events: vec![
+                    "Created".to_string(),
+                    "Created".to_string(),
+                    "Created".to_string(),
+                ],
+            }
+        );
     }
 
     #[tokio::test]

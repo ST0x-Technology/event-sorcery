@@ -1,8 +1,9 @@
 # simple
 
 Single-entity event-sourced example: a `SupportTicket` aggregate moving through
-`Open -> Pending -> Closed`, with an injected `Clock` service and a materialized
-view backed by a SQLite generated column for filtered queries.
+`Open -> Pending -> Closed`, with a materialized view backed by a SQLite
+generated column for filtered queries, and a durable job -- closing a ticket
+enqueues a `NotifyClosed` job that a supervised worker runs.
 
 ## Run
 
@@ -19,9 +20,10 @@ cargo nextest run --manifest-path examples/simple/Cargo.toml
 | Typed `Id` with `Display` + `FromStr`                 | `TicketId`                                   |
 | Domain error with `thiserror`                         | `SupportTicketError`                         |
 | `type Materialized = Table` + `PROJECTION = Table`    | trait consts                                 |
-| Domain service injected via `type Services = Arc<…>`  | `Clock`, `WallClock`, `FrozenClock`          |
+| Typed durable jobs: `type Jobs = jobs![…]`            | `NotifyClosed`, the `Close` handler          |
+| `impl Job` + a supervised worker via the macro        | `NotifyClosed`, `build_supervised_worker!`   |
 | View-table SQL with a generated column                | `migrations/*_support_ticket_view.sql`       |
-| `StoreBuilder::build(clock)` returning a tuple        | `main.rs`                                    |
+| `StoreBuilder::build()` returning a tuple             | `main.rs`                                    |
 | `Projection::load`, `load_all`, `filter`, `rebuild_*` | `main.rs`                                    |
 | `Column` constant pattern                             | `const STATUS: Column = …`                   |
 | `replay`, `TestHarness`, `TestStore`                  | `#[cfg(test)] mod tests` in `support_ticket` |
@@ -40,18 +42,35 @@ SQLite generated column, which lets `Projection::filter` push the predicate into
 SQL. Enum-typed entities have variant-dependent paths and are unsuitable for
 generated columns; prefer `load_all` + filter-in-Rust there.
 
-**Migrations live inside the example crate.** Both the canonical event-sorcery
-schema (events + snapshots tables) and the view-table SQL are committed under
-`migrations/` and applied with `sqlx::migrate!("./migrations")`. This mirrors
-the real consumer layout: a downstream project copies the event-sorcery schema
-into its own migration directory next to its own view tables, rather than
-depending on a path inside the library's source tree.
+**Migrations live inside the example crate.** The canonical event-sorcery schema
+(events + snapshots + the `job_queue` view table) and the view-table SQL are
+committed under `migrations/` and applied with `sqlx::migrate!("./migrations")`.
+This mirrors the real consumer layout: a downstream project copies the
+event-sorcery schema into its own migration directory next to its own view
+tables, rather than depending on a path inside the library's source tree. The
+consumer owns migrations — `StoreBuilder::build()` and `JobRuntime::build()`
+wire over an already-migrated pool and do not migrate themselves.
 
-**`Services = Arc<dyn Clock>`.** Demonstrates how to inject an external
-dependency into command handlers. The example uses a deterministic stub in tests
-for reproducible event payloads; production wires `chrono::Utc::now()` through
-the same trait. `()` is fine when an entity needs no service.
+**Typed jobs instead of injected services.** Command handlers are pure
+`(state, command) -> events` and take only a `JobQueue<Self::Jobs>` — no service
+injection. Inputs that used to come from a service (here, the event timestamp)
+are carried on the command instead, and side effects (notifying the customer)
+become durable jobs. `type Jobs = jobs![NotifyClosed]` declares the job types
+the entity may enqueue; `jobs.push(...)` is compile-checked to only accept a
+declared job. The job is flushed in the same transaction that commits its
+events, so it runs iff the close commits.
 
-**Two named `Clock` impls (`WallClock`, `FrozenClock`)** instead of one
-configurable mock with booleans — distinct types make it obvious at the call
-site which behavior is in play.
+**`build_supervised_worker!`.** Wires a supervised apalis worker per job type
+over one `JobRuntime`, so the consumer supplies only the `Job::Input` bundle
+(`Notifier`) and the macro builds the claim/run/ack pipeline. `main` runs the
+monitor briefly to drain the queue the `Close` command filled.
+
+## Migrating from an existing job system
+
+This example enqueues jobs from a command handler (the atomic-with-events path).
+If you are moving an existing manual or apalis-backed job system onto
+event-sorcery durable jobs — where jobs are enqueued from reactors, polling
+loops, or other jobs, not command handlers — see
+[`docs/migrating-to-durable-jobs.md`](../../docs/migrating-to-durable-jobs.md):
+what event-sorcery covers, the enqueue-side prerequisites it does not ship yet,
+and the safe per-kind cutover.

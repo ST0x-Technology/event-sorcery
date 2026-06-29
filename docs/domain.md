@@ -124,11 +124,16 @@ of state, events, or projections changes. Compared against the persisted version
 in the `schema_registry` table on startup; mismatches clear stale snapshots and
 trigger view rebuilds.
 
-### Service
+### Job
 
-External dependency injected into command handlers (`EventSourced::Services`).
-Used so a handler can produce side-effects (e.g., enqueue work) atomically with
-event persistence. `()` when no services are needed.
+A durable, retryable unit of side-effecting work (`Job`). Command handlers stay
+pure `(state, command) -> events` and enqueue jobs via the typed
+`JobQueue<Self::Jobs>` they receive; the entity declares the job types it may
+dispatch as `EventSourced::Jobs` (a `JobList`, built with the `jobs!` macro, or
+`Nil`). Jobs flush in the same transaction that commits the events, and a
+supervised worker claims and runs each one. There is no service-injection into
+handlers -- inputs a handler needs are carried on the command; side effects are
+jobs.
 
 ### Lifecycle
 

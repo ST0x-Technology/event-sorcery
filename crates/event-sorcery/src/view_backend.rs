@@ -8,7 +8,7 @@
 
 use cqrs_es::Aggregate;
 use cqrs_es::persist::ViewRepository;
-use sqlite_es::SqliteViewRepository;
+use sqlite_es::{IndexedView, SqliteViewRepository};
 
 /// Pluggable storage backend for materialized views, supplying a
 /// concrete [`ViewRepository`] for each `(View, Aggregate)` pair.
@@ -31,8 +31,10 @@ use sqlite_es::SqliteViewRepository;
 /// these bounds (and so don't reintroduce `Lifecycle` into their
 /// `where` clauses).
 pub trait ViewBackend: Send + Sync + 'static {
-    /// View repository for views of `View` over `Aggregate`.
-    type Repo<View, Agg>: ViewRepository<View, Agg> + Send + Sync + 'static
+    /// View repository for views of `View` over `Aggregate`. Carries
+    /// [`IndexedView`] so [`crate::Projection::find`] can run a predicate scan
+    /// without naming the `pub(crate)` `Lifecycle` type in a public bound.
+    type Repo<View, Agg>: ViewRepository<View, Agg> + IndexedView<View, Agg> + Send + Sync + 'static
     where
         View: cqrs_es::View<Agg> + Clone + 'static,
         Agg: Aggregate + 'static;

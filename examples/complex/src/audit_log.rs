@@ -67,7 +67,7 @@ mod tests {
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         let store = StoreBuilder::<Order>::new(pool)
             .with(log.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -102,7 +102,7 @@ mod tests {
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         let store = StoreBuilder::<Order>::new(pool)
             .with(Arc::new(spy.clone()))
-            .build(())
+            .build()
             .await
             .unwrap();
 

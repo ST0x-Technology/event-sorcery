@@ -33,14 +33,7 @@ must_use_candidate = "allow"
 redundant_pub_crate = "allow"
 
 [workspace.dependencies]
-# Exact rc pins: apalis's Jobs-table schema churns between release
-# candidates (e.g. the job column flipped TEXT -> BLOB), and consumers
-# of this library do not inherit our Cargo.lock. Relax once 1.0 final
-# ships.
-apalis = "=1.0.0-rc.9"
-apalis-codec = "=0.1.0-rc.9"
 apalis-core = "=1.0.0-rc.9"
-apalis-sqlite = "=1.0.0-rc.8"
 async-trait = "0.1.89"
 cqrs-es = "0.5.0"
 serde = { version = "1.0.228", features = ["derive"] }
