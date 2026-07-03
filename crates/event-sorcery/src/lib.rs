@@ -16,9 +16,17 @@
 //!   cmd)` takes `&str`, making it trivial to pass the wrong ID.
 //!   This has caused production bugs.
 //!
-//! - **No schema versioning**: When aggregate or view schemas
-//!   change, stale snapshots and views cause silent data
-//!   corruption. Manual database intervention is required.
+//! - **Manual schema versioning**: When aggregate or view schemas
+//!   change, a stale `SCHEMA_VERSION` leaves snapshots and views
+//!   in the old shape. Bumping it is the operator's responsibility;
+//!   [`EventSourced::SCHEMA_VERSION`] plus startup reconciliation
+//!   clears version-mismatched snapshots and rebuilds views. On load,
+//!   an incompatible snapshot for a [`CompactionPolicy::Retain`]
+//!   aggregate is ignored and the entity rebuilt from its
+//!   always-present event history; for a
+//!   [`CompactionPolicy::CompactAfterSnapshot`] aggregate it instead
+//!   surfaces an error, since its events may be gone and the snapshot
+//!   is the only durable state -- so state is never silently lost.
 //!
 //! - **Flat command handling**: A single `handle` method receives
 //!   all commands regardless of lifecycle state. Implementors
@@ -107,7 +115,7 @@ use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
 pub use projection::{Column, Projection, ProjectionError, Table};
 pub use reactor::Reactor;
-pub use schema_registry::{ReconcileError, Reconciler, SchemaRegistry};
+pub use schema_registry::{ReconcileError, Reconciler, SchemaReconciliation, SchemaRegistry};
 use sqlite_event_repository::SqliteEventRepository;
 #[cfg(any(test, feature = "test-support"))]
 pub use testing::{
@@ -310,7 +318,7 @@ impl<Entity: EventSourced> Store<Entity> {
     /// and reconciliation. This constructor exists for cases
     /// where direct construction is needed (e.g., tests).
     pub(crate) fn new(cqrs: SqliteCqrs<Entity>, pool: SqlitePool) -> Self {
-        let repo = SqliteEventRepository::new(pool);
+        let repo = SqliteEventRepository::new(pool, Entity::COMPACTION_POLICY);
         let event_store = PersistedEventStore::new_snapshot_store(repo, Entity::SNAPSHOT_SIZE);
         Self { cqrs, event_store }
     }
@@ -355,7 +363,7 @@ impl<Entity: EventSourced> Store<Entity> {
         pool: SqlitePool,
         id: &Entity::Id,
     ) -> Result<Option<Entity>, SendError<Entity>> {
-        let repo = SqliteEventRepository::new(pool);
+        let repo = SqliteEventRepository::new(pool, Entity::COMPACTION_POLICY);
         let event_store =
             PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
                 repo,
@@ -412,7 +420,7 @@ pub async fn load_entity<Entity: EventSourced>(
     pool: &SqlitePool,
     id: &Entity::Id,
 ) -> Result<Option<Entity>, SendError<Entity>> {
-    let repo = SqliteEventRepository::new(pool.clone());
+    let repo = SqliteEventRepository::new(pool.clone(), Entity::COMPACTION_POLICY);
     let event_store =
         PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
             repo,
@@ -441,7 +449,7 @@ pub async fn send_command<Entity: EventSourced>(
     command: Entity::Command,
     services: Entity::Services,
 ) -> Result<(), SendError<Entity>> {
-    let repo = SqliteEventRepository::new(pool.clone());
+    let repo = SqliteEventRepository::new(pool.clone(), Entity::COMPACTION_POLICY);
     let store = PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
         repo,
         Entity::SNAPSHOT_SIZE,
