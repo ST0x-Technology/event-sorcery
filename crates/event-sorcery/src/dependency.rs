@@ -97,6 +97,7 @@ impl<Head: EventSourced, Tail: EntityList> EntityList for Cons<Head, Tail> {
 ///     .exhaustive()
 ///     .await
 /// ```
+#[derive(Clone)]
 pub enum OneOf<Head, Tail> {
     Here(Head),
     There(Tail),
@@ -515,6 +516,29 @@ mod tests {
         let event =
             <TwoEntityList as HasEntity<Beta>>::inject("b1".to_string(), BetaEvent::Spawned);
         assert!(matches!(event, OneOf::There(OneOf::Here(_))));
+    }
+
+    #[test]
+    fn one_of_clone_preserves_variant_and_payload() {
+        let here: OneOf<(String, AlphaEvent), OneOf<(String, BetaEvent), Never>> =
+            OneOf::Here(("a1".to_string(), AlphaEvent::Born));
+        let there: OneOf<(String, AlphaEvent), OneOf<(String, BetaEvent), Never>> =
+            OneOf::There(OneOf::Here(("b1".to_string(), BetaEvent::Spawned)));
+
+        let here_clone = here.clone();
+        let there_clone = there.clone();
+
+        match (here, here_clone) {
+            (OneOf::Here(original), OneOf::Here(clone)) => assert_eq!(original, clone),
+            _ => panic!("expected both to be OneOf::Here"),
+        }
+
+        match (there, there_clone) {
+            (OneOf::There(OneOf::Here(original)), OneOf::There(OneOf::Here(clone))) => {
+                assert_eq!(original, clone);
+            }
+            _ => panic!("expected both to be OneOf::There(OneOf::Here(_))"),
+        }
     }
 
     #[tokio::test]

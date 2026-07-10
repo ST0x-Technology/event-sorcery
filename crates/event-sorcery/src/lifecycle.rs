@@ -326,6 +326,9 @@ where
                 envelope.payload.clone(),
             );
 
+            // No retry here by design -- wrap the reactor in `RetryOnBusy`
+            // (gated by `IdempotentReactor`) to retry on transient SQLite
+            // busy errors. See `docs/cqrs.md`'s "Reactors" section.
             if let Err(error) = self.reactor.react(injected).await {
                 error!(
                     target: "cqrs",
@@ -346,8 +349,12 @@ mod tests {
     use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use super::*;
+    use crate::dependency::{Cons, Dependent, EntityList};
+    use crate::reactor::{IdempotentReactor, RETRY_MAX_ATTEMPTS, RetryOnBusy};
+    use crate::testing::sqlx_error_with_code;
     use crate::{EventSourced, Nil};
 
     /// Test entity: a simple counter with controllable error behavior.
@@ -654,5 +661,178 @@ mod tests {
         lifecycle.update(&envelope);
 
         assert!(matches!(lifecycle, Lifecycle::Live(Counter { value: 7 })));
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("always fails")]
+    struct AlwaysFailError;
+
+    /// Test reactor that always fails with a non-busy error, proving
+    /// `dispatch`'s baseline swallow behavior (no retry, no panic).
+    struct AlwaysFailReactor {
+        calls: AtomicU32,
+    }
+
+    impl Dependent for AlwaysFailReactor {
+        type Dependencies = Cons<Counter, Nil>;
+    }
+
+    #[async_trait]
+    impl Reactor for AlwaysFailReactor {
+        type Error = AlwaysFailError;
+
+        async fn react(
+            &self,
+            _event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(AlwaysFailError)
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    enum FlakyDispatchError {
+        #[error("busy: {0}")]
+        Busy(#[source] sqlx::Error),
+    }
+
+    /// Test reactor that fails with a busy-classified error a configurable
+    /// number of times before succeeding. Also implements `IdempotentReactor`
+    /// so it can be wrapped in `RetryOnBusy`.
+    ///
+    /// `busy_code` is the SQLite extended result code the busy failures carry,
+    /// so the dispatch recovery path can be driven with both plain
+    /// `SQLITE_BUSY` (`"5"`) and `SQLITE_BUSY_SNAPSHOT` (`"517"`).
+    struct FlakyIdempotentReactor {
+        remaining_busy_failures: AtomicU32,
+        calls: AtomicU32,
+        applied: AtomicBool,
+        busy_code: &'static str,
+    }
+
+    impl Dependent for FlakyIdempotentReactor {
+        type Dependencies = Cons<Counter, Nil>;
+    }
+
+    #[async_trait]
+    impl Reactor for FlakyIdempotentReactor {
+        type Error = FlakyDispatchError;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+
+            let remaining = self.remaining_busy_failures.load(Ordering::SeqCst);
+            if remaining > 0 {
+                self.remaining_busy_failures
+                    .store(remaining - 1, Ordering::SeqCst);
+                return Err(FlakyDispatchError::Busy(sqlx_error_with_code(
+                    self.busy_code,
+                )));
+            }
+
+            let _ = event.into_inner();
+            self.applied.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl IdempotentReactor for FlakyIdempotentReactor {}
+
+    #[tokio::test]
+    async fn dispatch_swallows_reactor_error_without_retry() {
+        let reactor = Arc::new(AlwaysFailReactor {
+            calls: AtomicU32::new(0),
+        });
+        let bridge = ReactorBridge {
+            reactor: Arc::clone(&reactor),
+        };
+        let envelope: EventEnvelope<Lifecycle<Counter>> = EventEnvelope {
+            aggregate_id: "counter-1".to_string(),
+            sequence: 1,
+            payload: CounterEvent::Created { initial: 1 },
+            metadata: HashMap::new(),
+        };
+
+        bridge.dispatch("counter-1", &[envelope]).await;
+
+        assert_eq!(reactor.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Drives the full dispatch -> `RetryOnBusy` -> reactor path to a verified
+    /// successful write with busy failures carrying `busy_code`.
+    async fn dispatch_retries_busy_and_succeeds(busy_code: &'static str) {
+        let reactor = Arc::new(RetryOnBusy {
+            inner: FlakyIdempotentReactor {
+                remaining_busy_failures: AtomicU32::new(2),
+                calls: AtomicU32::new(0),
+                applied: AtomicBool::new(false),
+                busy_code,
+            },
+        });
+        let bridge = ReactorBridge {
+            reactor: Arc::clone(&reactor),
+        };
+        let envelope: EventEnvelope<Lifecycle<Counter>> = EventEnvelope {
+            aggregate_id: "counter-1".to_string(),
+            sequence: 1,
+            payload: CounterEvent::Created { initial: 1 },
+            metadata: HashMap::new(),
+        };
+
+        bridge.dispatch("counter-1", &[envelope]).await;
+
+        assert!(
+            reactor.inner.applied.load(Ordering::SeqCst),
+            "the write must actually land after retrying code {busy_code}"
+        );
+        assert_eq!(reactor.inner.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn dispatch_retries_busy_error_via_retry_on_busy_and_succeeds() {
+        dispatch_retries_busy_and_succeeds("5").await;
+    }
+
+    /// `busy_timeout` cannot absorb `SQLITE_BUSY_SNAPSHOT`; rolling back and
+    /// re-attempting is the only fix. Covers that scenario through the real
+    /// dispatch path, not just `is_retryable_sqlite_busy`'s unit tests.
+    #[tokio::test]
+    async fn dispatch_retries_busy_snapshot_error_via_retry_on_busy_and_succeeds() {
+        dispatch_retries_busy_and_succeeds("517").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dispatch_swallows_retry_on_busy_exhaustion_after_full_schedule() {
+        // Never reaches zero within RETRY_MAX_ATTEMPTS + 1 calls -- exercises
+        // the real production schedule end to end (~4.3s), proving dispatch
+        // still swallows the error once RetryOnBusy exhausts its budget.
+        let reactor = Arc::new(RetryOnBusy {
+            inner: FlakyIdempotentReactor {
+                remaining_busy_failures: AtomicU32::new(u32::MAX),
+                calls: AtomicU32::new(0),
+                applied: AtomicBool::new(false),
+                busy_code: "5",
+            },
+        });
+        let bridge = ReactorBridge {
+            reactor: Arc::clone(&reactor),
+        };
+        let envelope: EventEnvelope<Lifecycle<Counter>> = EventEnvelope {
+            aggregate_id: "counter-1".to_string(),
+            sequence: 1,
+            payload: CounterEvent::Created { initial: 1 },
+            metadata: HashMap::new(),
+        };
+
+        bridge.dispatch("counter-1", &[envelope]).await;
+
+        assert!(!reactor.inner.applied.load(Ordering::SeqCst));
+        assert_eq!(
+            reactor.inner.calls.load(Ordering::SeqCst),
+            RETRY_MAX_ATTEMPTS + 1
+        );
     }
 }

@@ -115,7 +115,13 @@ safe) or `CompactAfterSnapshot`. Compaction never crosses snapshot boundaries.
 
 A side-effect handler keyed off events. Reads from one or more aggregates'
 streams and produces effects (commands on other aggregates, external calls).
-Reactors retry with exponential backoff on optimistic-lock conflicts.
+Retry with exponential backoff is `Projection::react`'s own internal behavior --
+covering both optimistic-lock conflicts and transient SQLite busy/busy-snapshot
+errors -- not a property of reactors in general. A bespoke reactor opts into an
+equivalent retry for transient SQLite busy errors via
+`RetryOnBusy`/`IdempotentReactor` or `retry_with_backoff` (see
+[docs/cqrs.md](cqrs.md#reactors)); one that does neither still logs and drops
+its update on a busy error.
 
 ### Schema Version
 
