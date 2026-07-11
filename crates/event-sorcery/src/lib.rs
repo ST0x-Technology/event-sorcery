@@ -122,7 +122,7 @@ pub use lifecycle::{LifecycleError, Never};
 pub use projection::{Column, Projection, ProjectionError, Table};
 pub use reactor::{
     IdempotentReactor, RETRY_MAX_ATTEMPTS, RETRY_SCHEDULE, Reactor, RetryBaseDelay, RetryMaxDelay,
-    RetryOnBusy, RetrySchedule, is_retryable_sqlite_busy, retry_with_backoff,
+    RetryOnBusy, RetrySchedule, RetryScheduleError, is_retryable_sqlite_busy, retry_with_backoff,
 };
 pub use schema_registry::{ReconcileError, Reconciler, SchemaReconciliation, SchemaRegistry};
 use sqlite_event_repository::SqliteEventRepository;
