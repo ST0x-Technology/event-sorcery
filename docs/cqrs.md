@@ -379,8 +379,8 @@ which would re-fire the preceding side effects:
 ```rust
 use cqrs_es::AggregateError;
 use event_sorcery::{
-    RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS, SendError,
-    is_retryable_sqlite_busy, retry_with_backoff,
+    RETRY_MAX_ATTEMPTS, RETRY_SCHEDULE, SendError, is_retryable_sqlite_busy,
+    retry_with_backoff,
 };
 
 /// Reaches the busy error that `AggregateError`'s unsourced box hides from the
@@ -404,8 +404,7 @@ async fn react(&self, event: /* ... */) -> Result<(), MyReactorError> {
 
     retry_with_backoff(
         RETRY_MAX_ATTEMPTS,
-        RETRY_BASE_DELAY_MS,
-        RETRY_MAX_DELAY_MS,
+        RETRY_SCHEDULE,
         || self.store.send(position_id.clone(), Rebalance { quote }),
         send_error_is_busy,
     )
@@ -440,7 +439,7 @@ The per-event cost is **the sleep budget plus up to one `busy_timeout` per
 attempt**:
 
 - **Sleep budget: ~4.3s.** The sum of the backoff delays between the 11 attempts
-  (see `RETRY_MAX_ATTEMPTS` / `RETRY_BASE_DELAY_MS` / `RETRY_MAX_DELAY_MS`).
+  (see `RETRY_MAX_ATTEMPTS` / `RETRY_SCHEDULE`).
 - **Plus up to `busy_timeout` per attempt.** A plain `SQLITE_BUSY` does not
   surface to the application immediately: SQLite first waits out the
   connection's `busy_timeout`, which sqlx defaults to **5s**. Under persistent

@@ -166,8 +166,7 @@ where
     ) -> Result<(), Self::Error> {
         retry_with_backoff(
             RETRY_MAX_ATTEMPTS,
-            RETRY_BASE_DELAY_MS,
-            RETRY_MAX_DELAY_MS,
+            RETRY_SCHEDULE,
             move || {
                 let event = event.clone();
                 async move { self.inner.react(event).await }
@@ -190,41 +189,86 @@ where
     }
 }
 
-/// Default retry schedule: 10ms base delay, doubling, capped at 1s, 10 retries.
+/// The starting delay of an exponential-backoff retry schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryBaseDelay(pub Duration);
+
+/// The delay ceiling of an exponential-backoff retry schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryMaxDelay(pub Duration);
+
+/// The base and max delay of an exponential-backoff retry schedule.
 ///
-/// That is a ~4.3s total retry budget. Shared between `Projection::react`'s own
-/// retry loop and [`RetryOnBusy`]'s call to [`retry_with_backoff`], so the two
-/// stay in sync without sharing the loop itself.
+/// `base_delay` and `max_delay` are distinct newtypes (not two positional
+/// `Duration` args, nor two same-typed named fields), so a call site cannot
+/// transpose them -- swapping which value is assigned to which field is a
+/// type error, not just a naming-discipline convention. See
+/// [`RETRY_SCHEDULE`] for the production default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetrySchedule {
+    pub base_delay: RetryBaseDelay,
+    pub max_delay: RetryMaxDelay,
+}
+
+/// Number of retries before `retry_with_backoff`/`Projection::react` give up.
+/// See [`RETRY_SCHEDULE`] for the delay progression.
 pub const RETRY_MAX_ATTEMPTS: u32 = 10;
-pub const RETRY_BASE_DELAY_MS: u64 = 10;
-pub const RETRY_MAX_DELAY_MS: u64 = 1000;
+
+/// Default retry schedule: 10ms base delay, doubling, capped at 1s.
+///
+/// Combined with [`RETRY_MAX_ATTEMPTS`] = 10, that is a ~4.3s total retry
+/// budget. Shared between `Projection::react`'s own retry loop and
+/// [`RetryOnBusy`]'s call to [`retry_with_backoff`], so the two stay in sync
+/// without sharing the loop itself.
+pub const RETRY_SCHEDULE: RetrySchedule = RetrySchedule {
+    base_delay: RetryBaseDelay(Duration::from_millis(10)),
+    max_delay: RetryMaxDelay(Duration::from_secs(1)),
+};
 
 /// Computes the exponential backoff delay for a given retry attempt.
 ///
-/// Saturates toward `max_delay_ms` instead of overflowing: a caller-supplied
-/// `attempt`/`base_delay_ms` large enough to overflow the exponential term
-/// just hits the cap sooner rather than panicking (debug) or wrapping
-/// (release). Shared by [`retry_with_backoff`] and `Projection::react`'s own
-/// retry loop so the two schedules can't silently diverge on this property.
-pub(crate) fn backoff_delay_ms(attempt: u32, base_delay_ms: u64, max_delay_ms: u64) -> u64 {
-    2u64.checked_pow(attempt)
-        .and_then(|multiplier| base_delay_ms.checked_mul(multiplier))
-        .map_or(max_delay_ms, |computed| computed.min(max_delay_ms))
+/// Doubles `schedule.base_delay` once per attempt (iteratively, so there is
+/// no artificial exponent ceiling), clamping to `schedule.max_delay` the
+/// moment doubling would reach or exceed it. `attempt == 0` returns
+/// `base_delay` itself (clamped if `base_delay` already exceeds `max_delay`,
+/// e.g. a misconfigured schedule). Shared by [`retry_with_backoff`] and
+/// `Projection::react`'s own retry loop so the two schedules can't silently
+/// diverge on this property.
+pub(crate) fn backoff_delay(attempt: u32, schedule: RetrySchedule) -> Duration {
+    let RetryBaseDelay(base_delay) = schedule.base_delay;
+    let RetryMaxDelay(max_delay) = schedule.max_delay;
+
+    // Doubling zero stays zero, so the loop below would spin for the full
+    // `attempt` count without ever changing state; short-circuit so a caller
+    // with a zero base delay and a huge `attempt` doesn't block on a no-op.
+    if base_delay.is_zero() {
+        return base_delay.min(max_delay);
+    }
+
+    let mut delay = base_delay;
+
+    for _ in 0..attempt {
+        match delay.checked_mul(2) {
+            Some(doubled) if doubled < max_delay => delay = doubled,
+            _ => return max_delay,
+        }
+    }
+
+    delay.min(max_delay)
 }
 
 /// Retries `make_attempt` with exponential backoff while `should_retry`
 /// returns `true` for the error, up to `max_attempts` retries (so
 /// `max_attempts + 1` total calls in the worst case).
 ///
-/// The schedule is an explicit parameter rather than baked-in constants so
-/// callers exercising the exhaustion/backoff mechanics in tests can use a
-/// tiny synthetic schedule instead of paying the real multi-second
-/// production budget. Production callers pass [`RETRY_MAX_ATTEMPTS`],
-/// [`RETRY_BASE_DELAY_MS`], and [`RETRY_MAX_DELAY_MS`].
+/// The schedule is an explicit parameter rather than baked into
+/// `retry_with_backoff` itself so callers exercising the exhaustion/backoff
+/// mechanics in tests can use a tiny synthetic schedule instead of paying
+/// the real multi-second production budget. Production callers pass
+/// [`RETRY_MAX_ATTEMPTS`] and [`RETRY_SCHEDULE`].
 pub async fn retry_with_backoff<Output, Error, MakeAttempt, Attempt>(
     max_attempts: u32,
-    base_delay_ms: u64,
-    max_delay_ms: u64,
+    schedule: RetrySchedule,
     mut make_attempt: MakeAttempt,
     should_retry: impl Fn(&Error) -> bool,
 ) -> Result<Output, Error>
@@ -238,13 +282,13 @@ where
         match make_attempt().await {
             Ok(output) => return Ok(output),
             Err(error) if attempt < max_attempts && should_retry(&error) => {
-                let delay_ms = backoff_delay_ms(attempt, base_delay_ms, max_delay_ms);
+                let delay = backoff_delay(attempt, schedule);
                 warn!(
                     target: "cqrs",
-                    attempt = attempt + 1, max_attempts, delay_ms,
+                    attempt = attempt + 1, max_attempts, delay_ms = delay.as_millis(),
                     "Retrying after transient error"
                 );
-                sleep(Duration::from_millis(delay_ms)).await;
+                sleep(delay).await;
                 attempt += 1;
             }
             Err(error) => return Err(error),
@@ -643,8 +687,10 @@ mod tests {
     /// module doc comment on why the schedule is a parameter, not baked-in
     /// consts, on this helper.
     const TEST_MAX_ATTEMPTS: u32 = 3;
-    const TEST_BASE_DELAY_MS: u64 = 1;
-    const TEST_MAX_DELAY_MS: u64 = 5;
+    const TEST_SCHEDULE: RetrySchedule = RetrySchedule {
+        base_delay: RetryBaseDelay(Duration::from_millis(1)),
+        max_delay: RetryMaxDelay(Duration::from_millis(5)),
+    };
 
     #[tokio::test]
     async fn retry_with_backoff_succeeds_on_first_attempt() {
@@ -652,8 +698,7 @@ mod tests {
 
         let result = retry_with_backoff(
             TEST_MAX_ATTEMPTS,
-            TEST_BASE_DELAY_MS,
-            TEST_MAX_DELAY_MS,
+            TEST_SCHEDULE,
             || {
                 call_count.fetch_add(1, Ordering::SeqCst);
                 async { Ok::<_, SyntheticError>(42) }
@@ -672,8 +717,7 @@ mod tests {
 
         let result = retry_with_backoff(
             TEST_MAX_ATTEMPTS,
-            TEST_BASE_DELAY_MS,
-            TEST_MAX_DELAY_MS,
+            TEST_SCHEDULE,
             || {
                 let attempt = call_count.fetch_add(1, Ordering::SeqCst);
                 async move {
@@ -698,8 +742,7 @@ mod tests {
 
         let result: Result<u32, SyntheticError> = retry_with_backoff(
             TEST_MAX_ATTEMPTS,
-            TEST_BASE_DELAY_MS,
-            TEST_MAX_DELAY_MS,
+            TEST_SCHEDULE,
             || {
                 call_count.fetch_add(1, Ordering::SeqCst);
                 async { Err(SyntheticError::Permanent) }
@@ -718,8 +761,7 @@ mod tests {
 
         let result: Result<u32, SyntheticError> = retry_with_backoff(
             TEST_MAX_ATTEMPTS,
-            TEST_BASE_DELAY_MS,
-            TEST_MAX_DELAY_MS,
+            TEST_SCHEDULE,
             || {
                 call_count.fetch_add(1, Ordering::SeqCst);
                 async { Err(SyntheticError::Retryable) }
@@ -732,20 +774,25 @@ mod tests {
         assert_eq!(call_count.load(Ordering::SeqCst), TEST_MAX_ATTEMPTS + 1);
     }
 
-    /// `2u64.pow(attempt)` overflows once `attempt >= 64`. A caller-supplied
-    /// schedule with enough attempts to reach that must saturate toward
-    /// `max_delay_ms` instead of panicking (debug builds) or silently
-    /// wrapping (release builds) -- this exercises exactly that range with a
-    /// tiny delay so the test stays fast.
+    /// A high attempt count with `base_delay == max_delay` must not panic
+    /// (debug builds) or hang the retry loop (release builds) even though
+    /// every attempt saturates to `max_delay` on the very first doubling --
+    /// this exercises the retry loop end-to-end with a tiny delay so the
+    /// test stays fast. It does not itself force `Duration::checked_mul`
+    /// overflow inside `backoff_delay`; see
+    /// `backoff_delay_saturates_to_max_on_duration_overflow` for that.
     #[tokio::test]
     async fn retry_with_backoff_caps_delay_without_overflow_at_high_attempt_counts() {
         const HIGH_MAX_ATTEMPTS: u32 = 70;
+        const HIGH_ATTEMPT_SCHEDULE: RetrySchedule = RetrySchedule {
+            base_delay: RetryBaseDelay(Duration::from_millis(1)),
+            max_delay: RetryMaxDelay(Duration::from_millis(1)),
+        };
         let call_count = AtomicU32::new(0);
 
         let result: Result<u32, SyntheticError> = retry_with_backoff(
             HIGH_MAX_ATTEMPTS,
-            1,
-            1,
+            HIGH_ATTEMPT_SCHEDULE,
             || {
                 call_count.fetch_add(1, Ordering::SeqCst);
                 async { Err(SyntheticError::Retryable) }
@@ -756,6 +803,72 @@ mod tests {
 
         assert_eq!(result.unwrap_err(), SyntheticError::Retryable);
         assert_eq!(call_count.load(Ordering::SeqCst), HIGH_MAX_ATTEMPTS + 1);
+    }
+
+    /// `base_delay` and `max_delay` are distinct newtypes (`RetryBaseDelay`,
+    /// `RetryMaxDelay`), so a role-swapped `RetrySchedule` literal (passing a
+    /// `RetryMaxDelay` where `base_delay` is expected, or vice versa) is now a
+    /// compile error rather than a value that could silently clamp wrong --
+    /// there is no runtime case left to exercise for that failure mode.
+    #[test]
+    fn backoff_delay_applies_base_and_max_by_role() {
+        let schedule = RetrySchedule {
+            base_delay: RetryBaseDelay(Duration::from_millis(10)),
+            max_delay: RetryMaxDelay(Duration::from_millis(1000)),
+        };
+
+        // attempt 0: base_delay * 2^0 = base_delay, well under max_delay.
+        assert_eq!(backoff_delay(0, schedule), Duration::from_millis(10));
+        // attempt 6: base_delay * 2^6 = 640ms, still under max_delay.
+        assert_eq!(backoff_delay(6, schedule), Duration::from_millis(640));
+        // attempt 7: base_delay * 2^7 = 1280ms, clamped to max_delay.
+        assert_eq!(backoff_delay(7, schedule), Duration::from_millis(1000));
+    }
+
+    /// A misconfigured schedule where `base_delay` already exceeds
+    /// `max_delay`. The doc comment on `backoff_delay` promises `attempt ==
+    /// 0` is clamped in this case; the final `.min(max_delay)` is what makes
+    /// that true, so this exercises that branch directly.
+    #[test]
+    fn backoff_delay_clamps_base_delay_exceeding_max_delay() {
+        let misconfigured_schedule = RetrySchedule {
+            base_delay: RetryBaseDelay(Duration::from_millis(1000)),
+            max_delay: RetryMaxDelay(Duration::from_millis(10)),
+        };
+
+        assert_eq!(
+            backoff_delay(0, misconfigured_schedule),
+            Duration::from_millis(10),
+        );
+    }
+
+    /// Forces the `Duration::checked_mul(2)` guard in `backoff_delay` to
+    /// genuinely overflow (return `None`), not merely hit the
+    /// `doubled >= max_delay` clamp. `max_delay` is set to `Duration::MAX`
+    /// so the only way `backoff_delay` can return it is via the overflow
+    /// branch: repeatedly doubling a 1-second `base_delay` exceeds the
+    /// representable range of `Duration` (whose seconds field is `u64`)
+    /// well before the attempt count below is exhausted.
+    #[test]
+    fn backoff_delay_saturates_to_max_on_duration_overflow() {
+        const OVERFLOW_SCHEDULE: RetrySchedule = RetrySchedule {
+            base_delay: RetryBaseDelay(Duration::from_secs(1)),
+            max_delay: RetryMaxDelay(Duration::MAX),
+        };
+
+        assert_eq!(backoff_delay(70, OVERFLOW_SCHEDULE), Duration::MAX);
+    }
+
+    /// A zero `base_delay` never grows under doubling, so `backoff_delay`
+    /// returns `Duration::ZERO` regardless of the attempt count.
+    #[test]
+    fn backoff_delay_is_bounded_for_zero_base_delay() {
+        const ZERO_BASE_SCHEDULE: RetrySchedule = RetrySchedule {
+            base_delay: RetryBaseDelay(Duration::ZERO),
+            max_delay: RetryMaxDelay(Duration::from_secs(1)),
+        };
+
+        assert_eq!(backoff_delay(1_000_000, ZERO_BASE_SCHEDULE), Duration::ZERO);
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
