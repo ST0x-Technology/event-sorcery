@@ -120,6 +120,28 @@ The typed front door for command dispatch. Takes a strongly-typed `Id` and a
 `Command`, routes through `Lifecycle` based on current state, and returns a
 typed `SendError<Entity>`. Hides `cqrs-es::CqrsFramework` entirely.
 
+`Store::send` serializes commands per aggregate ID: the full load -> handle ->
+commit -> reactor/projection-dispatch cycle of one command completes before the
+next command on the _same_ aggregate begins, so reactors and projections observe
+events in commit order. Commands to different aggregate IDs still run
+concurrently. Two consequences: concurrent same-aggregate commands now queue
+rather than one failing with an optimistic-lock error, and a command can wait
+behind an in-flight same-aggregate command's slow reactor retries. A reactor
+commanding the same `(entity type, aggregate ID)` it is currently reacting to --
+directly, or transitively through a chain of other reactors' inline-awaited
+dispatches within the same command -- would deadlock against the held lock;
+`Store::send` detects this within a single task and fails fast with
+`LifecycleError::ReentrantCommand` instead. That guard only catches same-task
+inline self-commands, so it does not reach across tasks: two separate,
+concurrently in-flight command chains that reference each other (aggregate A's
+reactor commands B while B's reactor concurrently commands A) can still
+deadlock, and so can a same-aggregate command a reactor moves onto a different
+task (e.g. `tokio::spawn(...).await`) -- that spawned task starts with an empty
+guard scope of its own, so it blocks on the mutex the spawning task is still
+holding. Avoid cross-aggregate cycles, and never move a same-aggregate command
+off-task within a reactor; defer such work until after `react()` returns. See
+ADR-0004.
+
 ### `Projection<Entity, Backend>`
 
 The read-side. A SQLite-backed materialized view that consumers query for entity
@@ -173,7 +195,9 @@ projection becomes a type error, not silent data staleness.
 
 ### Write path
 
-1. Caller invokes `Store::send(&id, command)`.
+1. Caller invokes `Store::send(&id, command)`, which acquires a per-aggregate-
+   ID lock before proceeding (steps 2-5 all run under that lock; see
+   `Store<Entity>` above and ADR-0004).
 2. `Store` looks up the aggregate, loads its `Lifecycle`, applies any relevant
    snapshot, replays uncached events.
 3. `Lifecycle::handle` routes to `EventSourced::initialize` (no state) or
@@ -181,7 +205,8 @@ projection becomes a type error, not silent data staleness.
 4. `cqrs-es::CqrsFramework` persists events with monotonic sequence numbers in
    the same SQL transaction as any side-effects implemented via cqrs-es
    `Service`s.
-5. Reactors registered on this aggregate are notified.
+5. Reactors registered on this aggregate are notified, in commit order, before
+   the lock is released and `send` returns.
 
 ### Read path
 

@@ -119,7 +119,10 @@ impl<R: Reactor> Reactor for Arc<R> {
 /// on the same database file -- can block that caller *per reacted event*, and
 /// a command that emits multiple events dispatches the reactor once per event,
 /// so the worst-case block is that per-event cost multiplied by the event
-/// count.
+/// count. `Store::send` also serializes commands per aggregate ID (see
+/// ADR-0004), so this block is not confined to the original caller: any other
+/// command queued behind it on the *same* aggregate also waits it out before it
+/// can even begin.
 ///
 /// The per-event cost is **the ~4.3s sleep budget plus up to one
 /// `busy_timeout` per attempt**, not ~4.3s flat. The sleep budget is only the

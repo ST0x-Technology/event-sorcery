@@ -104,6 +104,21 @@ pub enum LifecycleError<Entity: EventSourced> {
     },
     #[error(transparent)]
     Apply(Entity::Error),
+    /// A command in this task is already commanding the same aggregate (directly,
+    /// or transitively through a chain of inline-awaited reactor dispatches) when
+    /// another `Store::send()` for that same aggregate is attempted. Reactors are
+    /// dispatched inline while `Store::send`'s per-aggregate lock is held (see
+    /// ADR-0004), so a same-aggregate self-command would block forever on a lock
+    /// this task already holds. Returned instead of deadlocking.
+    ///
+    /// The offending aggregate ID is logged at the `Store::send` return site
+    /// rather than carried here, to avoid widening `EventSourced::Id`'s bounds
+    /// just for this one error variant.
+    #[error(
+        "command to this aggregate is already in flight in this task \
+         (reentrant same-aggregate command would deadlock on the held per-aggregate lock)"
+    )]
+    ReentrantCommand,
 }
 
 /// Uninhabited error type for entities with infallible

@@ -104,8 +104,14 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sqlx::AssertSqlSafe;
 use sqlx::SqlitePool;
+use std::any::TypeId;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::str::FromStr;
+use std::sync::{Arc, Mutex as SyncMutex, PoisonError};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::task_local;
+use tracing::{error, warn};
 
 #[doc(hidden)]
 pub use dependency::Cons;
@@ -309,9 +315,75 @@ pub trait EventSourced:
 /// startup. The builder handles CQRS framework construction,
 /// query wiring, and schema reconciliation, returning a
 /// ready-to-use `Store`.
+///
+/// `send` serializes commands per aggregate ID (see
+/// [`PerAggregateLocks`]): the whole load -> handle -> commit ->
+/// reactor/projection-dispatch cycle of one command completes
+/// before the next command on the *same* aggregate begins, so
+/// reactors and projections observe events in commit order.
+/// Commands to different aggregate IDs still run concurrently.
+///
+/// **Reentrancy hazard:** because the lock is held across the
+/// whole command (including reactor dispatch), a reactor calling
+/// `Store::send()` back onto the same `(Entity, Entity::Id)` it is
+/// currently reacting to -- directly, or transitively through a
+/// chain of other reactors' inline-awaited dispatches within the
+/// *same inline await-chain* -- would deadlock against the held
+/// lock. `Store::send` detects this via a task-local set of
+/// in-flight aggregate keys, inherited down that await-chain, and
+/// fails fast with [`LifecycleError::ReentrantCommand`] instead of
+/// hanging.
+///
+/// **The guard catches ancestor self-cycles, not sibling
+/// concurrency.** It tracks *inline await-chain ancestry*, not task
+/// identity: a `send()` rejects `id` only if a call somewhere up its
+/// own chain of awaiters already holds it. Two sibling `send()`
+/// calls to the same aggregate -- e.g. issued via `tokio::join!` from
+/// inside a reactor -- each inherit the same ancestor snapshot and so
+/// neither sees the other's in-flight key. Provided that aggregate is
+/// not itself in the snapshot they inherited, they queue on
+/// [`PerAggregateLocks`] normally, exactly like two unrelated calls
+/// would, rather than one spuriously failing as reentrant. Siblings
+/// aimed at the aggregate the reactor is *currently reacting to* are
+/// the other case entirely: that key is already in the inherited
+/// snapshot, so each is rejected with
+/// [`LifecycleError::ReentrantCommand`] -- being siblings buys them
+/// nothing, because each one is an ancestor self-cycle in its own
+/// right.
+///
+/// A reactor that moves a same-aggregate `send()` onto a *different*
+/// task -- e.g. `tokio::spawn(async move { store.send(&id, cmd).await
+/// }).await` -- escapes the guard entirely. The spawned task starts
+/// with an empty task-local scope, so it blocks on the per-aggregate
+/// mutex the outer task is still holding across that spawn-and-
+/// await, exactly like the cross-aggregate cycle below. Never move a
+/// same-aggregate command off-task from within a reactor; defer such
+/// work until after `react()` returns.
+///
+/// **Cross-aggregate cycles are not detected.** The reentrancy guard
+/// only catches a self-cycle within a single inline await-chain. Two
+/// *separate*, concurrently in-flight command chains that reference
+/// each other -- e.g. aggregate A's reactor commands B while,
+/// concurrently, B's reactor commands A, whether on separate tasks or
+/// via sibling futures joined/selected within one task -- can still
+/// deadlock: each chain holds one aggregate's lock while blocking on
+/// the other's. This is inherent to the per-aggregate ordering
+/// guarantee (see ADR-0004); avoid bidirectional cross-aggregate
+/// command cycles, or defer the cross-aggregate `send()` until after
+/// `react()` returns (e.g. via a channel/queue drained outside the
+/// reacting command) so it does not run under the held lock.
+///
+/// **Aggregate IDs must be of bounded cardinality.** The per-aggregate
+/// lock map is never evicted: it holds one mutex per distinct
+/// `Entity::Id` this `Store` has ever commanded, for the lifetime of
+/// the `Store`. That is sized for business-entity cardinality (see
+/// ADR-0004), so a `Store` fed an unbounded stream of fresh IDs -- one
+/// per request, say -- grows its lock map without bound. Do not use
+/// `Entity::Id`s that are effectively unique per command.
 pub struct Store<Entity: EventSourced> {
     cqrs: SqliteCqrs<Entity>,
-    event_store: PersistedEventStore<SqliteEventRepository, Lifecycle<Entity>>,
+    persisted_events: PersistedEventStore<SqliteEventRepository, Lifecycle<Entity>>,
+    locks: PerAggregateLocks,
 }
 
 impl<Entity: EventSourced> Store<Entity> {
@@ -322,8 +394,12 @@ impl<Entity: EventSourced> Store<Entity> {
     /// where direct construction is needed (e.g., tests).
     pub(crate) fn new(cqrs: SqliteCqrs<Entity>, pool: SqlitePool) -> Self {
         let repo = SqliteEventRepository::new(pool, Entity::COMPACTION_POLICY);
-        let event_store = PersistedEventStore::new_snapshot_store(repo, Entity::SNAPSHOT_SIZE);
-        Self { cqrs, event_store }
+        let persisted_events = PersistedEventStore::new_snapshot_store(repo, Entity::SNAPSHOT_SIZE);
+        Self {
+            cqrs,
+            persisted_events,
+            locks: PerAggregateLocks::default(),
+        }
     }
 
     /// Send a command to the entity identified by `id`.
@@ -333,12 +409,79 @@ impl<Entity: EventSourced> Store<Entity> {
     /// - Uninitialized -> `Entity::initialize`
     /// - Live -> `Entity::transition`
     /// - Failed -> returns the stored error
+    ///
+    /// Serializes per aggregate ID -- see the type-level doc
+    /// comment on [`Store`] for the ordering guarantee, the
+    /// fail-fast same-aggregate reentrancy guard, and the
+    /// cross-aggregate cycle caveat this introduces.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LifecycleError::ReentrantCommand`] if this call is
+    /// already commanding `id` somewhere up its own inline await-chain
+    /// (directly, or transitively through inline-awaited reactor dispatch)
+    /// instead of blocking forever on the already-held lock. This only
+    /// catches ancestor self-cycles -- see the [`Store`] type-level doc
+    /// comment for the escape hatches (spawned-and-awaited same-aggregate
+    /// `send()`, and cross-aggregate cycles) it does not close.
     pub async fn send(
         &self,
         id: &Entity::Id,
         command: Entity::Command,
     ) -> Result<(), SendError<Entity>> {
-        self.cqrs.execute(&id.to_string(), command).await
+        let lock_key = AggregateLockKey {
+            entity: TypeId::of::<Entity>(),
+            id: id.to_string(),
+        };
+
+        // The extended set is only ever installed in a *new*, nested
+        // `HELD_AGGREGATE_LOCKS` scope wrapping this call's own
+        // `send_under_lock` future below, so it becomes visible only while
+        // code within this call's own await-chain is being polled -- true
+        // descendants (an inline-awaited reactor this call's command
+        // dispatches) see it, but a sibling does not.
+        let admission = HELD_AGGREGATE_LOCKS
+            .try_with(|held| Admission::for_inherited_scope(held, &lock_key))
+            // No scope yet at all (e.g. a brand-new task a reactor spawned
+            // via `tokio::spawn`) -- deliberately treated as "nothing to
+            // detect" rather than "possibly reentrant". A spawned task has
+            // no ancestor call in this chain and cannot see the spawning
+            // task's held keys; that is the documented escape hatch a
+            // spawned-and-awaited same-aggregate `send()` opens -- see the
+            // [`Store`] type-level doc comment.
+            .unwrap_or_else(|_task_local_not_yet_scoped| {
+                Admission::Proceed(HashSet::from([lock_key.clone()]))
+            });
+
+        let held = match admission {
+            Admission::Reject => {
+                error!(
+                    aggregate_id = %lock_key.id,
+                    entity = std::any::type_name::<Entity>(),
+                    "reentrant same-aggregate command rejected",
+                );
+                return Err(LifecycleError::ReentrantCommand.into());
+            }
+            Admission::Proceed(held) => held,
+        };
+
+        HELD_AGGREGATE_LOCKS
+            .scope(held, self.send_under_lock(&lock_key.id, command))
+            .await
+    }
+
+    /// Acquires the per-aggregate lock and runs `command` through `cqrs-es`.
+    /// Called only after `send` has confirmed `id_string`'s key is not
+    /// already held by an ancestor call in this call's own await-chain (and
+    /// has installed a nested [`HELD_AGGREGATE_LOCKS`] scope reflecting
+    /// that), so this never contends with itself.
+    async fn send_under_lock(
+        &self,
+        id_string: &str,
+        command: Entity::Command,
+    ) -> Result<(), SendError<Entity>> {
+        let _lock_guard = self.locks.acquire(id_string).await;
+        self.cqrs.execute(id_string, command).await
     }
 
     /// Load an entity's current state directly from the event store.
@@ -351,7 +494,10 @@ impl<Entity: EventSourced> Store<Entity> {
     /// - `Ok(None)` if the entity has not been initialized
     /// - `Err` if the entity is in a failed lifecycle state or on infrastructure error
     pub async fn load(&self, id: &Entity::Id) -> Result<Option<Entity>, SendError<Entity>> {
-        let context = self.event_store.load_aggregate(&id.to_string()).await?;
+        let context = self
+            .persisted_events
+            .load_aggregate(&id.to_string())
+            .await?;
 
         Ok(context.aggregate.into_result()?)
     }
@@ -367,14 +513,132 @@ impl<Entity: EventSourced> Store<Entity> {
         id: &Entity::Id,
     ) -> Result<Option<Entity>, SendError<Entity>> {
         let repo = SqliteEventRepository::new(pool, Entity::COMPACTION_POLICY);
-        let event_store =
+        let persisted_events =
             PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
                 repo,
                 Entity::SNAPSHOT_SIZE,
             );
-        let context = event_store.load_aggregate(&id.to_string()).await?;
+        let context = persisted_events.load_aggregate(&id.to_string()).await?;
 
         Ok(context.aggregate.into_result()?)
+    }
+}
+
+/// Identifies one aggregate instance (an `Entity` type plus its ID) for the
+/// reentrancy guard and per-aggregate lock table below.
+///
+/// Keyed by `TypeId` plus `String` rather than a formatted string so that two
+/// different `(Entity, id)` pairs can never collide on a shared key, which
+/// `std::any::type_name` (a diagnostic aid, not a type-identity primitive)
+/// plus string concatenation could not guarantee.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct AggregateLockKey {
+    entity: TypeId,
+    id: String,
+}
+
+/// Outcome of the reentrancy check a `Store::send` runs against the lock keys
+/// it inherited from its own await-chain.
+///
+/// Names the reject path instead of leaving it as a shape (a `None` inside an
+/// `Ok`), so the two ways a `send` may proceed -- an inherited scope that does
+/// not already hold this key, and no inherited scope at all -- cannot be
+/// confused with the one way it must not.
+enum Admission {
+    /// An ancestor call in this await-chain already holds this key, so
+    /// proceeding would deadlock on a lock this chain itself is holding.
+    Reject,
+    /// Safe to proceed. Carries the key set to install for this call's own
+    /// nested scope: everything inherited, plus this call's key.
+    Proceed(HashSet<AggregateLockKey>),
+}
+
+impl Admission {
+    /// Snapshot-and-extend, never mutate-in-place: reads the inherited scope
+    /// without touching it, so a sibling `send()` joined/selected alongside
+    /// this one -- which inherited the very same scope -- is unaffected by the
+    /// key this call goes on to add.
+    fn for_inherited_scope(held: &HashSet<AggregateLockKey>, lock_key: &AggregateLockKey) -> Self {
+        if held.contains(lock_key) {
+            return Self::Reject;
+        }
+
+        let mut extended = held.clone();
+        extended.insert(lock_key.clone());
+        Self::Proceed(extended)
+    }
+}
+
+task_local! {
+    /// Aggregate lock keys held by the inline await-chain currently being
+    /// polled, i.e. the in-flight `Store::send` call this scope was
+    /// installed for, plus every ancestor call it inherited a snapshot from.
+    ///
+    /// `CqrsFramework::execute_with_metadata` dispatches every registered
+    /// reactor inline, awaited directly -- so a reactor's own `Store::send()`
+    /// is polled as part of the same await-chain as the outer `execute()`
+    /// that is reacting to it, and this task-local value is visible to it.
+    /// Each `Store::send` call installs its own *nested* scope (see
+    /// `Store::send`) containing a snapshot of whatever it inherited plus its
+    /// own key, rather than mutating the inherited value in place -- a
+    /// `tokio::task_local!` scope is only ever visible while the future it
+    /// wraps is actually being polled, so this nested scope is visible to
+    /// true descendants (an inline-awaited reactor this call's command
+    /// dispatches) but not to a sibling `send()` joined/selected alongside
+    /// this one, which still only sees what it itself inherited. `Store::send`
+    /// checks the inherited snapshot before acquiring [`PerAggregateLocks`] so
+    /// a same-aggregate self-command -- direct or transitive -- fails fast
+    /// with [`LifecycleError::ReentrantCommand`] instead of deadlocking on a
+    /// lock an ancestor call already holds. It does not, and cannot, catch a
+    /// cycle formed by two *separate* concurrently in-flight tasks -- nor a
+    /// same-aggregate `send()` a reactor moves onto a new task via
+    /// `tokio::spawn` and then awaits, since that spawned task starts with
+    /// an empty scope of its own -- see the [`Store`] type-level doc
+    /// comment.
+    static HELD_AGGREGATE_LOCKS: HashSet<AggregateLockKey>;
+}
+
+/// Keyed async mutex serializing `Store::send` per aggregate ID.
+///
+/// See ADR-0004 for the full rationale. An outer `std::sync::Mutex` guards a
+/// map from aggregate ID to a per-aggregate `tokio::sync::Mutex`; callers
+/// clone the `Arc` for their ID out of the map and then hold the per-aggregate
+/// lock across the async command execution. The per-aggregate lock is async
+/// (not `std::sync::Mutex`) because the guard is held across an `.await`
+/// point -- a `std` guard held there would block the executing worker thread.
+///
+/// The map is never evicted: it grows with aggregate-ID cardinality for the
+/// lifetime of the `Store`. Accepted tradeoff for this library's bounded
+/// business-entity cardinality; see ADR-0004.
+#[derive(Default)]
+struct PerAggregateLocks {
+    locks: SyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+}
+
+impl PerAggregateLocks {
+    /// Acquire the lock for `aggregate_id`, creating it on first use.
+    ///
+    /// The returned guard is released by RAII when dropped -- including on
+    /// cancellation of the future holding it -- so there is no separate
+    /// release step.
+    async fn acquire(&self, aggregate_id: &str) -> OwnedMutexGuard<()> {
+        let per_aggregate_lock = {
+            let mut locks = self.locks.lock().unwrap_or_else(PoisonError::into_inner);
+            // Look up by borrowed `&str` first so the steady-state case (the
+            // aggregate's lock already exists, which is the overwhelmingly
+            // common case once a `Store` has warmed up) never allocates a
+            // `String` just to discard it. Only the first-use miss path pays
+            // for the owned key `entry()` requires.
+            locks.get(aggregate_id).cloned().unwrap_or_else(|| {
+                Arc::clone(
+                    locks
+                        .entry(aggregate_id.to_string())
+                        .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+                )
+            })
+        };
+
+        per_aggregate_lock.lock_owned().await
     }
 }
 
@@ -424,13 +688,13 @@ pub async fn load_entity<Entity: EventSourced>(
     id: &Entity::Id,
 ) -> Result<Option<Entity>, SendError<Entity>> {
     let repo = SqliteEventRepository::new(pool.clone(), Entity::COMPACTION_POLICY);
-    let event_store =
+    let persisted_events =
         PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
             repo,
             Entity::SNAPSHOT_SIZE,
         );
 
-    let context = event_store.load_aggregate(&id.to_string()).await?;
+    let context = persisted_events.load_aggregate(&id.to_string()).await?;
 
     Ok(context.aggregate.into_result()?)
 }
@@ -446,6 +710,23 @@ pub async fn load_entity<Entity: EventSourced>(
 /// The caller must provide `services` matching the aggregate's
 /// `Services` type. For commands that never invoke services (e.g.,
 /// failure commands), a panicking stub is safe.
+///
+/// # Bypasses the per-aggregate ordering guarantee
+///
+/// This calls `cqrs.execute()` directly: it takes no per-aggregate lock and
+/// registers no query processors. Two consequences, both of which put it
+/// outside the guarantee [`Store::send`] provides (see ADR-0004):
+///
+/// - **No serialization.** Run concurrently against a live [`Store`] on the
+///   same aggregate, it interleaves with that `Store`'s commands rather than
+///   queueing behind them.
+/// - **No dispatch.** Its events never reach the `Store`'s reactors or
+///   projections, so read models do not see them until something else replays
+///   the event log (e.g. `Projection::catch_up`).
+///
+/// Use it only where no `Store` for the entity is concurrently live -- CLI,
+/// migration, and test contexts. For anything server-lifetime, use
+/// [`Store::send`].
 pub async fn send_command<Entity: EventSourced>(
     pool: &SqlitePool,
     id: &Entity::Id,
@@ -561,7 +842,7 @@ where
             match id_str.parse::<Entity::Id>() {
                 Ok(id) => ids.push(id),
                 Err(parse_error) => {
-                    tracing::warn!(
+                    warn!(
                         target: "cqrs",
                         aggregate_id = id_str,
                         aggregate_type = Entity::AGGREGATE_TYPE,
@@ -630,7 +911,7 @@ where
             match id_str.parse::<Entity::Id>() {
                 Ok(id) => ids.push(id),
                 Err(parse_error) => {
-                    tracing::warn!(
+                    warn!(
                         target: "cqrs",
                         aggregate_id = id_str,
                         aggregate_type = Entity::AGGREGATE_TYPE,
@@ -699,8 +980,12 @@ mod tests {
     use cqrs_es::DomainEvent;
     use serde::{Deserialize, Serialize};
     use sqlx::SqlitePool;
+    use std::time::Duration;
+    use tokio::sync::{Notify, OnceCell, oneshot};
+    use tokio::time::{Instant, sleep, timeout};
 
     use super::*;
+    use crate::deps;
 
     /// Numeric-only ID that rejects non-numeric strings.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1224,5 +1509,1666 @@ mod tests {
         let count = count_aggregates::<Widget>(&pool).await.unwrap();
 
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn per_aggregate_locks_serializes_same_key() {
+        let locks = Arc::new(PerAggregateLocks::default());
+        let order = Arc::new(SyncMutex::new(Vec::new()));
+        let (acquired_tx, acquired_rx) = oneshot::channel();
+        let release = Arc::new(Notify::new());
+
+        let holder_locks = Arc::clone(&locks);
+        let holder_order = Arc::clone(&order);
+        let holder_release = Arc::clone(&release);
+        let holder = tokio::spawn(async move {
+            let guard = holder_locks.acquire("agg-1").await;
+            holder_order
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push("A-acquired");
+            acquired_tx
+                .send(())
+                .expect("test should still be waiting on the receiver");
+
+            holder_release.notified().await;
+            holder_order
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push("A-released");
+            drop(guard);
+        });
+
+        // Barrier: don't spawn the contender until the holder has confirmed
+        // it holds the guard, so the contender's acquire() is guaranteed to
+        // contend with an already-held lock rather than racing to acquire it
+        // first.
+        acquired_rx
+            .await
+            .expect("holder task should signal before completing");
+
+        let contender_locks = Arc::clone(&locks);
+        let contender_order = Arc::clone(&order);
+        let contender = tokio::spawn(async move {
+            let _guard = contender_locks.acquire("agg-1").await;
+            contender_order
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push("B-acquired");
+        });
+
+        release.notify_one();
+
+        holder.await.unwrap();
+        contender.await.unwrap();
+
+        assert_eq!(
+            *order.lock().unwrap_or_else(PoisonError::into_inner),
+            vec!["A-acquired", "A-released", "B-acquired"],
+        );
+    }
+
+    #[tokio::test]
+    async fn per_aggregate_locks_does_not_block_different_keys() {
+        let locks = Arc::new(PerAggregateLocks::default());
+        let gate = Arc::new(Notify::new());
+        let (acquired_tx, acquired_rx) = oneshot::channel();
+
+        let task_locks = Arc::clone(&locks);
+        let task_gate = Arc::clone(&gate);
+        let _held_forever = tokio::spawn(async move {
+            let _guard = task_locks.acquire("agg-1").await;
+            acquired_tx
+                .send(())
+                .expect("test should still be waiting on the receiver");
+            task_gate.notified().await;
+        });
+
+        // Barrier: don't attempt "agg-2" until "agg-1" is confirmed held, so
+        // this proves "agg-2" is unaffected by an *actually held* lock rather
+        // than inferring it from a single scheduling opportunity.
+        acquired_rx
+            .await
+            .expect("holder task should signal before completing");
+
+        timeout(Duration::from_millis(200), locks.acquire("agg-2"))
+            .await
+            .expect("acquiring a different aggregate ID must not block on an unrelated held lock");
+    }
+
+    /// Order-sensitive fixture for `Store::send` serialization tests: any
+    /// `Append` command is valid whether the aggregate is uninitialized or
+    /// live, and the resulting state is the exact sequence of applied
+    /// labels -- so out-of-order reactor dispatch is directly observable
+    /// as a wrong label order, not a coincidentally-equal value.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+    struct Ledger {
+        order: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct LedgerEvent {
+        label: String,
+    }
+
+    impl DomainEvent for LedgerEvent {
+        fn event_type(&self) -> String {
+            "LedgerEvent::Appended".to_string()
+        }
+
+        fn event_version(&self) -> String {
+            "1.0".to_string()
+        }
+    }
+
+    enum LedgerCommand {
+        Append { label: String },
+    }
+
+    #[async_trait]
+    impl EventSourced for Ledger {
+        type Id = NumericId;
+        type Event = LedgerEvent;
+        type Command = LedgerCommand;
+        type Error = Never;
+        type Services = ();
+        type Materialized = Nil;
+
+        const AGGREGATE_TYPE: &'static str = "Ledger";
+        const PROJECTION: Nil = Nil;
+        const SCHEMA_VERSION: u64 = 1;
+
+        fn originate(event: &LedgerEvent) -> Option<Self> {
+            Some(Self {
+                order: vec![event.label.clone()],
+            })
+        }
+
+        fn evolve(entity: &Self, event: &LedgerEvent) -> Result<Option<Self>, Never> {
+            let mut order = entity.order.clone();
+            order.push(event.label.clone());
+            Ok(Some(Self { order }))
+        }
+
+        async fn initialize(
+            command: LedgerCommand,
+            _services: &(),
+        ) -> Result<Vec<LedgerEvent>, Never> {
+            let LedgerCommand::Append { label } = command;
+            Ok(vec![LedgerEvent { label }])
+        }
+
+        async fn transition(
+            &self,
+            command: LedgerCommand,
+            _services: &(),
+        ) -> Result<Vec<LedgerEvent>, Never> {
+            let LedgerCommand::Append { label } = command;
+            Ok(vec![LedgerEvent { label }])
+        }
+    }
+
+    /// Reactor that stalls its dispatch of the event labeled `"first"` on a
+    /// test-controlled latch, simulating the retry window a slow/retrying
+    /// reactor opens up (see `RetryOnBusy`). Signals `committed` right
+    /// before stalling, so a test can prove the corresponding command has
+    /// already committed before it fires a second, concurrent command, and
+    /// signals `contender_dispatched` whenever any *other* event reaches
+    /// dispatch, so a test can prove that cannot happen while `"first"` is
+    /// still stalled.
+    struct StallFirstReactor {
+        order_log: Arc<AsyncMutex<Vec<String>>>,
+        committed: SyncMutex<Option<oneshot::Sender<()>>>,
+        release: Notify,
+        contender_dispatched: Notify,
+    }
+
+    deps!(StallFirstReactor, [Ledger]);
+
+    #[async_trait]
+    impl Reactor for StallFirstReactor {
+        type Error = Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            let (_id, event) = event.into_inner();
+
+            if event.label == "first" {
+                let sender = self
+                    .committed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                if let Some(sender) = sender {
+                    let _ = sender.send(());
+                }
+                self.release.notified().await;
+            } else {
+                self.contender_dispatched.notify_one();
+            }
+
+            self.order_log.lock().await.push(event.label);
+            Ok(())
+        }
+    }
+
+    /// Wall-clock headroom given to a contending command to do its worst
+    /// before a test asserts it has not.
+    ///
+    /// Deliberately real time, not a count of `yield_now()`s: under a broken
+    /// `Store::send` the contender reaches the state these tests forbid only
+    /// by completing actual SQLite work, which runs on the pool's blocking
+    /// threads. Cooperative yields on the test's own task do not schedule
+    /// that work at all, so no number of them bounds it -- a yield-drain can
+    /// return long before a genuine regression has had the chance to show
+    /// itself, and the test then passes for the wrong reason. Against an
+    /// in-memory pool that work is sub-millisecond, so this leaves ~2 orders
+    /// of magnitude of headroom.
+    const CONTENDER_GRACE: Duration = Duration::from_millis(250);
+
+    /// Regression test: proves `Store::send` delivers
+    /// events to reactors in commit order even when the first command's
+    /// dispatch stalls (simulating a `RetryOnBusy` retry window). Without
+    /// per-aggregate serialization, "second" -- whose load only happens
+    /// once "first" has already committed, per the barrier below -- can
+    /// finish its own (non-stalled) dispatch before "first"'s stalled
+    /// dispatch completes, so the reactor observes "second" before
+    /// "first" even though "first" committed strictly earlier.
+    #[tokio::test]
+    async fn store_send_serializes_same_aggregate_dispatch_in_commit_order() {
+        let pool = test_pool().await;
+
+        let order_log: Arc<AsyncMutex<Vec<String>>> = Arc::new(AsyncMutex::new(Vec::new()));
+        let (committed_tx, committed_rx) = oneshot::channel();
+        let reactor = Arc::new(StallFirstReactor {
+            order_log: Arc::clone(&order_log),
+            committed: SyncMutex::new(Some(committed_tx)),
+            release: Notify::new(),
+            contender_dispatched: Notify::new(),
+        });
+
+        let store = StoreBuilder::<Ledger>::new(pool.clone())
+            .with(Arc::clone(&reactor))
+            .build(())
+            .await
+            .unwrap();
+
+        let id = NumericId(1);
+
+        let store_first = Arc::clone(&store);
+        let id_first = id.clone();
+        let first = tokio::spawn(async move {
+            store_first
+                .send(
+                    &id_first,
+                    LedgerCommand::Append {
+                        label: "first".to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+        });
+
+        // Barrier: "second" must not even be spawned until "first" has
+        // committed and entered its stall, so "second" is guaranteed to load
+        // live state (going through `transition`, not `initialize`) rather
+        // than racing an uninitialized aggregate.
+        committed_rx
+            .await
+            .expect("first's reactor should signal before stalling");
+
+        let store_second = Arc::clone(&store);
+        let id_second = id.clone();
+        let second = tokio::spawn(async move {
+            store_second
+                .send(
+                    &id_second,
+                    LedgerCommand::Append {
+                        label: "second".to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+        });
+
+        // The invariant, asserted directly: while "first"'s dispatch is
+        // stalled, "second" must not be able to reach dispatch at all. Under
+        // a correct `Store::send` it is blocked on the per-aggregate lock
+        // "first" still holds, so this signal can never fire and the wait is
+        // guaranteed to time out. Narrow the lock to cover only dispatch and
+        // "second" -- whose own dispatch does not stall -- runs straight
+        // through, firing this and naming the violation on the spot, rather
+        // than leaving the final commit-order assertion to be decided by
+        // which task the executor happened to poll first.
+        match timeout(CONTENDER_GRACE, reactor.contender_dispatched.notified()).await {
+            Ok(()) => panic!(
+                "\"second\" reached reactor dispatch while \"first\"'s dispatch was still \
+                 stalled: Store::send is not serializing the whole execute per aggregate, \
+                 so reactors can observe events out of commit order"
+            ),
+            Err(_elapsed) => {}
+        }
+
+        release_and_join(&reactor.release, first, second).await;
+
+        let payloads: Vec<String> = sqlx::query_scalar(
+            "SELECT payload FROM events \
+             WHERE aggregate_type = 'Ledger' AND aggregate_id = '1' \
+             ORDER BY sequence",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let commit_order: Vec<String> = payloads
+            .iter()
+            .map(|payload| serde_json::from_str::<LedgerEvent>(payload).unwrap().label)
+            .collect();
+
+        assert_eq!(
+            *order_log.lock().await,
+            commit_order,
+            "reactor dispatch order must match commit order for a single \
+             aggregate, even when the first event's dispatch stalls",
+        );
+    }
+
+    /// The projected twin of `Ledger`: same append-only label sequence, but
+    /// `Materialized = Table`, so `StoreBuilder::build` wires a real
+    /// `Projection` for it. Lets the ordering guarantee be asserted against an
+    /// actual materialized view -- the read model whose corruption motivates
+    /// per-aggregate serialization -- rather than only against a bespoke
+    /// reactor's log.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+    struct ProjectedLedger {
+        order: Vec<String>,
+    }
+
+    #[async_trait]
+    impl EventSourced for ProjectedLedger {
+        type Id = NumericId;
+        type Event = LedgerEvent;
+        type Command = LedgerCommand;
+        type Error = Never;
+        type Services = ();
+        type Materialized = Table;
+
+        const AGGREGATE_TYPE: &'static str = "ProjectedLedger";
+        const PROJECTION: Table = Table("projected_ledger_view");
+        const SCHEMA_VERSION: u64 = 1;
+
+        fn originate(event: &LedgerEvent) -> Option<Self> {
+            Some(Self {
+                order: vec![event.label.clone()],
+            })
+        }
+
+        fn evolve(entity: &Self, event: &LedgerEvent) -> Result<Option<Self>, Never> {
+            let mut order = entity.order.clone();
+            order.push(event.label.clone());
+            Ok(Some(Self { order }))
+        }
+
+        async fn initialize(
+            command: LedgerCommand,
+            _services: &(),
+        ) -> Result<Vec<LedgerEvent>, Never> {
+            let LedgerCommand::Append { label } = command;
+            Ok(vec![LedgerEvent { label }])
+        }
+
+        async fn transition(
+            &self,
+            command: LedgerCommand,
+            _services: &(),
+        ) -> Result<Vec<LedgerEvent>, Never> {
+            let LedgerCommand::Append { label } = command;
+            Ok(vec![LedgerEvent { label }])
+        }
+    }
+
+    /// `StallFirstReactor` for `ProjectedLedger`. Registered via `.with()`, so
+    /// `StoreBuilder` dispatches it *before* the projection it auto-wires
+    /// (the projection's `ReactorBridge` is pushed last). Stalling here
+    /// therefore holds the first command's *view update* open, which is
+    /// exactly the window a retrying `Projection::react` opens in production.
+    struct StallFirstProjectedReactor {
+        committed: SyncMutex<Option<oneshot::Sender<()>>>,
+        release: Notify,
+        contender_dispatched: Notify,
+    }
+
+    deps!(StallFirstProjectedReactor, [ProjectedLedger]);
+
+    #[async_trait]
+    impl Reactor for StallFirstProjectedReactor {
+        type Error = Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            let (_id, event) = event.into_inner();
+
+            if event.label == "first" {
+                let sender = self
+                    .committed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                if let Some(sender) = sender {
+                    let _ = sender.send(());
+                }
+                self.release.notified().await;
+            } else {
+                self.contender_dispatched.notify_one();
+            }
+
+            Ok(())
+        }
+    }
+
+    async fn projected_test_pool() -> SqlitePool {
+        let pool = test_pool().await;
+        sqlx::query(
+            "CREATE TABLE projected_ledger_view ( \
+                 view_id TEXT NOT NULL PRIMARY KEY, \
+                 version BIGINT NOT NULL, \
+                 payload TEXT NOT NULL \
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    /// The scenario this whole change exists for, asserted end to end against
+    /// a real wired `Projection` rather than a bespoke reactor: two concurrent
+    /// same-aggregate commands, where the first's view update is stalled (the
+    /// window `Projection::react`'s retry loop opens in production).
+    ///
+    /// Without per-aggregate serialization, "second" commits and applies its
+    /// view update against a view that has not yet seen "first", and "first"'s
+    /// delayed update then lands on top -- so the materialized read model ends
+    /// up ordered `["second", "first"]` while the event log says
+    /// `["first", "second"]`. The view must match commit order.
+    #[tokio::test]
+    async fn store_send_keeps_projection_in_commit_order_when_view_update_stalls() {
+        let pool = projected_test_pool().await;
+
+        let (committed_tx, committed_rx) = oneshot::channel();
+        let reactor = Arc::new(StallFirstProjectedReactor {
+            committed: SyncMutex::new(Some(committed_tx)),
+            release: Notify::new(),
+            contender_dispatched: Notify::new(),
+        });
+
+        let (store, projection) = StoreBuilder::<ProjectedLedger>::new(pool.clone())
+            .with(Arc::clone(&reactor))
+            .build(())
+            .await
+            .unwrap();
+
+        let id = NumericId(1);
+
+        let store_first = Arc::clone(&store);
+        let id_first = id.clone();
+        let first = tokio::spawn(async move {
+            store_first
+                .send(
+                    &id_first,
+                    LedgerCommand::Append {
+                        label: "first".to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+        });
+
+        // Barrier: "first" has committed its event and is now stalled with its
+        // view update still pending.
+        committed_rx
+            .await
+            .expect("first's reactor should signal before stalling");
+
+        let store_second = Arc::clone(&store);
+        let id_second = id.clone();
+        let second = tokio::spawn(async move {
+            store_second
+                .send(
+                    &id_second,
+                    LedgerCommand::Append {
+                        label: "second".to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+        });
+
+        // "second" must not reach dispatch -- and therefore must not touch the
+        // view -- while "first"'s view update is still outstanding.
+        match timeout(CONTENDER_GRACE, reactor.contender_dispatched.notified()).await {
+            Ok(()) => panic!(
+                "\"second\" reached dispatch while \"first\"'s view update was still stalled: \
+                 the projection can be written out of commit order"
+            ),
+            Err(_elapsed) => {}
+        }
+
+        release_and_join(&reactor.release, first, second).await;
+
+        let payloads: Vec<String> = sqlx::query_scalar(
+            "SELECT payload FROM events \
+             WHERE aggregate_type = 'ProjectedLedger' AND aggregate_id = '1' \
+             ORDER BY sequence",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let commit_order: Vec<String> = payloads
+            .iter()
+            .map(|payload| serde_json::from_str::<LedgerEvent>(payload).unwrap().label)
+            .collect();
+
+        assert_eq!(
+            commit_order,
+            vec!["first".to_string(), "second".to_string()],
+            "the event log itself must record the commit order the barrier established",
+        );
+
+        let view = projection
+            .load(&id)
+            .await
+            .unwrap()
+            .expect("the projection must have materialized the aggregate");
+
+        assert_eq!(
+            view.order, commit_order,
+            "the materialized view must apply events in commit order, even when the first \
+             event's view update stalls",
+        );
+    }
+
+    /// Polls the `Ledger` event count across the whole `window`, asserting it
+    /// never leaves 1 -- i.e. the contending command never commits while the
+    /// first command's `execute` is still in flight.
+    ///
+    /// A single check after `sleep(window)` would only sample the endpoint;
+    /// this watches the entire interval, so a commit that lands mid-window
+    /// fails the test at the moment it happens rather than needing to still be
+    /// observable at the end.
+    async fn assert_events_stay_at_one(pool: &SqlitePool, window: Duration) {
+        const POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+        let deadline = Instant::now() + window;
+        while Instant::now() < deadline {
+            let committed: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM events \
+                 WHERE aggregate_type = 'Ledger' AND aggregate_id = '1'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+
+            assert_eq!(
+                committed, 1,
+                "second command must not even commit while first's execute \
+                 (dispatch included) is still in flight",
+            );
+
+            sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Releases a `StallFirstReactor`'s latch and awaits both spawned
+    /// `Store::send` tasks. Shared by tests that only differ in what they
+    /// assert afterward.
+    async fn release_and_join(
+        release: &Notify,
+        first: tokio::task::JoinHandle<()>,
+        second: tokio::task::JoinHandle<()>,
+    ) {
+        release.notify_one();
+        first.await.unwrap();
+        second.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_serializes_same_aggregate() {
+        let pool = test_pool().await;
+
+        let order_log: Arc<AsyncMutex<Vec<String>>> = Arc::new(AsyncMutex::new(Vec::new()));
+        let (committed_tx, committed_rx) = oneshot::channel();
+        let reactor = Arc::new(StallFirstReactor {
+            order_log: Arc::clone(&order_log),
+            committed: SyncMutex::new(Some(committed_tx)),
+            release: Notify::new(),
+            contender_dispatched: Notify::new(),
+        });
+
+        let store = StoreBuilder::<Ledger>::new(pool.clone())
+            .with(Arc::clone(&reactor))
+            .build(())
+            .await
+            .unwrap();
+
+        let id = NumericId(1);
+
+        let store_first = Arc::clone(&store);
+        let id_first = id.clone();
+        let first = tokio::spawn(async move {
+            store_first
+                .send(
+                    &id_first,
+                    LedgerCommand::Append {
+                        label: "first".to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+        });
+
+        committed_rx
+            .await
+            .expect("first's reactor should signal before stalling");
+
+        let store_second = Arc::clone(&store);
+        let id_second = id.clone();
+        let second = tokio::spawn(async move {
+            store_second
+                .send(
+                    &id_second,
+                    LedgerCommand::Append {
+                        label: "second".to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+        });
+
+        // If `Store::send` only serialized dispatch (not the whole
+        // `execute`), "second" could load, handle and commit right here,
+        // since committing does not require the reactor to have run -- it
+        // would then block on the dispatch lock, never reaching the reactor,
+        // so `contender_dispatched` cannot detect this one. The events table
+        // is the observable, and reaching it means real SQLite work: give
+        // "second" genuine wall-clock room to do it, and actively watch the
+        // whole window rather than sampling once at the end of a sleep, so a
+        // commit that lands and is later overtaken cannot slip past. With the
+        // whole-`execute` lock "second" cannot even begin loading.
+        assert_events_stay_at_one(&pool, CONTENDER_GRACE).await;
+
+        release_and_join(&reactor.release, first, second).await;
+
+        let committed_after_release: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE aggregate_type = 'Ledger' AND aggregate_id = '1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(committed_after_release, 2);
+    }
+
+    #[tokio::test]
+    async fn send_does_not_serialize_different_aggregates() {
+        let pool = test_pool().await;
+
+        let order_log: Arc<AsyncMutex<Vec<String>>> = Arc::new(AsyncMutex::new(Vec::new()));
+        let (committed_tx, committed_rx) = oneshot::channel();
+        let reactor = Arc::new(StallFirstReactor {
+            order_log: Arc::clone(&order_log),
+            committed: SyncMutex::new(Some(committed_tx)),
+            release: Notify::new(),
+            contender_dispatched: Notify::new(),
+        });
+
+        let store = StoreBuilder::<Ledger>::new(pool.clone())
+            .with(Arc::clone(&reactor))
+            .build(())
+            .await
+            .unwrap();
+
+        let store_first = Arc::clone(&store);
+        let first = tokio::spawn(async move {
+            store_first
+                .send(
+                    &NumericId(1),
+                    LedgerCommand::Append {
+                        label: "first".to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+        });
+
+        committed_rx
+            .await
+            .expect("first's reactor should signal before stalling");
+
+        // Aggregate "2" is a different aggregate ID from the stalled
+        // aggregate "1"; its `send` must complete promptly even while "1"'s
+        // command is still stalled in dispatch.
+        timeout(
+            Duration::from_millis(500),
+            store.send(
+                &NumericId(2),
+                LedgerCommand::Append {
+                    label: "other".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("a different aggregate ID must not block on an unrelated held lock")
+        .unwrap();
+
+        reactor.release.notify_one();
+        first.await.unwrap();
+    }
+
+    /// Reports the result of `SelfCommandingReactor`'s inner, self-directed
+    /// `Store::send()` back to the test.
+    type SelfSendResultSender = oneshot::Sender<Result<(), SendError<Ledger>>>;
+
+    /// Reactor that, upon reacting to a `Ledger` event, immediately calls
+    /// `Store::send()` back onto the *same* aggregate ID it is reacting to --
+    /// the exact self-cycle the task-local reentrancy guard exists to catch.
+    /// The inner `send()`'s result is reported over a oneshot rather than
+    /// through `react()`'s own return type, since `Ledger::Error` is `Never`
+    /// (uninhabited) and cannot carry it.
+    struct SelfCommandingReactor {
+        store: OnceCell<Arc<Store<Ledger>>>,
+        inner_result: SyncMutex<Option<SelfSendResultSender>>,
+    }
+
+    deps!(SelfCommandingReactor, [Ledger]);
+
+    #[async_trait]
+    impl Reactor for SelfCommandingReactor {
+        type Error = Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            let (id, _event) = event.into_inner();
+            let store = self
+                .store
+                .get()
+                .expect("store must be set before the reactor can be dispatched");
+
+            let result = store
+                .send(
+                    &id,
+                    LedgerCommand::Append {
+                        label: "reentrant".to_string(),
+                    },
+                )
+                .await;
+
+            let sender = self
+                .inner_result
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(sender) = sender {
+                let _ = sender.send(result);
+            }
+
+            Ok(())
+        }
+    }
+
+    /// Regression test for the reentrancy hazard `Store::send`'s
+    /// per-aggregate lock introduces (see ADR-0004 and the `Store` type-level
+    /// doc comment): a reactor commanding the same aggregate it is reacting
+    /// to would deadlock on the lock its own outer command already holds.
+    /// Proves the guard turns that into a fast, typed error instead --
+    /// wrapped in a short `timeout` so a regression that reintroduces the
+    /// deadlock fails the test instead of hanging the suite.
+    #[tokio::test]
+    async fn reactor_self_commanding_same_aggregate_fails_fast_instead_of_deadlocking() {
+        let pool = test_pool().await;
+
+        let (result_tx, result_rx) = oneshot::channel();
+        let reactor = Arc::new(SelfCommandingReactor {
+            store: OnceCell::new(),
+            inner_result: SyncMutex::new(Some(result_tx)),
+        });
+
+        let store = StoreBuilder::<Ledger>::new(pool.clone())
+            .with(Arc::clone(&reactor))
+            .build(())
+            .await
+            .unwrap();
+        let Ok(()) = reactor.store.set(Arc::clone(&store)) else {
+            panic!("store should only be set once, before any dispatch");
+        };
+
+        let outer_result = timeout(
+            Duration::from_secs(2),
+            store.send(
+                &NumericId(1),
+                LedgerCommand::Append {
+                    label: "outer".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("a self-commanding reactor must fail fast, not hang the outer send");
+        outer_result.expect("the outer command itself must still succeed and commit");
+
+        let inner_result = timeout(Duration::from_secs(2), result_rx)
+            .await
+            .expect("reactor should report its inner send's result well within the timeout")
+            .expect("inner_result sender must not be dropped without sending");
+
+        let error =
+            inner_result.expect_err("self-commanding the same aggregate must fail, not succeed");
+        assert!(
+            matches!(
+                error,
+                AggregateError::UserError(LifecycleError::ReentrantCommand)
+            ),
+            "expected AggregateError::UserError(ReentrantCommand), got: {error:?}",
+        );
+    }
+
+    /// Reactor that, upon reacting to a `Ledger` event, calls `Store::send()`
+    /// onto a *different* aggregate ID than the one it is reacting to -- the
+    /// normal cross-aggregate orchestration pattern (see `RebalancingTrigger`
+    /// in docs/cqrs.md) the reentrancy guard must leave alone even while the
+    /// task-local held-set is non-empty (populated by the outer command this
+    /// reactor is dispatched from). Reports the inner send's result over a
+    /// oneshot for the same reason `SelfCommandingReactor` does.
+    struct DifferentAggregateReactor {
+        store: OnceCell<Arc<Store<Ledger>>>,
+        target: NumericId,
+        inner_result: SyncMutex<Option<SelfSendResultSender>>,
+    }
+
+    deps!(DifferentAggregateReactor, [Ledger]);
+
+    #[async_trait]
+    impl Reactor for DifferentAggregateReactor {
+        type Error = Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            let (id, _event) = event.into_inner();
+
+            // This reactor is registered for every `Ledger` event, including
+            // the one its own orchestrated command produces on `target`.
+            // Without this guard, reacting to `target`'s own event would
+            // re-enter this branch and self-command `target` while already
+            // reacting to it -- a genuine reentrancy case, not the
+            // different-aggregate case this test exercises.
+            if id == self.target {
+                return Ok(());
+            }
+
+            let store = self
+                .store
+                .get()
+                .expect("store must be set before the reactor can be dispatched");
+
+            let result = store
+                .send(
+                    &self.target,
+                    LedgerCommand::Append {
+                        label: "orchestrated".to_string(),
+                    },
+                )
+                .await;
+
+            let sender = self
+                .inner_result
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(sender) = sender {
+                let _ = sender.send(result);
+            }
+
+            Ok(())
+        }
+    }
+
+    /// Proves the reentrancy guard's `Admission::Proceed` branch (populated
+    /// held-set, different key -> proceed) is not broadened into rejecting
+    /// every command issued from within a reactor.
+    /// `send_does_not_serialize_different_aggregates` exercises a
+    /// different-aggregate `send()` from the *test's own task*, where
+    /// `HELD_AGGREGATE_LOCKS` is an empty/fresh scope; this test instead
+    /// exercises it from *inside* a reactor's inline dispatch, where the
+    /// held-set already contains the outer aggregate's key -- the only place
+    /// `Proceed` under a populated ancestor scope is reachable, and the exact
+    /// shape of the `RebalancingTrigger` cross-aggregate orchestration pattern
+    /// documented on `Store`.
+    #[tokio::test]
+    async fn reactor_commanding_different_aggregate_from_inline_dispatch_succeeds() {
+        let pool = test_pool().await;
+
+        let (result_tx, result_rx) = oneshot::channel();
+        let reactor = Arc::new(DifferentAggregateReactor {
+            store: OnceCell::new(),
+            target: NumericId(2),
+            inner_result: SyncMutex::new(Some(result_tx)),
+        });
+
+        let store = StoreBuilder::<Ledger>::new(pool.clone())
+            .with(Arc::clone(&reactor))
+            .build(())
+            .await
+            .unwrap();
+        let Ok(()) = reactor.store.set(Arc::clone(&store)) else {
+            panic!("store should only be set once, before any dispatch");
+        };
+
+        let outer_result = timeout(
+            Duration::from_secs(2),
+            store.send(
+                &NumericId(1),
+                LedgerCommand::Append {
+                    label: "outer".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("orchestrating a different aggregate must not hang");
+        outer_result.expect("the outer command itself must succeed and commit");
+
+        let inner_result = timeout(Duration::from_secs(2), result_rx)
+            .await
+            .expect("reactor should report its inner send's result well within the timeout")
+            .expect("inner_result sender must not be dropped without sending");
+        inner_result.expect(
+            "commanding a different aggregate from inside a reactor must succeed, \
+             not be rejected as reentrant",
+        );
+
+        let target_entity = load_entity::<Ledger>(&pool, &NumericId(2))
+            .await
+            .unwrap()
+            .expect("the orchestrated aggregate's event must be committed");
+        assert_eq!(target_entity.order, vec!["orchestrated".to_string()]);
+    }
+
+    /// Reports the results of `SiblingSendingReactor`'s two joined, sibling
+    /// `Store::send()` calls back to the test.
+    type SiblingSendResultsSender =
+        oneshot::Sender<(Result<(), SendError<Ledger>>, Result<(), SendError<Ledger>>)>;
+
+    /// Reactor that, upon reacting to a `Ledger` event, issues two *sibling*
+    /// `Store::send()` calls to the same *different* aggregate concurrently
+    /// via `tokio::join!` -- the exact shape the reentrancy guard must not
+    /// spuriously reject: both calls inherit the same ancestor task-local
+    /// snapshot (the outer aggregate's key), so neither has committed a key
+    /// the other can see yet, and they must queue on `PerAggregateLocks`
+    /// instead of one being rejected as reentrant.
+    struct SiblingSendingReactor {
+        store: OnceCell<Arc<Store<Ledger>>>,
+        target: NumericId,
+        results: SyncMutex<Option<SiblingSendResultsSender>>,
+    }
+
+    deps!(SiblingSendingReactor, [Ledger]);
+
+    #[async_trait]
+    impl Reactor for SiblingSendingReactor {
+        type Error = Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            let (id, _event) = event.into_inner();
+
+            // Guard against re-entering on the target aggregate's own
+            // resulting events, mirroring `DifferentAggregateReactor` --
+            // this test is about sibling concurrency, not self-commanding.
+            if id == self.target {
+                return Ok(());
+            }
+
+            let store = self
+                .store
+                .get()
+                .expect("store must be set before the reactor can be dispatched");
+
+            let (result_one, result_two) = tokio::join!(
+                store.send(
+                    &self.target,
+                    LedgerCommand::Append {
+                        label: "sibling-a".to_string(),
+                    },
+                ),
+                store.send(
+                    &self.target,
+                    LedgerCommand::Append {
+                        label: "sibling-b".to_string(),
+                    },
+                ),
+            );
+
+            let sender = self
+                .results
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(sender) = sender {
+                let _ = sender.send((result_one, result_two));
+            }
+
+            Ok(())
+        }
+    }
+
+    /// Regression test for the finding that sibling `send()` calls to the
+    /// same aggregate, joined within a single reactor's inline dispatch, were
+    /// spuriously rejected as reentrant instead of queuing: `send_under_lock`
+    /// used to insert its key into the *shared* inherited task-local set
+    /// before acquiring the per-aggregate mutex, so the second sibling
+    /// `tokio::join!` polled would observe the first's not-yet-acquired key
+    /// and fail fast even though there is no ancestor relationship (and thus
+    /// no deadlock) between the two -- only ordinary contention.
+    #[tokio::test]
+    async fn reactor_joining_sibling_sends_to_same_aggregate_queues() {
+        let pool = test_pool().await;
+
+        let (results_tx, results_rx) = oneshot::channel();
+        let reactor = Arc::new(SiblingSendingReactor {
+            store: OnceCell::new(),
+            target: NumericId(2),
+            results: SyncMutex::new(Some(results_tx)),
+        });
+
+        let store = StoreBuilder::<Ledger>::new(pool.clone())
+            .with(Arc::clone(&reactor))
+            .build(())
+            .await
+            .unwrap();
+        let Ok(()) = reactor.store.set(Arc::clone(&store)) else {
+            panic!("store should only be set once, before any dispatch");
+        };
+
+        let outer_result = timeout(
+            Duration::from_secs(2),
+            store.send(
+                &NumericId(1),
+                LedgerCommand::Append {
+                    label: "outer".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("joining sibling sends to the same aggregate must not hang");
+        outer_result.expect("the outer command itself must still succeed and commit");
+
+        let (result_one, result_two) = timeout(Duration::from_secs(2), results_rx)
+            .await
+            .expect("reactor should report both sibling results well within the timeout")
+            .expect("results sender must not be dropped without sending");
+
+        result_one
+            .expect("a sibling send must queue behind its sibling, not be rejected as reentrant");
+        result_two
+            .expect("a sibling send must queue behind its sibling, not be rejected as reentrant");
+
+        let target_entity = load_entity::<Ledger>(&pool, &NumericId(2))
+            .await
+            .unwrap()
+            .expect("both sibling commands' events must be committed");
+        assert_eq!(
+            target_entity.order.len(),
+            2,
+            "both sibling commands must have committed exactly once each, got: {:?}",
+            target_entity.order,
+        );
+        assert!(
+            target_entity.order.contains(&"sibling-a".to_string())
+                && target_entity.order.contains(&"sibling-b".to_string()),
+            "both sibling labels must appear in the committed order, got: {:?}",
+            target_entity.order,
+        );
+    }
+
+    /// Reactor that forms a two-aggregate, same-task cycle back to itself:
+    /// reacting to aggregate 1's event, it commands aggregate 2 inline; then,
+    /// reacting (in the same task, since dispatch is always inline-awaited)
+    /// to aggregate 2's event, it commands back onto aggregate 1 -- which is
+    /// still held by the outermost `send()` on the call stack. Proves the
+    /// guard's *transitive* detection: the innermost self-command fails fast
+    /// even though it isn't a *direct* self-command, just a link in a chain
+    /// that closes back onto an ancestor key.
+    struct CyclingReactor {
+        store: OnceCell<Arc<Store<Ledger>>>,
+        cycle_result: SyncMutex<Option<SelfSendResultSender>>,
+    }
+
+    deps!(CyclingReactor, [Ledger]);
+
+    #[async_trait]
+    impl Reactor for CyclingReactor {
+        type Error = Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            let (id, event) = event.into_inner();
+            let store = self
+                .store
+                .get()
+                .expect("store must be set before the reactor can be dispatched");
+
+            match (id, event.label.as_str()) {
+                (NumericId(1), "outer") => {
+                    store
+                        .send(
+                            &NumericId(2),
+                            LedgerCommand::Append {
+                                label: "hop".to_string(),
+                            },
+                        )
+                        .await
+                        .expect("hopping to an unheld aggregate must succeed");
+                }
+                (NumericId(2), _) => {
+                    let result = store
+                        .send(
+                            &NumericId(1),
+                            LedgerCommand::Append {
+                                label: "cycle-back".to_string(),
+                            },
+                        )
+                        .await;
+                    let sender = self
+                        .cycle_result
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take();
+                    if let Some(sender) = sender {
+                        let _ = sender.send(result);
+                    }
+                }
+                _ => {}
+            }
+
+            Ok(())
+        }
+    }
+
+    /// Regression test for the *transitive* branch of the reentrancy rule
+    /// (see the `Store` type-level doc comment and ADR-0004): a chain of
+    /// inline-awaited reactor dispatches that closes back onto an ancestor
+    /// aggregate ID must fail fast, even though the closing `send()` is not
+    /// itself a direct self-command.
+    #[tokio::test]
+    async fn reactor_transitive_cycle_through_second_aggregate_fails_fast() {
+        let pool = test_pool().await;
+
+        let (result_tx, result_rx) = oneshot::channel();
+        let reactor = Arc::new(CyclingReactor {
+            store: OnceCell::new(),
+            cycle_result: SyncMutex::new(Some(result_tx)),
+        });
+
+        let store = StoreBuilder::<Ledger>::new(pool.clone())
+            .with(Arc::clone(&reactor))
+            .build(())
+            .await
+            .unwrap();
+        let Ok(()) = reactor.store.set(Arc::clone(&store)) else {
+            panic!("store should only be set once, before any dispatch");
+        };
+
+        let outer_result = timeout(
+            Duration::from_secs(2),
+            store.send(
+                &NumericId(1),
+                LedgerCommand::Append {
+                    label: "outer".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("a transitively self-commanding chain must fail fast, not hang");
+        outer_result.expect("the outer command itself must still succeed and commit");
+
+        let cycle_result = timeout(Duration::from_secs(2), result_rx)
+            .await
+            .expect("the cycle-closing reactor should report its result well within the timeout")
+            .expect("cycle_result sender must not be dropped without sending");
+
+        let error = cycle_result
+            .expect_err("closing the cycle back onto aggregate 1 must fail, not succeed");
+        assert!(
+            matches!(
+                error,
+                AggregateError::UserError(LifecycleError::ReentrantCommand)
+            ),
+            "expected AggregateError::UserError(ReentrantCommand), got: {error:?}",
+        );
+    }
+
+    /// Reactor that issues two *sibling* `Store::send()` calls, joined within
+    /// one `react()`, both targeting the aggregate it is *currently reacting
+    /// to*. The mirror of `SiblingSendingReactor`, which deliberately aims its
+    /// siblings at a different aggregate: here the target key is already in
+    /// the snapshot both siblings inherited, so each must be rejected as
+    /// reentrant rather than queued. Queuing them instead would deadlock --
+    /// they would be waiting on a lock their own ancestor `send()` holds.
+    struct SiblingSendingToSourceReactor {
+        store: OnceCell<Arc<Store<Ledger>>>,
+        results: SyncMutex<Option<SiblingSendResultsSender>>,
+    }
+
+    deps!(SiblingSendingToSourceReactor, [Ledger]);
+
+    #[async_trait]
+    impl Reactor for SiblingSendingToSourceReactor {
+        type Error = Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            let (id, _event) = event.into_inner();
+
+            let store = self
+                .store
+                .get()
+                .expect("store must be set before the reactor can be dispatched");
+
+            // Both siblings target `id` -- the aggregate being reacted to --
+            // so no new events are produced and this reactor cannot re-enter.
+            let (result_one, result_two) = tokio::join!(
+                store.send(
+                    &id,
+                    LedgerCommand::Append {
+                        label: "sibling-to-source-a".to_string(),
+                    },
+                ),
+                store.send(
+                    &id,
+                    LedgerCommand::Append {
+                        label: "sibling-to-source-b".to_string(),
+                    },
+                ),
+            );
+
+            let sender = self
+                .results
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(sender) = sender {
+                let _ = sender.send((result_one, result_two));
+            }
+
+            Ok(())
+        }
+    }
+
+    /// Asserts one sibling `send()` was rejected by the reentrancy guard
+    /// rather than queued on the per-aggregate lock.
+    fn assert_rejected_as_reentrant(result: Result<(), SendError<Ledger>>) {
+        let error = result.expect_err(
+            "a sibling aimed at the aggregate under reaction must be rejected as reentrant, \
+             not queued",
+        );
+        assert!(
+            matches!(
+                error,
+                AggregateError::UserError(LifecycleError::ReentrantCommand)
+            ),
+            "expected AggregateError::UserError(ReentrantCommand), got: {error:?}",
+        );
+    }
+
+    /// The other half of the sibling contract that
+    /// `reactor_joining_sibling_sends_to_same_aggregate_queues` pins. Siblings
+    /// aimed at a *different* aggregate queue; siblings aimed at the aggregate
+    /// currently under reaction must each fail fast with `ReentrantCommand`,
+    /// because that key *is* in the snapshot they inherited. Without this the
+    /// sibling fix could silently regress into queuing them, reintroducing the
+    /// deadlock the guard exists to prevent.
+    #[tokio::test]
+    async fn reactor_joining_sibling_sends_to_reacted_aggregate_fails_fast() {
+        let pool = test_pool().await;
+
+        let (results_tx, results_rx) = oneshot::channel();
+        let reactor = Arc::new(SiblingSendingToSourceReactor {
+            store: OnceCell::new(),
+            results: SyncMutex::new(Some(results_tx)),
+        });
+
+        let store = StoreBuilder::<Ledger>::new(pool.clone())
+            .with(Arc::clone(&reactor))
+            .build(())
+            .await
+            .unwrap();
+        let Ok(()) = reactor.store.set(Arc::clone(&store)) else {
+            panic!("store should only be set once, before any dispatch");
+        };
+
+        let outer_result = timeout(
+            Duration::from_secs(2),
+            store.send(
+                &NumericId(1),
+                LedgerCommand::Append {
+                    label: "outer".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("siblings aimed at the reacted aggregate must fail fast, not deadlock");
+        outer_result.expect("the outer command itself must still succeed and commit");
+
+        let (result_one, result_two) = timeout(Duration::from_secs(2), results_rx)
+            .await
+            .expect("reactor should report both sibling results well within the timeout")
+            .expect("results sender must not be dropped without sending");
+
+        assert_rejected_as_reentrant(result_one);
+        assert_rejected_as_reentrant(result_two);
+
+        // Rejected means rejected: neither sibling may have committed an event.
+        let entity = load_entity::<Ledger>(&pool, &NumericId(1))
+            .await
+            .unwrap()
+            .expect("the outer command's event must be committed");
+        assert_eq!(
+            entity.order,
+            vec!["outer".to_string()],
+            "no rejected sibling command may have committed an event",
+        );
+    }
+
+    /// Reactor that, from a *single* `react()` body, hops to a different
+    /// aggregate and awaits it, and only then sends back to the aggregate it
+    /// is reacting to. Distinct from `CyclingReactor`, which closes its cycle
+    /// from the *nested* dispatch (while reacting to aggregate 2): here the
+    /// closing send is issued by the original `react()` itself, after the
+    /// intervening hop has fully completed and its nested scope has been
+    /// popped. Pins that the inherited held-set survives an intervening
+    /// cross-aggregate hop rather than being clobbered by it.
+    struct TwoStepReactor {
+        store: OnceCell<Arc<Store<Ledger>>>,
+        target: NumericId,
+        source_result: SyncMutex<Option<SelfSendResultSender>>,
+    }
+
+    deps!(TwoStepReactor, [Ledger]);
+
+    #[async_trait]
+    impl Reactor for TwoStepReactor {
+        type Error = Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            let (id, _event) = event.into_inner();
+
+            // Don't re-enter on the hop's own resulting event -- this test is
+            // about the follow-up send from the *original* react() body.
+            if id == self.target {
+                return Ok(());
+            }
+
+            let store = self
+                .store
+                .get()
+                .expect("store must be set before the reactor can be dispatched");
+
+            store
+                .send(
+                    &self.target,
+                    LedgerCommand::Append {
+                        label: "hop".to_string(),
+                    },
+                )
+                .await
+                .expect("hopping to an unheld aggregate must succeed");
+
+            // The hop above has completed and its scope popped. `id` is still
+            // held by the outer `send()` that dispatched this reactor, so this
+            // must still be rejected.
+            let result = store
+                .send(
+                    &id,
+                    LedgerCommand::Append {
+                        label: "back-to-source".to_string(),
+                    },
+                )
+                .await;
+
+            let sender = self
+                .source_result
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(sender) = sender {
+                let _ = sender.send(result);
+            }
+
+            Ok(())
+        }
+    }
+
+    /// A send back to the source aggregate must be rejected for as long as the
+    /// outer `execute()` holds it -- not just when it is the reactor's first
+    /// action. An intervening, fully-awaited hop to another aggregate must not
+    /// launder the held-set and let the follow-up through.
+    #[tokio::test]
+    async fn reactor_sending_back_to_source_after_cross_aggregate_hop_fails_fast() {
+        let pool = test_pool().await;
+
+        let (result_tx, result_rx) = oneshot::channel();
+        let reactor = Arc::new(TwoStepReactor {
+            store: OnceCell::new(),
+            target: NumericId(2),
+            source_result: SyncMutex::new(Some(result_tx)),
+        });
+
+        let store = StoreBuilder::<Ledger>::new(pool.clone())
+            .with(Arc::clone(&reactor))
+            .build(())
+            .await
+            .unwrap();
+        let Ok(()) = reactor.store.set(Arc::clone(&store)) else {
+            panic!("store should only be set once, before any dispatch");
+        };
+
+        let outer_result = timeout(
+            Duration::from_secs(2),
+            store.send(
+                &NumericId(1),
+                LedgerCommand::Append {
+                    label: "outer".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("a send back to the source after a hop must fail fast, not hang");
+        outer_result.expect("the outer command itself must still succeed and commit");
+
+        let source_result = timeout(Duration::from_secs(2), result_rx)
+            .await
+            .expect("the reactor should report its follow-up result well within the timeout")
+            .expect("source_result sender must not be dropped without sending");
+
+        let error = source_result
+            .expect_err("sending back to the still-held source aggregate must fail, not succeed");
+        assert!(
+            matches!(
+                error,
+                AggregateError::UserError(LifecycleError::ReentrantCommand)
+            ),
+            "expected AggregateError::UserError(ReentrantCommand), got: {error:?}",
+        );
+
+        // The intervening hop must still have committed -- the guard rejects
+        // only the send that closes back onto a held key.
+        let hop_entity = load_entity::<Ledger>(&pool, &NumericId(2))
+            .await
+            .unwrap()
+            .expect("the intervening hop's event must be committed");
+        assert_eq!(hop_entity.order, vec!["hop".to_string()]);
+
+        let source_entity = load_entity::<Ledger>(&pool, &NumericId(1))
+            .await
+            .unwrap()
+            .expect("the outer command's event must be committed");
+        assert_eq!(
+            source_entity.order,
+            vec!["outer".to_string()],
+            "the rejected follow-up must not have committed an event",
+        );
+    }
+
+    /// Reactor for `Ledger` that, while reacting to aggregate `"1"`, commands
+    /// a *different* `EventSourced` entity type (`Widget`) using the exact
+    /// same ID string ("1"). Proves the `HELD_AGGREGATE_LOCKS` key -- keyed
+    /// by `AggregateLockKey`'s `TypeId` and `String` fields, not a formatted
+    /// string -- does not treat two different `(Entity, id)` pairs that
+    /// share an ID representation as the same held key: `Store<Widget>::send`
+    /// must not be spuriously rejected as reentrant just because
+    /// `Store<Ledger>` currently holds the ID string "1".
+    /// Reports the result of `CrossEntityTypeReactor`'s inner `Store<Widget>`
+    /// send back to the test.
+    type WidgetSendResultSender = oneshot::Sender<Result<(), SendError<Widget>>>;
+
+    struct CrossEntityTypeReactor {
+        widget_store: OnceCell<Arc<Store<Widget>>>,
+        inner_result: SyncMutex<Option<WidgetSendResultSender>>,
+    }
+
+    deps!(CrossEntityTypeReactor, [Ledger]);
+
+    #[async_trait]
+    impl Reactor for CrossEntityTypeReactor {
+        type Error = Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            let (id, _event) = event.into_inner();
+            let widget_store = self
+                .widget_store
+                .get()
+                .expect("widget store must be set before the reactor can be dispatched");
+
+            let result = widget_store
+                .send(
+                    &id,
+                    WidgetCommand::Create {
+                        name: "cross-entity".to_string(),
+                    },
+                )
+                .await;
+
+            let sender = self
+                .inner_result
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(sender) = sender {
+                let _ = sender.send(result);
+            }
+
+            Ok(())
+        }
+    }
+
+    /// Proves `HELD_AGGREGATE_LOCKS`'s `AggregateLockKey` keying prevents a
+    /// false-positive reentrancy rejection across different entity types
+    /// that happen to share an ID string: `Ledger` and `Widget` both use
+    /// `NumericId` as their `Id`, so aggregate "1" of each renders to the
+    /// same string, but they must not collide on the held-set key.
+    #[tokio::test]
+    async fn reactor_commanding_different_entity_type_with_same_id_string_succeeds() {
+        let pool = test_pool().await;
+
+        let (result_tx, result_rx) = oneshot::channel();
+        let reactor = Arc::new(CrossEntityTypeReactor {
+            widget_store: OnceCell::new(),
+            inner_result: SyncMutex::new(Some(result_tx)),
+        });
+
+        let ledger_store = StoreBuilder::<Ledger>::new(pool.clone())
+            .with(Arc::clone(&reactor))
+            .build(())
+            .await
+            .unwrap();
+        let widget_store = Arc::new(testing::test_store::<Widget>(pool.clone(), ()));
+        let Ok(()) = reactor.widget_store.set(widget_store) else {
+            panic!("widget store should only be set once, before any dispatch");
+        };
+
+        let outer_result = timeout(
+            Duration::from_secs(2),
+            ledger_store.send(
+                &NumericId(1),
+                LedgerCommand::Append {
+                    label: "outer".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("commanding a different entity type with a colliding ID string must not hang");
+        outer_result.expect("the outer Ledger command itself must succeed and commit");
+
+        let inner_result = timeout(Duration::from_secs(2), result_rx)
+            .await
+            .expect("reactor should report its inner send's result well within the timeout")
+            .expect("inner_result sender must not be dropped without sending");
+        inner_result.expect(
+            "a different entity type sharing an ID string with the held aggregate must not \
+             be rejected as reentrant",
+        );
+
+        let widget = load_entity::<Widget>(&pool, &NumericId(1))
+            .await
+            .unwrap()
+            .expect("the Widget aggregate's event must be committed");
+        assert_eq!(widget.name, "cross-entity");
+    }
+
+    /// Regression test for the RAII release claims on
+    /// `HELD_AGGREGATE_LOCKS`'s nested `.scope()`/`PerAggregateLocks::acquire`
+    /// (see their doc comments): dropping an in-flight `Store::send` future --
+    /// here, via `JoinHandle::abort()` on a task stalled *inside* a reactor
+    /// while holding the per-aggregate lock -- must release both the mutex
+    /// guard and the nested task-local scope holding its key, so a subsequent
+    /// same-aggregate `send()` proceeds instead of hanging on an orphaned
+    /// lock.
+    #[tokio::test]
+    async fn send_releases_lock_on_task_cancellation() {
+        let pool = test_pool().await;
+
+        let (committed_tx, committed_rx) = oneshot::channel();
+        let reactor = Arc::new(StallFirstReactor {
+            order_log: Arc::new(AsyncMutex::new(Vec::new())),
+            committed: SyncMutex::new(Some(committed_tx)),
+            release: Notify::new(),
+            contender_dispatched: Notify::new(),
+        });
+
+        let store = StoreBuilder::<Ledger>::new(pool.clone())
+            .with(Arc::clone(&reactor))
+            .build(())
+            .await
+            .unwrap();
+
+        let id = NumericId(1);
+
+        let store_stalled = Arc::clone(&store);
+        let id_stalled = id.clone();
+        let stalled = tokio::spawn(async move {
+            let _ = store_stalled
+                .send(
+                    &id_stalled,
+                    LedgerCommand::Append {
+                        label: "first".to_string(),
+                    },
+                )
+                .await;
+        });
+
+        committed_rx
+            .await
+            .expect("first's reactor should signal before stalling");
+
+        // Cancel the task while it holds the per-aggregate lock: its reactor
+        // is stalled awaiting `reactor.release`, which this test never
+        // notifies, so the abort must interrupt it there.
+        stalled.abort();
+        let join_error = stalled
+            .await
+            .expect_err("an aborted task must yield a JoinError");
+        assert!(
+            join_error.is_cancelled(),
+            "the task should have been cancelled by abort(), not panicked: {join_error:?}",
+        );
+
+        let second_result = timeout(
+            Duration::from_secs(2),
+            store.send(
+                &id,
+                LedgerCommand::Append {
+                    label: "second".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("a same-aggregate send after cancellation must not deadlock on an orphaned lock");
+        second_result.expect("send after lock release via cancellation must succeed");
     }
 }

@@ -34,8 +34,18 @@ aggregate_id, sequence)`. The library's event store is the
 
 A consistency boundary: a cluster of state that's loaded, mutated, and persisted
 atomically. All events for a single aggregate are totally ordered; events across
-different aggregates are not. In `cqrs-es` vocabulary, `trait Aggregate` is the
-bridge between domain logic and the event store.
+different aggregates are not. `Store::send` extends that total order past commit
+into reactor/projection _application_: it serializes commands per
+`(entity type, aggregate ID)`, so that aggregate's events are also applied to
+every reactor and projection in commit order (see
+[docs/cqrs.md](cqrs.md#reactors) and ADR-0004) -- previously the store-level
+ordering did not extend past commit into dispatch. The lock table backing this
+lives on the `Store` itself, so the guarantee holds for commands sent through
+the _same_ `Store` instance, not process-wide: two `Store`s over the same entity
+would each serialize against their own table and not against each other. Hold
+exactly one `Store` per entity, as the single-framework-instance rule already
+requires. In `cqrs-es` vocabulary, `trait Aggregate` is the bridge between
+domain logic and the event store.
 
 In `event-sorcery`, consumers don't implement `Aggregate` directly. They
 implement `EventSourced` on their domain type, and a blanket impl on
@@ -122,6 +132,52 @@ equivalent retry for transient SQLite busy errors via
 `RetryOnBusy`/`IdempotentReactor` or `retry_with_backoff` (see
 [docs/cqrs.md](cqrs.md#reactors)); one that does neither still logs and drops
 its update on a busy error.
+
+Reactors run inside the per-aggregate lock `Store::send` holds for the duration
+of a command (see the Aggregate entry above and ADR-0004). A reactor that calls
+`Store::send()` back onto the same `(entity type, aggregate ID)` it is currently
+reacting to -- directly, or transitively through a chain of other reactors'
+inline-awaited dispatches within the same inline await-chain -- would deadlock
+on that held lock; `Store::send` detects this by tracking await-chain ancestry
+and fails fast with `LifecycleError::ReentrantCommand` instead of hanging.
+Commanding a _different_ aggregate ID, or a different entity type entirely, from
+an inline-awaited reactor is the normal reactor-orchestration pattern.
+
+The guard tracks inline await-chain ancestry, not task identity: it rejects `id`
+only if a call somewhere up its own chain of awaiters already holds it, so two
+sibling `send()` calls to the same aggregate issued via `tokio::join!`/`select!`
+from inside a reactor queue on the lock normally instead of one spuriously
+failing as reentrant -- provided that aggregate is absent from the ancestor set
+they inherited. If the siblings target the very aggregate the reactor is
+currently reacting to, that key _is_ in the inherited set, so each is rejected
+as reentrant rather than queued. It only catches ancestor self-cycles, so it is
+not immune to deadlock in general: two separate, concurrently in-flight command
+chains that reference each other (A's reactor commands B while, concurrently,
+B's reactor commands A) can still deadlock, since each chain holds one
+aggregate's lock while blocking on the other's -- whether the two chains run on
+separate tasks or as sibling futures joined/selected within one task. The same
+is true if a reactor moves a _same_-aggregate `send()` onto a different task and
+awaits it (e.g. `tokio::spawn(...).await`): that spawned task starts with an
+empty guard scope of its own and blocks on the mutex the outer task is still
+holding, exactly like the cross-aggregate case. Both are inherent to the
+per-aggregate ordering guarantee -- avoid bidirectional cross-aggregate command
+cycles, and never move a same-aggregate command off-task within a reactor; defer
+either kind of follow-up `send()` until after `react()` returns.
+
+The guarantee is a property of `Store::send`, not of the events table. The
+crate's own `send_command()` free function calls `cqrs.execute()` directly, with
+no lock and no query processors, so it sits outside the guarantee on both
+counts: run concurrently against a live `Store` on the same aggregate, it
+interleaves with that `Store`'s commands instead of queueing behind them, and
+its events never reach that `Store`'s reactors or projections. It is for CLI,
+migration, and test contexts where no `Store` for the entity is concurrently
+live.
+
+Nested `send()` calls a reactor issues are its own to handle: `ReactorBridge`
+only logs when `react()` itself returns `Err`, so a reactor that ignores the
+`Result` of an inner `send()` swallows a `ReentrantCommand` rejection silently
+and the outer command still reports success. Outer success does not imply the
+nested command ran -- propagate the `Result` or handle it explicitly.
 
 ### Schema Version
 
