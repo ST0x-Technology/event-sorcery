@@ -142,6 +142,13 @@ holding. Avoid cross-aggregate cycles, and never move a same-aggregate command
 off-task within a reactor; defer such work until after `react()` returns. See
 ADR-0004.
 
+The lock table backing this serialization is self-evicting: an aggregate's lock
+exists only while a command on it is in flight, so the table's memory is bounded
+by how many commands are in flight concurrently, not by how many distinct
+aggregate IDs the process has ever commanded. Per-event and per-request ID
+schemes (an ID per fill, per order, per API request) are therefore safe. See
+ADR-0005.
+
 ### `Projection<Entity, Backend>`
 
 The read-side. A SQLite-backed materialized view that consumers query for entity

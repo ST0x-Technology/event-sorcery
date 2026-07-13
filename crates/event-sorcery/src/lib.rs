@@ -108,7 +108,7 @@ use std::any::TypeId;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex as SyncMutex, PoisonError};
+use std::sync::{Arc, Mutex as SyncMutex, PoisonError, Weak};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::task_local;
 use tracing::{error, warn};
@@ -373,13 +373,12 @@ pub trait EventSourced:
 /// `react()` returns (e.g. via a channel/queue drained outside the
 /// reacting command) so it does not run under the held lock.
 ///
-/// **Aggregate IDs must be of bounded cardinality.** The per-aggregate
-/// lock map is never evicted: it holds one mutex per distinct
-/// `Entity::Id` this `Store` has ever commanded, for the lifetime of
-/// the `Store`. That is sized for business-entity cardinality (see
-/// ADR-0004), so a `Store` fed an unbounded stream of fresh IDs -- one
-/// per request, say -- grows its lock map without bound. Do not use
-/// `Entity::Id`s that are effectively unique per command.
+/// **Aggregate-ID cardinality is unconstrained.** The per-aggregate
+/// lock table is self-evicting: an aggregate's lock exists only while
+/// a command on it is in flight, so the table is bounded by how many
+/// commands are in flight concurrently, not by how many distinct
+/// `Entity::Id`s this `Store` has ever commanded. An ID minted per
+/// fill, per order or per request is fine. See ADR-0005.
 pub struct Store<Entity: EventSourced> {
     cqrs: SqliteCqrs<Entity>,
     persisted_events: PersistedEventStore<SqliteEventRepository, Lifecycle<Entity>>,
@@ -598,47 +597,144 @@ task_local! {
     static HELD_AGGREGATE_LOCKS: HashSet<AggregateLockKey>;
 }
 
+/// Table size at or above which [`AggregateLockTable::sweep_if_due`] collects
+/// dead entries, and the floor the post-sweep watermark never drops below.
+///
+/// A floor keeps sweeps amortized O(1) per acquire even when very few
+/// aggregates are live, and means consumers whose aggregate IDs really are
+/// bounded (a few dozen symbols, say) never pay for a sweep at all.
+const MIN_SWEEP_WATERMARK: usize = 64;
+
 /// Keyed async mutex serializing `Store::send` per aggregate ID.
 ///
-/// See ADR-0004 for the full rationale. An outer `std::sync::Mutex` guards a
-/// map from aggregate ID to a per-aggregate `tokio::sync::Mutex`; callers
-/// clone the `Arc` for their ID out of the map and then hold the per-aggregate
-/// lock across the async command execution. The per-aggregate lock is async
-/// (not `std::sync::Mutex`) because the guard is held across an `.await`
-/// point -- a `std` guard held there would block the executing worker thread.
-///
-/// The map is never evicted: it grows with aggregate-ID cardinality for the
-/// lifetime of the `Store`. Accepted tradeoff for this library's bounded
-/// business-entity cardinality; see ADR-0004.
+/// See ADR-0004 for why commands serialize per aggregate at all, and ADR-0005
+/// for why this table is bounded. An outer `std::sync::Mutex` guards the table;
+/// callers take the `Arc` for their ID out of it and then hold the
+/// per-aggregate lock across the async command execution. The per-aggregate
+/// lock is async (not `std::sync::Mutex`) because the guard is held across an
+/// `.await` point -- a `std` guard held there would block the executing worker
+/// thread. The outer mutex is a `std` one because it is only ever held for the
+/// synchronous resolve-or-insert.
 #[derive(Default)]
 struct PerAggregateLocks {
-    locks: SyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    table: SyncMutex<AggregateLockTable>,
+}
+
+/// Aggregate ID -> a weak handle on that aggregate's in-flight mutex.
+///
+/// Weak, not strong, is what bounds this table. A strong reference exists only
+/// where lock interest exists -- the `Arc` [`PerAggregateLocks::acquire`] takes
+/// out of the table, the `lock_owned()` future it moves into, and the
+/// `OwnedMutexGuard` that future resolves to. So the mutex for an aggregate
+/// deallocates the instant its last holder or waiter goes away (including on
+/// cancellation, where a waiter simply drops its `Arc`), leaving behind an
+/// entry whose `Weak` is dead: garbage with no correctness weight, collected by
+/// [`sweep_if_due`](Self::sweep_if_due).
+///
+/// This is what makes the eviction race unrepresentable rather than merely
+/// unlikely. A fresh mutex is created only when `Weak::upgrade` fails under the
+/// outer mutex; upgrade fails only when the strong count is zero; and the
+/// strong count only ever *rises* inside that same outer mutex, since the
+/// upgrade in `acquire` is the sole count-increasing site and everything
+/// downstream moves the `Arc` rather than cloning it. A task that has taken the
+/// mutex out of the table but not yet acquired it therefore cannot be missed:
+/// its interest *is* a strong reference. Evict on last-guard-drop instead and
+/// that task becomes invisible, so an eviction plus a fresh insert would hand
+/// two tasks two different mutexes for one aggregate -- silently unserializing
+/// them. See ADR-0005.
+struct AggregateLockTable {
+    entries: HashMap<String, Weak<AsyncMutex<()>>>,
+    sweep_watermark: usize,
+}
+
+impl Default for AggregateLockTable {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            // Deriving `Default` would start this at 0 and sweep on every
+            // insert.
+            sweep_watermark: MIN_SWEEP_WATERMARK,
+        }
+    }
 }
 
 impl PerAggregateLocks {
-    /// Acquire the lock for `aggregate_id`, creating it on first use.
+    /// Acquire the lock for `aggregate_id`, creating a fresh mutex when no task
+    /// currently holds interest in one.
     ///
     /// The returned guard is released by RAII when dropped -- including on
-    /// cancellation of the future holding it -- so there is no separate
-    /// release step.
+    /// cancellation of the future holding it -- so there is no separate release
+    /// step, and no eviction step either: dropping the last guard deallocates
+    /// the mutex.
     async fn acquire(&self, aggregate_id: &str) -> OwnedMutexGuard<()> {
         let per_aggregate_lock = {
-            let mut locks = self.locks.lock().unwrap_or_else(PoisonError::into_inner);
-            // Look up by borrowed `&str` first so the steady-state case (the
-            // aggregate's lock already exists, which is the overwhelmingly
-            // common case once a `Store` has warmed up) never allocates a
-            // `String` just to discard it. Only the first-use miss path pays
-            // for the owned key `entry()` requires.
-            locks.get(aggregate_id).cloned().unwrap_or_else(|| {
-                Arc::clone(
-                    locks
-                        .entry(aggregate_id.to_string())
-                        .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
-                )
+            let mut table = self.table.lock().unwrap_or_else(PoisonError::into_inner);
+
+            // Resolve by borrowed `&str` so the contended case -- an aggregate
+            // whose lock some other task is already holding or awaiting, which
+            // is the only case where this table does any work at all -- never
+            // allocates a `String` just to discard it. Only the insert path
+            // pays for the owned key.
+            let live_lock = table.entries.get(aggregate_id).and_then(Weak::upgrade);
+
+            live_lock.unwrap_or_else(|| {
+                let fresh_lock = Arc::new(AsyncMutex::new(()));
+                table
+                    .entries
+                    .insert(aggregate_id.to_string(), Arc::downgrade(&fresh_lock));
+                table.sweep_if_due();
+                fresh_lock
             })
         };
 
         per_aggregate_lock.lock_owned().await
+    }
+}
+
+impl AggregateLockTable {
+    /// Amortized collection of dead entries, called on the one path that grows
+    /// the table.
+    ///
+    /// Removes only entries whose mutex has no strong references left. Those
+    /// are permanently unreachable -- a `Weak` whose strong count has hit zero
+    /// can never be upgraded again -- so removing one is invisible to every
+    /// current and future `acquire`, and correctness never depends on this
+    /// running. A strong count that goes stale between the read and the removal
+    /// can only be stale-high, which keeps a dead entry one sweep longer.
+    ///
+    /// Sweeping at a watermark of twice the live count means each sweep is
+    /// preceded by at least as many inserts as it costs, so the amortized cost
+    /// is O(1) per acquire, and the table stays bounded by
+    /// `max(2 * concurrent in-flight sends, MIN_SWEEP_WATERMARK)`.
+    ///
+    /// The `shrink_to` is what makes both of those claims true rather than
+    /// merely peak-relative. `HashMap::retain` walks the bucket array, so a
+    /// sweep costs O(capacity), not O(len) -- and a `std` `HashMap` never
+    /// shrinks itself on `retain`/`remove`. Without the shrink, a burst of `P`
+    /// concurrent sends would grow capacity to ~`2P` and leave it there for the
+    /// life of the process: once the burst drained, the watermark would fall
+    /// back to `MIN_SWEEP_WATERMARK` while each sweep still paid O(`P`),
+    /// triggered by as few as ~`MIN_SWEEP_WATERMARK / 2` inserts. Shrinking
+    /// back to the new watermark re-ties capacity to the *live* count, so both
+    /// the time and the memory bound track current concurrency instead of the
+    /// historical peak.
+    fn sweep_if_due(&mut self) {
+        if self.entries.len() < self.sweep_watermark {
+            return;
+        }
+
+        self.entries
+            .retain(|_, per_aggregate_lock| per_aggregate_lock.strong_count() > 0);
+
+        self.sweep_watermark = self
+            .entries
+            .len()
+            .saturating_mul(2)
+            .max(MIN_SWEEP_WATERMARK);
+
+        // Leaves room to grow back to the watermark without reallocating, while
+        // releasing the bucket array a drained spike would otherwise strand.
+        self.entries.shrink_to(self.sweep_watermark);
     }
 }
 
@@ -1596,6 +1692,265 @@ mod tests {
             .expect("acquiring a different aggregate ID must not block on an unrelated held lock");
     }
 
+    /// Number of tasks currently holding or awaiting `aggregate_id`'s lock --
+    /// its entry's strong count, since interest in a lock *is* a strong
+    /// reference to it (see [`AggregateLockTable`]).
+    fn lock_interest(locks: &PerAggregateLocks, aggregate_id: &str) -> usize {
+        locks
+            .table
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entries
+            .get(aggregate_id)
+            .map_or(0, Weak::strong_count)
+    }
+
+    /// Spins until `aggregate_id` has exactly `expected` interested tasks.
+    ///
+    /// A deterministic barrier: it waits on the precise state the assertions
+    /// downstream depend on, rather than guessing at a number of yields or a
+    /// sleep duration. Callers wrap it in a `timeout` so a state that never
+    /// arrives fails the test instead of hanging it.
+    async fn await_lock_interest(locks: &PerAggregateLocks, aggregate_id: &str, expected: usize) {
+        while lock_interest(locks, aggregate_id) != expected {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The eviction race, encoded.
+    ///
+    /// Evicting an aggregate's entry when its last guard drops looks obviously
+    /// correct and is not: a task that has taken the mutex out of the table but
+    /// has not yet acquired it -- or, as here, is queued on it -- is invisible
+    /// to the table, so evicting and then inserting afresh hands two tasks two
+    /// *different* mutexes for one aggregate and lets them run concurrently,
+    /// silently undoing ADR-0004 with no error anywhere. Under that design the
+    /// third acquire below finds no entry, creates an unlocked mutex, and
+    /// completes immediately -- and this test fails.
+    #[tokio::test]
+    async fn per_aggregate_locks_keep_one_mutex_while_a_waiter_is_queued() {
+        let locks = Arc::new(PerAggregateLocks::default());
+
+        let holder_guard = locks.acquire("agg-1").await;
+
+        let waiter_locks = Arc::clone(&locks);
+        let release_waiter = Arc::new(Notify::new());
+        let waiter_release = Arc::clone(&release_waiter);
+        let (waiter_acquired_tx, waiter_acquired_rx) = oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let _guard = waiter_locks.acquire("agg-1").await;
+            waiter_acquired_tx
+                .send(())
+                .expect("test should still be waiting on the receiver");
+            waiter_release.notified().await;
+        });
+
+        // Barrier: two interested tasks -- this test's guard, and the waiter
+        // queued on the very same mutex.
+        timeout(
+            Duration::from_secs(2),
+            await_lock_interest(&locks, "agg-1", 2),
+        )
+        .await
+        .expect("the waiter should queue on the held lock");
+
+        // Evict-on-last-guard-drop would remove the entry right here, while the
+        // waiter is still queued on the mutex it removed.
+        drop(holder_guard);
+
+        waiter_acquired_rx
+            .await
+            .expect("the waiter should acquire once the holder releases");
+
+        match timeout(Duration::from_millis(200), locks.acquire("agg-1")).await {
+            Ok(_guard) => panic!(
+                "acquired a lock the waiter is still holding: the table handed out a second \
+                 mutex for the same aggregate, so two commands on it can run concurrently"
+            ),
+            Err(_elapsed) => {}
+        }
+
+        release_waiter.notify_one();
+        waiter.await.unwrap();
+
+        timeout(Duration::from_secs(2), locks.acquire("agg-1"))
+            .await
+            .expect("the lock must be acquirable once the waiter releases it");
+    }
+
+    /// Memory is actually reclaimed: commanding many distinct aggregates once
+    /// each -- the per-fill / per-order / per-request ID schemes both consumer
+    /// bots use -- must not leave a mutex behind for every ID ever seen.
+    ///
+    /// The exact residue is determined by the sweep policy, not incidental:
+    /// entries accumulate until an insert reaches the watermark (64), which
+    /// sweeps back to the single live entry; the last such sweep lands on the
+    /// 127th acquire, leaving it plus the 128th behind.
+    #[tokio::test]
+    async fn per_aggregate_locks_reclaim_entries_of_finished_aggregates() {
+        let locks = PerAggregateLocks::default();
+
+        for index in 0..2 * MIN_SWEEP_WATERMARK {
+            drop(locks.acquire(&format!("agg-{index}")).await);
+        }
+
+        let (entry_count, live_mutex_count) = {
+            let table = locks.table.lock().unwrap_or_else(PoisonError::into_inner);
+            (
+                table.entries.len(),
+                table
+                    .entries
+                    .values()
+                    .filter(|per_aggregate_lock| per_aggregate_lock.strong_count() > 0)
+                    .count(),
+            )
+        };
+
+        assert_eq!(
+            entry_count, 2,
+            "the lock table must not retain an entry per aggregate ID ever commanded",
+        );
+        assert_eq!(
+            live_mutex_count, 0,
+            "every mutex must already be deallocated -- reclaiming them does not wait on a sweep",
+        );
+    }
+
+    /// The table's memory bound must track *current* concurrency, not the
+    /// historical peak.
+    ///
+    /// `HashMap::retain` alone would not give this: it never shrinks the bucket
+    /// array, so a drained spike of concurrent sends would strand capacity at
+    /// spike size for the life of the process -- and, because a sweep walks
+    /// buckets rather than entries, would make every later sweep pay for that
+    /// stranded capacity too. Holding many guards at once forces real growth,
+    /// so this fails without the `shrink_to` in `sweep_if_due`.
+    #[tokio::test]
+    async fn per_aggregate_locks_release_capacity_after_a_concurrency_spike() {
+        const SPIKE: usize = 8 * MIN_SWEEP_WATERMARK;
+
+        let locks = PerAggregateLocks::default();
+
+        // Hold every guard at once: the entries stay live, so no sweep can
+        // collect them and the table must genuinely grow to spike size.
+        let mut guards = Vec::new();
+        for index in 0..SPIKE {
+            guards.push(locks.acquire(&format!("spike-{index}")).await);
+        }
+
+        let spike_capacity = {
+            let table = locks.table.lock().unwrap_or_else(PoisonError::into_inner);
+            table.entries.capacity()
+        };
+        assert!(
+            spike_capacity >= SPIKE,
+            "the spike must have actually grown the table, got capacity {spike_capacity}",
+        );
+
+        // Drain the spike. The entries are now all dead, but the watermark is
+        // still ~2 * SPIKE, so keep commanding fresh aggregates -- one at a
+        // time, so only one is ever live -- until an insert reaches it and
+        // sweeps. That sweep is the one that collapses the watermark back to
+        // MIN_SWEEP_WATERMARK, and it is where a `retain` alone would strand
+        // the spike's bucket array for good.
+        drop(guards);
+        for index in 0..(2 * SPIKE + MIN_SWEEP_WATERMARK) {
+            drop(locks.acquire(&format!("after-{index}")).await);
+        }
+
+        let (drained_capacity, drained_watermark) = {
+            let table = locks.table.lock().unwrap_or_else(PoisonError::into_inner);
+            (table.entries.capacity(), table.sweep_watermark)
+        };
+
+        assert_eq!(
+            drained_watermark, MIN_SWEEP_WATERMARK,
+            "with the spike drained and one live aggregate, the watermark must be back at its floor",
+        );
+        assert!(
+            drained_capacity < spike_capacity,
+            "capacity must be released once a spike drains, but it stayed at \
+             {drained_capacity} (spike was {spike_capacity}): the table's time and memory \
+             bounds would be peak-concurrency, not current",
+        );
+    }
+
+    /// A sweep collects only permanently-dead entries. It must never replace
+    /// the mutex of a lock somebody is still holding, which would be the same
+    /// silent unserialization as the eviction race above.
+    #[tokio::test]
+    async fn per_aggregate_locks_sweep_never_replaces_a_held_mutex() {
+        let locks = PerAggregateLocks::default();
+
+        let held_guard = locks.acquire("held").await;
+
+        // Enough distinct aggregates to drive at least one sweep straight past
+        // the held entry.
+        for index in 0..MIN_SWEEP_WATERMARK {
+            drop(locks.acquire(&format!("churn-{index}")).await);
+        }
+
+        assert_eq!(
+            lock_interest(&locks, "held"),
+            1,
+            "a sweep must keep the entry of a lock that is still held",
+        );
+
+        match timeout(Duration::from_millis(200), locks.acquire("held")).await {
+            Ok(_guard) => panic!(
+                "acquired a lock this test still holds: a sweep replaced its mutex with a fresh one"
+            ),
+            Err(_elapsed) => {}
+        }
+
+        drop(held_guard);
+
+        timeout(Duration::from_secs(2), locks.acquire("held"))
+            .await
+            .expect("the lock must be acquirable once the held guard is released");
+    }
+
+    /// A waiter cancelled before it ever acquires produces no guard, so it is
+    /// the path that orphans an entry forever under any release-hook design.
+    /// Here it just drops its `Arc`.
+    #[tokio::test]
+    async fn per_aggregate_locks_recover_after_a_cancelled_waiter() {
+        let locks = Arc::new(PerAggregateLocks::default());
+
+        let holder_guard = locks.acquire("agg-1").await;
+
+        let waiter_locks = Arc::clone(&locks);
+        let waiter = tokio::spawn(async move {
+            let _guard = waiter_locks.acquire("agg-1").await;
+        });
+
+        timeout(
+            Duration::from_secs(2),
+            await_lock_interest(&locks, "agg-1", 2),
+        )
+        .await
+        .expect("the waiter should queue on the held lock");
+
+        waiter.abort();
+        let join_error = waiter.await.unwrap_err();
+        assert!(join_error.is_cancelled());
+
+        timeout(
+            Duration::from_secs(2),
+            await_lock_interest(&locks, "agg-1", 1),
+        )
+        .await
+        .expect("a cancelled waiter must give up its interest in the lock");
+
+        drop(holder_guard);
+
+        timeout(Duration::from_secs(2), locks.acquire("agg-1"))
+            .await
+            .expect(
+                "the lock must be acquirable after a waiter is cancelled and the holder releases",
+            );
+    }
+
     /// Order-sensitive fixture for `Store::send` serialization tests: any
     /// `Append` command is valid whether the aggregate is uninitialized or
     /// live, and the resulting state is the exact sequence of applied
@@ -2169,6 +2524,43 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(committed_after_release, 2);
+    }
+
+    /// The reported leak, through the production path: a `Store` commanded
+    /// once each on many distinct aggregate IDs -- what both consumer bots do,
+    /// keying an aggregate per on-chain fill, per hedge order, or per API
+    /// request -- must not accumulate a mutex per ID for the life of the
+    /// process. Same residue arithmetic as the unit-level reclamation test.
+    #[tokio::test]
+    async fn send_keeps_the_lock_table_bounded_across_distinct_aggregate_ids() {
+        let pool = test_pool().await;
+        let store = StoreBuilder::<Ledger>::new(pool).build(()).await.unwrap();
+
+        for index in 0..2 * MIN_SWEEP_WATERMARK {
+            store
+                .send(
+                    &NumericId(u64::try_from(index).unwrap()),
+                    LedgerCommand::Append {
+                        label: format!("event-{index}"),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let entries = store
+            .locks
+            .table
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entries
+            .len();
+
+        assert_eq!(
+            entries, 2,
+            "the lock table must stay bounded by in-flight commands, not grow with every \
+             aggregate ID the store has ever commanded",
+        );
     }
 
     #[tokio::test]
