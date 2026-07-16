@@ -202,12 +202,50 @@ pub struct RetryMaxDelay(pub Duration);
 /// `base_delay` and `max_delay` are distinct newtypes (not two positional
 /// `Duration` args, nor two same-typed named fields), so a call site cannot
 /// transpose them -- swapping which value is assigned to which field is a
-/// type error, not just a naming-discipline convention. See
+/// type error, not just a naming-discipline convention. Construct via
+/// [`RetrySchedule::new`], which enforces `base_delay <= max_delay`. See
 /// [`RETRY_SCHEDULE`] for the production default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetrySchedule {
-    pub base_delay: RetryBaseDelay,
-    pub max_delay: RetryMaxDelay,
+    base_delay: RetryBaseDelay,
+    max_delay: RetryMaxDelay,
+}
+
+impl RetrySchedule {
+    /// Rejects `base_delay > max_delay`, which would flatten every
+    /// backoff attempt to a single fixed delay -- see `backoff_delay`.
+    pub const fn new(
+        base_delay: RetryBaseDelay,
+        max_delay: RetryMaxDelay,
+    ) -> Result<Self, RetryScheduleError> {
+        let RetryBaseDelay(base_duration) = base_delay;
+        let RetryMaxDelay(max_duration) = max_delay;
+
+        if base_duration.as_nanos() > max_duration.as_nanos() {
+            return Err(RetryScheduleError::BaseExceedsMax {
+                base: base_delay,
+                max: max_delay,
+            });
+        }
+
+        Ok(Self {
+            base_delay,
+            max_delay,
+        })
+    }
+}
+
+/// Error building a [`RetrySchedule`] whose `base_delay` exceeds `max_delay`.
+///
+/// Returned by [`RetrySchedule::new`], which is the only way to construct a
+/// schedule outside this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RetryScheduleError {
+    #[error("retry schedule base_delay {base:?} exceeds max_delay {max:?}")]
+    BaseExceedsMax {
+        base: RetryBaseDelay,
+        max: RetryMaxDelay,
+    },
 }
 
 /// Number of retries before `retry_with_backoff`/`Projection::react` give up.
@@ -220,9 +258,12 @@ pub const RETRY_MAX_ATTEMPTS: u32 = 10;
 /// budget. Shared between `Projection::react`'s own retry loop and
 /// [`RetryOnBusy`]'s call to [`retry_with_backoff`], so the two stay in sync
 /// without sharing the loop itself.
-pub const RETRY_SCHEDULE: RetrySchedule = RetrySchedule {
-    base_delay: RetryBaseDelay(Duration::from_millis(10)),
-    max_delay: RetryMaxDelay(Duration::from_secs(1)),
+pub const RETRY_SCHEDULE: RetrySchedule = match RetrySchedule::new(
+    RetryBaseDelay(Duration::from_millis(10)),
+    RetryMaxDelay(Duration::from_secs(1)),
+) {
+    Ok(schedule) => schedule,
+    Err(_) => panic!("RETRY_SCHEDULE: base_delay exceeds max_delay"),
 };
 
 /// Computes the exponential backoff delay for a given retry attempt.
@@ -230,8 +271,9 @@ pub const RETRY_SCHEDULE: RetrySchedule = RetrySchedule {
 /// Doubles `schedule.base_delay` once per attempt (iteratively, so there is
 /// no artificial exponent ceiling), clamping to `schedule.max_delay` the
 /// moment doubling would reach or exceed it. `attempt == 0` returns
-/// `base_delay` itself (clamped if `base_delay` already exceeds `max_delay`,
-/// e.g. a misconfigured schedule). Shared by [`retry_with_backoff`] and
+/// `base_delay` itself (clamped if `base_delay` already exceeds `max_delay`;
+/// `RetrySchedule::new` rejects this for external callers, but an in-module
+/// schedule can still be built this way). Shared by [`retry_with_backoff`] and
 /// `Projection::react`'s own retry loop so the two schedules can't silently
 /// diverge on this property.
 pub(crate) fn backoff_delay(attempt: u32, schedule: RetrySchedule) -> Duration {
@@ -826,10 +868,12 @@ mod tests {
         assert_eq!(backoff_delay(7, schedule), Duration::from_millis(1000));
     }
 
-    /// A misconfigured schedule where `base_delay` already exceeds
-    /// `max_delay`. The doc comment on `backoff_delay` promises `attempt ==
-    /// 0` is clamped in this case; the final `.min(max_delay)` is what makes
-    /// that true, so this exercises that branch directly.
+    /// Coverage for `backoff_delay`'s defensive `.min(max_delay)` clamp on a
+    /// schedule with `base_delay > max_delay`. `RetrySchedule::new` rejects
+    /// this shape for external callers, but `backoff_delay` has no way to
+    /// know whether a schedule it's handed came through `new()` or an
+    /// in-module literal (this test lives in `reactor::tests`, so it can
+    /// still build one directly), so the clamp itself stays load-bearing.
     #[test]
     fn backoff_delay_clamps_base_delay_exceeding_max_delay() {
         let misconfigured_schedule = RetrySchedule {
@@ -841,6 +885,40 @@ mod tests {
             backoff_delay(0, misconfigured_schedule),
             Duration::from_millis(10),
         );
+    }
+
+    #[test]
+    fn retry_schedule_new_rejects_base_exceeding_max() {
+        let error = RetrySchedule::new(
+            RetryBaseDelay(Duration::from_millis(1000)),
+            RetryMaxDelay(Duration::from_millis(10)),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RetryScheduleError::BaseExceedsMax { base, max }
+            if base == RetryBaseDelay(Duration::from_millis(1000))
+                && max == RetryMaxDelay(Duration::from_millis(10))
+        ));
+    }
+
+    #[test]
+    fn retry_schedule_new_accepts_base_equal_max() {
+        RetrySchedule::new(
+            RetryBaseDelay(Duration::from_millis(5)),
+            RetryMaxDelay(Duration::from_millis(5)),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn retry_schedule_new_accepts_base_less_than_max() {
+        RetrySchedule::new(
+            RetryBaseDelay(Duration::from_millis(1)),
+            RetryMaxDelay(Duration::from_millis(5)),
+        )
+        .unwrap();
     }
 
     /// Forces the `Duration::checked_mul(2)` guard in `backoff_delay` to
