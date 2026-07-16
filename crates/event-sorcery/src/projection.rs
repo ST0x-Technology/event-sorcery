@@ -16,15 +16,14 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::time::{Duration, sleep};
+use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::EventSourced;
 use crate::dependency::{Cons, Dependent, EntityList, Nil};
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::reactor::{
-    RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS, Reactor, backoff_delay_ms,
-    is_retryable_sqlite_busy,
+    RETRY_MAX_ATTEMPTS, RETRY_SCHEDULE, Reactor, backoff_delay, is_retryable_sqlite_busy,
 };
 use crate::view_backend::{SqliteViewBackend, ViewBackend};
 
@@ -523,12 +522,11 @@ where
         let (id, event) = event.into_inner();
         let view_id = id.to_string();
 
-        // Retry with exponential backoff: 10ms, 20ms, 40ms, ... capped at 1s.
-        // 10 retries gives ~4.3s of total retry budget, enough for any
-        // realistic burst of concurrent writers on the same aggregate.
+        // Retry with exponential backoff per RETRY_SCHEDULE, up to
+        // RETRY_MAX_ATTEMPTS retries, enough for any realistic burst of
+        // concurrent writers on the same aggregate.
         let max_retries = RETRY_MAX_ATTEMPTS;
-        let base_delay_ms = RETRY_BASE_DELAY_MS;
-        let max_delay_ms = RETRY_MAX_DELAY_MS;
+        let schedule = RETRY_SCHEDULE;
 
         for attempt in 0..=max_retries {
             let (mut lifecycle, context) = match self.repo.load_with_context(&view_id).await {
@@ -536,13 +534,13 @@ where
                 Ok(None) => (Lifecycle::default(), ViewContext::new(view_id.clone(), 0)),
                 Err(error) if is_retryable_sqlite_busy(&error) => {
                     if attempt < max_retries {
-                        let delay_ms = backoff_delay_ms(attempt, base_delay_ms, max_delay_ms);
+                        let delay = backoff_delay(attempt, schedule);
                         warn!(
                             target: "cqrs",
-                            %view_id, attempt = attempt + 1, max_retries, delay_ms,
+                            %view_id, attempt = attempt + 1, max_retries, delay_ms = delay.as_millis(),
                             "SQLite busy loading view, retrying"
                         );
-                        sleep(Duration::from_millis(delay_ms)).await;
+                        sleep(delay).await;
                         continue;
                     }
 
@@ -564,13 +562,13 @@ where
             match self.repo.update_view(lifecycle, context).await {
                 Ok(()) => return Ok(()),
                 Err(PersistenceError::OptimisticLockError) if attempt < max_retries => {
-                    let delay_ms = backoff_delay_ms(attempt, base_delay_ms, max_delay_ms);
+                    let delay = backoff_delay(attempt, schedule);
                     warn!(
                         target: "cqrs",
-                        %view_id, attempt = attempt + 1, max_retries, delay_ms,
+                        %view_id, attempt = attempt + 1, max_retries, delay_ms = delay.as_millis(),
                         "Optimistic lock conflict, retrying view update"
                     );
-                    sleep(Duration::from_millis(delay_ms)).await;
+                    sleep(delay).await;
                 }
                 Err(PersistenceError::OptimisticLockError) => {
                     error!(
@@ -582,13 +580,13 @@ where
                 }
                 Err(error) if is_retryable_sqlite_busy(&error) => {
                     if attempt < max_retries {
-                        let delay_ms = backoff_delay_ms(attempt, base_delay_ms, max_delay_ms);
+                        let delay = backoff_delay(attempt, schedule);
                         warn!(
                             target: "cqrs",
-                            %view_id, attempt = attempt + 1, max_retries, delay_ms,
+                            %view_id, attempt = attempt + 1, max_retries, delay_ms = delay.as_millis(),
                             "SQLite busy, retrying view update"
                         );
-                        sleep(Duration::from_millis(delay_ms)).await;
+                        sleep(delay).await;
                     } else {
                         error!(
                             target: "cqrs",
