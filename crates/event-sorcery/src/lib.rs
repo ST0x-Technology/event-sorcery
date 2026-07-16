@@ -114,7 +114,10 @@ pub use dependency::{Dependent, EntityList, Fold, HasEntity, OneOf};
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
 pub use projection::{Column, Projection, ProjectionError, Table};
-pub use reactor::Reactor;
+pub use reactor::{
+    IdempotentReactor, RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS, Reactor,
+    RetryOnBusy, is_retryable_sqlite_busy, retry_with_backoff,
+};
 pub use schema_registry::{ReconcileError, Reconciler, SchemaReconciliation, SchemaRegistry};
 use sqlite_event_repository::SqliteEventRepository;
 #[cfg(any(test, feature = "test-support"))]

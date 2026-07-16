@@ -405,6 +405,64 @@ impl<Entity: EventSourced> TestStore<Entity> {
     }
 }
 
+/// Minimal [`sqlx::error::DatabaseError`] impl so tests don't need real SQLite
+/// lock contention -- just a stand-in with a controllable extended result code.
+///
+/// Single source of truth for the busy-error double: `reactor.rs`,
+/// `projection.rs` and `lifecycle.rs` all classify or retry on SQLite busy
+/// errors and all need to fabricate one.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct TestDatabaseError {
+    code: String,
+}
+
+#[cfg(test)]
+impl std::fmt::Display for TestDatabaseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "test database error (code {})", self.code)
+    }
+}
+
+#[cfg(test)]
+impl std::error::Error for TestDatabaseError {}
+
+#[cfg(test)]
+impl sqlx::error::DatabaseError for TestDatabaseError {
+    fn message(&self) -> &'static str {
+        "test database error"
+    }
+
+    fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+        Some(std::borrow::Cow::Borrowed(&self.code))
+    }
+
+    fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+        self
+    }
+
+    fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+        self
+    }
+
+    fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+        self
+    }
+
+    fn kind(&self) -> sqlx::error::ErrorKind {
+        sqlx::error::ErrorKind::Other
+    }
+}
+
+/// Builds a [`sqlx::Error::Database`] reporting `code` as its extended result
+/// code -- e.g. `"5"` (`SQLITE_BUSY`) or `"517"` (`SQLITE_BUSY_SNAPSHOT`).
+#[cfg(test)]
+pub(crate) fn sqlx_error_with_code(code: &str) -> sqlx::Error {
+    sqlx::Error::Database(Box::new(TestDatabaseError {
+        code: code.to_string(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;

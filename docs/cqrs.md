@@ -243,6 +243,137 @@ receives `(error, id, event)` and can reprocess the event from the errored state
 
 Wire reactors via `Unwired` + `StoreBuilder::wire()`.
 
+### Retrying on transient SQLite busy errors
+
+`ReactorBridge::dispatch` logs and swallows any `react()` error -- it does not
+retry. `Projection` gets its own retry-with-backoff for free (see
+`Projection::react`), covering both optimistic-lock conflicts and transient
+SQLite busy errors, but a bespoke `Reactor` does not: under SQLite WAL
+contention, a `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` failure logs and drops the
+reactor's update unless it opts in.
+
+Opt in by wrapping the reactor in `RetryOnBusy` and implementing the
+`IdempotentReactor` marker trait, which declares that `react()` performs solely
+SQLite writes with no side effect (HTTP/RPC call, `Store::send` to another
+aggregate, message-queue publish) that would double-fire on retry:
+
+```rust
+impl IdempotentReactor for MyReactor {}
+
+let store = StoreBuilder::<MyEntity>::new(pool)
+    .with(Arc::new(RetryOnBusy { inner: my_reactor }))
+    // ...
+```
+
+Only implement `IdempotentReactor` for reactors that are provably pure DB writes
+end-to-end -- a reactor that orchestrates across aggregates (like
+`RebalancingTrigger` above) must not, unless the downstream command handler is
+independently confirmed idempotent under re-invocation. For a reactor whose
+`react()` has side effects before its write, call `retry_with_backoff` and
+`is_retryable_sqlite_busy` directly around just the write instead, leaving the
+earlier side effects outside the retry boundary and outside `IdempotentReactor`
+entirely. A `react()` that issues two or more separate, non-transactional SQLite
+statements is unsafe to mark too: if the first commits and a later one hits
+`SQLITE_BUSY`, the retry replays the whole `react()`, re-running the
+already-committed statement. A conforming `react()` must be atomic as a whole --
+a single statement, a single transaction, or written so replaying it is safe
+(upserts, not bare inserts).
+
+A reactor that does neither still logs and drops its update on a busy error,
+exactly as before this exists -- opting in is a per-reactor decision, not a
+blanket fix.
+
+#### Reactors that call `Store::send`: unwrap the error yourself
+
+A reactor that orchestrates across aggregates is the one case the fail-closed
+default leaves unprotected, so it needs the most care. `Store::send` returns
+`SendError<Entity>` (= `cqrs_es::AggregateError<LifecycleError<Entity>>`), whose
+`DatabaseConnectionError` variant boxes its inner error _without_ wiring it as
+`#[source]`. `is_retryable_sqlite_busy` walks `source()` chains, so it cannot
+see into that box -- and because `AggregateError<T>` is generic over the
+aggregate, it cannot be downcast from generic code either. A busy error raised
+inside `Store::send` is therefore sealed, and `is_retryable_sqlite_busy` returns
+`false` for it (see `docs/sqlx.md`).
+
+At _your_ call site `Entity` is concrete, so you can open the box yourself.
+Classify the error, then retry only the write -- never the whole `react()`,
+which would re-fire the preceding side effects:
+
+```rust
+use cqrs_es::AggregateError;
+use event_sorcery::{
+    RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS, SendError,
+    is_retryable_sqlite_busy, retry_with_backoff,
+};
+
+/// Reaches the busy error that `AggregateError`'s unsourced box hides from the
+/// generic classifier.
+fn send_error_is_busy(error: &SendError<Position>) -> bool {
+    match error {
+        AggregateError::DatabaseConnectionError(inner) => {
+            is_retryable_sqlite_busy(inner.as_ref())
+        }
+        // A rejected command, a lost optimistic-lock race, or a corrupt payload
+        // is not a transient lock conflict -- retrying re-runs the command.
+        AggregateError::UserError(_)
+        | AggregateError::AggregateConflict
+        | AggregateError::DeserializationError(_)
+        | AggregateError::UnexpectedError(_) => false,
+    }
+}
+
+async fn react(&self, event: /* ... */) -> Result<(), MyReactorError> {
+    let quote = self.pricing.fetch_quote().await?; // side effect: outside the retry
+
+    retry_with_backoff(
+        RETRY_MAX_ATTEMPTS,
+        RETRY_BASE_DELAY_MS,
+        RETRY_MAX_DELAY_MS,
+        || self.store.send(position_id.clone(), Rebalance { quote }),
+        send_error_is_busy,
+    )
+    .await?;
+
+    Ok(())
+}
+```
+
+This reactor must **not** implement `IdempotentReactor`: the retry boundary is
+the write, not `react()`, and the HTTP call above it must not double-fire. Note
+that `Store::send` is only replay-safe here if the downstream command handler is
+idempotent under re-invocation -- retrying a command that appends an event
+re-appends it. Confirm that before wrapping the send at all.
+
+**Latency tradeoff:** `CqrsFramework::execute_with_metadata` awaits every
+registered reactor's `dispatch()` synchronously before returning to the command
+caller, once per event, so a `RetryOnBusy`-wrapped reactor blocks that caller
+_per reacted event_ whenever a busy/busy-snapshot conflict occurs -- including
+conflicts caused by an unrelated writer committing anywhere in the same database
+file, not just writes to the aggregate the command touched. A single command
+that emits multiple events dispatches the reactor once per event, so the
+worst-case block for that command is the per-event cost multiplied by the event
+count.
+
+The per-event cost is **the sleep budget plus up to one `busy_timeout` per
+attempt**:
+
+- **Sleep budget: ~4.3s.** The sum of the backoff delays between the 11 attempts
+  (see `RETRY_MAX_ATTEMPTS` / `RETRY_BASE_DELAY_MS` / `RETRY_MAX_DELAY_MS`).
+- **Plus up to `busy_timeout` per attempt.** A plain `SQLITE_BUSY` does not
+  surface to the application immediately: SQLite first waits out the
+  connection's `busy_timeout`, which sqlx defaults to **5s**. Under persistent
+  contention each attempt can burn that timeout _before_ returning the error
+  that triggers the next retry, so the worst case is on the order of a minute
+  per reacted event -- more than 10x the sleep budget alone.
+
+The ~4.3s figure is accurate only for busy errors that surface immediately:
+`SQLITE_BUSY_SNAPSHOT` (which `busy_timeout` cannot absorb -- rolling back and
+re-attempting is the only fix, and the reason this retry exists) or a connection
+configured with `busy_timeout` = 0. Size caller timeouts against the full bound,
+not the sleep budget. This is a real behavioral tradeoff (latency vs. lost
+updates), not just an idempotency question -- weigh it before wrapping a reactor
+in `RetryOnBusy`.
+
 ## Services Pattern
 
 Inject external dependencies into command handlers:

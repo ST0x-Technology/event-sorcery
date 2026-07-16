@@ -22,7 +22,10 @@ use tracing::{debug, error, info, trace, warn};
 use crate::EventSourced;
 use crate::dependency::{Cons, Dependent, EntityList, Nil};
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
-use crate::reactor::Reactor;
+use crate::reactor::{
+    RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS, Reactor, backoff_delay_ms,
+    is_retryable_sqlite_busy,
+};
 use crate::view_backend::{SqliteViewBackend, ViewBackend};
 
 /// A materialized view table name.
@@ -79,9 +82,9 @@ pub enum ProjectionError<Entity: EventSourced> {
         aggregate_id: String,
         source: serde_json::Error,
     },
-    #[error(transparent)]
+    #[error("sqlite query failed: {0}")]
     Sqlx(#[from] sqlx::Error),
-    #[error(transparent)]
+    #[error("view repository operation failed: {0}")]
     Persistence(#[from] PersistenceError),
     #[error(transparent)]
     Lifecycle(Box<LifecycleError<Entity>>),
@@ -523,14 +526,33 @@ where
         // Retry with exponential backoff: 10ms, 20ms, 40ms, ... capped at 1s.
         // 10 retries gives ~4.3s of total retry budget, enough for any
         // realistic burst of concurrent writers on the same aggregate.
-        let max_retries = 10u32;
-        let base_delay_ms = 10u64;
-        let max_delay_ms = 1000u64;
+        let max_retries = RETRY_MAX_ATTEMPTS;
+        let base_delay_ms = RETRY_BASE_DELAY_MS;
+        let max_delay_ms = RETRY_MAX_DELAY_MS;
 
         for attempt in 0..=max_retries {
             let (mut lifecycle, context) = match self.repo.load_with_context(&view_id).await {
                 Ok(Some(pair)) => pair,
                 Ok(None) => (Lifecycle::default(), ViewContext::new(view_id.clone(), 0)),
+                Err(error) if is_retryable_sqlite_busy(&error) => {
+                    if attempt < max_retries {
+                        let delay_ms = backoff_delay_ms(attempt, base_delay_ms, max_delay_ms);
+                        warn!(
+                            target: "cqrs",
+                            %view_id, attempt = attempt + 1, max_retries, delay_ms,
+                            "SQLite busy loading view, retrying"
+                        );
+                        sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+
+                    error!(
+                        target: "cqrs",
+                        %view_id, max_retries,
+                        "View load lost: SQLite busy conflict persisted after all retries"
+                    );
+                    return Ok(());
+                }
                 Err(error) => {
                     warn!(target: "cqrs", %view_id, ?error, "Failed to load view for update");
                     return Ok(());
@@ -542,7 +564,7 @@ where
             match self.repo.update_view(lifecycle, context).await {
                 Ok(()) => return Ok(()),
                 Err(PersistenceError::OptimisticLockError) if attempt < max_retries => {
-                    let delay_ms = (base_delay_ms * 2u64.pow(attempt)).min(max_delay_ms);
+                    let delay_ms = backoff_delay_ms(attempt, base_delay_ms, max_delay_ms);
                     warn!(
                         target: "cqrs",
                         %view_id, attempt = attempt + 1, max_retries, delay_ms,
@@ -557,6 +579,24 @@ where
                         "View update lost: optimistic lock conflict persisted after all retries"
                     );
                     return Ok(());
+                }
+                Err(error) if is_retryable_sqlite_busy(&error) => {
+                    if attempt < max_retries {
+                        let delay_ms = backoff_delay_ms(attempt, base_delay_ms, max_delay_ms);
+                        warn!(
+                            target: "cqrs",
+                            %view_id, attempt = attempt + 1, max_retries, delay_ms,
+                            "SQLite busy, retrying view update"
+                        );
+                        sleep(Duration::from_millis(delay_ms)).await;
+                    } else {
+                        error!(
+                            target: "cqrs",
+                            %view_id, max_retries,
+                            "View update lost: SQLite busy conflict persisted after all retries"
+                        );
+                        return Ok(());
+                    }
                 }
                 Err(error) => {
                     warn!(target: "cqrs", %view_id, ?error, "Failed to save view update");
@@ -641,6 +681,7 @@ mod tests {
     use super::*;
     use crate::Nil;
     use crate::lifecycle::Never;
+    use crate::testing::sqlx_error_with_code;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct TestEntity {
@@ -867,6 +908,151 @@ mod tests {
     type TestConflictingRepo = ConflictingRepo<Lifecycle<TestEntity>, Lifecycle<TestEntity>>;
     type TestConflictingProjection = Projection<TestEntity, ConflictingViewBackend>;
 
+    fn busy_persistence_error(code: &str) -> PersistenceError {
+        let boxed_sqlx_error: Box<dyn std::error::Error + Send + Sync + 'static> =
+            Box::new(sqlx_error_with_code(code));
+        PersistenceError::ConnectionError(boxed_sqlx_error)
+    }
+
+    /// In-memory view repository that returns a busy-classified
+    /// `PersistenceError::ConnectionError` a configurable number of times
+    /// before succeeding. Mirrors `ConflictingRepo`, but for the SQLite-busy
+    /// retry path rather than the optimistic-lock retry path.
+    ///
+    /// `busy_code` is the SQLite extended result code the failures carry, so
+    /// the retry loops can be driven with both plain `SQLITE_BUSY` (`"5"`) and
+    /// `SQLITE_BUSY_SNAPSHOT` (`"517"`) -- the latter being the case
+    /// `busy_timeout` cannot absorb, where rolling back and re-attempting is
+    /// the only fix, and therefore the whole reason the retry exists.
+    struct BusyRepo<View, Agg>
+    where
+        View: cqrs_es::View<Agg>,
+        Agg: cqrs_es::Aggregate,
+    {
+        views: RwLock<HashMap<String, (View, i64)>>,
+        remaining_busy_failures: AtomicU32,
+        remaining_load_busy_failures: AtomicU32,
+        busy_code: &'static str,
+        _phantom: PhantomData<Agg>,
+    }
+
+    impl<View, Agg> BusyRepo<View, Agg>
+    where
+        View: cqrs_es::View<Agg>,
+        Agg: cqrs_es::Aggregate,
+    {
+        /// Fails `update_view` a configurable number of times before succeeding.
+        fn new(busy_failures: u32, busy_code: &'static str) -> Self {
+            Self {
+                views: RwLock::new(HashMap::new()),
+                remaining_busy_failures: AtomicU32::new(busy_failures),
+                remaining_load_busy_failures: AtomicU32::new(0),
+                busy_code,
+                _phantom: PhantomData,
+            }
+        }
+
+        /// Fails `load_with_context` a configurable number of times before
+        /// succeeding, instead of `update_view`. Exercises the load-side busy
+        /// retry branch in `Projection::react`.
+        fn new_with_load_failures(load_busy_failures: u32, busy_code: &'static str) -> Self {
+            Self {
+                views: RwLock::new(HashMap::new()),
+                remaining_busy_failures: AtomicU32::new(0),
+                remaining_load_busy_failures: AtomicU32::new(load_busy_failures),
+                busy_code,
+                _phantom: PhantomData,
+            }
+        }
+
+        fn with_view(self, aggregate_id: &str, view: View) -> Self {
+            let mut views = self.views.into_inner();
+            views.insert(aggregate_id.to_string(), (view, 1));
+            Self {
+                views: RwLock::new(views),
+                ..self
+            }
+        }
+    }
+
+    impl<View, Agg> ViewRepository<View, Agg> for BusyRepo<View, Agg>
+    where
+        View: cqrs_es::View<Agg> + Clone,
+        Agg: cqrs_es::Aggregate,
+    {
+        async fn load(&self, aggregate_id: &str) -> Result<Option<View>, PersistenceError> {
+            Ok(self
+                .views
+                .read()
+                .await
+                .get(aggregate_id)
+                .map(|(view, _version)| view.clone()))
+        }
+
+        async fn load_with_context(
+            &self,
+            aggregate_id: &str,
+        ) -> Result<Option<(View, ViewContext)>, PersistenceError> {
+            let remaining = self.remaining_load_busy_failures.load(Ordering::SeqCst);
+
+            if remaining > 0 {
+                self.remaining_load_busy_failures
+                    .store(remaining - 1, Ordering::SeqCst);
+                return Err(busy_persistence_error(self.busy_code));
+            }
+
+            let guard = self.views.read().await;
+            Ok(guard.get(aggregate_id).map(|(view, version)| {
+                let context = ViewContext::new(aggregate_id.to_string(), *version);
+                (view.clone(), context)
+            }))
+        }
+
+        async fn update_view(
+            &self,
+            view: View,
+            context: ViewContext,
+        ) -> Result<(), PersistenceError> {
+            let remaining = self.remaining_busy_failures.load(Ordering::SeqCst);
+
+            if remaining > 0 {
+                self.remaining_busy_failures
+                    .store(remaining - 1, Ordering::SeqCst);
+                return Err(busy_persistence_error(self.busy_code));
+            }
+
+            let new_version = context.version + 1;
+            self.views
+                .write()
+                .await
+                .insert(context.view_instance_id, (view, new_version));
+
+            Ok(())
+        }
+    }
+
+    /// `ViewBackend` whose `Repo<V, A>` is `BusyRepo<V, A>`.
+    struct BusyViewBackend;
+
+    impl ViewBackend for BusyViewBackend {
+        type Repo<View, Agg>
+            = BusyRepo<View, Agg>
+        where
+            View: cqrs_es::View<Agg> + Clone + 'static,
+            Agg: cqrs_es::Aggregate + 'static;
+    }
+
+    type TestBusyRepo = BusyRepo<Lifecycle<TestEntity>, Lifecycle<TestEntity>>;
+    type TestBusyProjection = Projection<TestEntity, BusyViewBackend>;
+
+    // `Counter` (defined below for the `catch_up` tests) has an `evolve` that
+    // actually mutates its state, unlike `TestEntity`'s no-op `evolve`. The
+    // busy-retry success tests use it so a silently dropped update (rather
+    // than a genuinely retried-and-applied one) would show up as a failed
+    // assertion instead of passing either way.
+    type CounterBusyRepo = BusyRepo<Lifecycle<Counter>, Lifecycle<Counter>>;
+    type CounterBusyProjection = Projection<Counter, BusyViewBackend>;
+
     #[tokio::test]
     async fn react_retries_on_optimistic_lock_conflict() {
         let entity = TestEntity {
@@ -890,7 +1076,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn react_gives_up_after_max_retries() {
         // 11 conflicts exceeds the max of 10 retries (attempts 0..=10)
         let entity = TestEntity {
@@ -933,6 +1119,134 @@ mod tests {
                 name: "original".to_string(),
             })
         );
+    }
+
+    /// Drives the update-side busy retry loop to a verified successful write
+    /// with failures carrying `busy_code`.
+    async fn react_retries_update_busy_then_succeeds(busy_code: &'static str) {
+        // Succeeds on the 3rd attempt, so total sleep is 10ms + 20ms -- fast.
+        let repo: Arc<CounterBusyRepo> = Arc::new(
+            BusyRepo::new(2, busy_code).with_view("id-1", Lifecycle::Live(Counter { value: 0 })),
+        );
+        let projection: CounterBusyProjection = Projection::new(Arc::clone(&repo));
+
+        let event: OneOf<(String, CounterEvent), Never> =
+            OneOf::Here(("id-1".to_string(), CounterEvent::Incremented));
+
+        projection.react(event).await.unwrap();
+
+        // Both busy failures were consumed by retries before the write succeeded.
+        assert_eq!(
+            repo.remaining_busy_failures.load(Ordering::SeqCst),
+            0,
+            "busy failures carrying code {busy_code} should all have been retried"
+        );
+
+        // Counter::evolve actually increments the value, so this only passes
+        // if the retried write was truly applied -- a silently dropped update
+        // (e.g. a missing/broken retry arm) would leave the view at 0.
+        let result = projection.load(&"id-1".to_string()).await.unwrap();
+        assert_eq!(result, Some(Counter { value: 1 }));
+    }
+
+    #[tokio::test]
+    async fn react_retries_on_sqlite_busy_error_then_succeeds() {
+        react_retries_update_busy_then_succeeds("5").await;
+    }
+
+    /// `busy_timeout` cannot absorb `SQLITE_BUSY_SNAPSHOT` -- the only fix is
+    /// to roll back and re-attempt, which is precisely what this retry loop
+    /// does. Drives the same loop as the plain-busy case above with `"517"` so
+    /// the scenario the retry exists for is covered end to end, not just in
+    /// `is_retryable_sqlite_busy`'s isolated unit tests.
+    #[tokio::test]
+    async fn react_retries_on_sqlite_busy_snapshot_error_then_succeeds() {
+        react_retries_update_busy_then_succeeds("517").await;
+    }
+
+    /// Drives the load-side busy retry loop to a verified successful write
+    /// with failures carrying `busy_code`.
+    async fn react_retries_load_busy_then_succeeds(busy_code: &'static str) {
+        // Succeeds loading on the 3rd attempt, so total sleep is 10ms + 20ms.
+        let repo: Arc<CounterBusyRepo> = Arc::new(
+            BusyRepo::new_with_load_failures(2, busy_code)
+                .with_view("id-1", Lifecycle::Live(Counter { value: 0 })),
+        );
+        let projection: CounterBusyProjection = Projection::new(Arc::clone(&repo));
+
+        let event: OneOf<(String, CounterEvent), Never> =
+            OneOf::Here(("id-1".to_string(), CounterEvent::Incremented));
+
+        projection.react(event).await.unwrap();
+
+        // Both load-busy failures were consumed by retries before the load
+        // succeeded.
+        assert_eq!(
+            repo.remaining_load_busy_failures.load(Ordering::SeqCst),
+            0,
+            "load-busy failures carrying code {busy_code} should all have been retried"
+        );
+
+        // Proves the retried load was followed by a real applied write, not a
+        // silently dropped update.
+        let result = projection.load(&"id-1".to_string()).await.unwrap();
+        assert_eq!(result, Some(Counter { value: 1 }));
+    }
+
+    #[tokio::test]
+    async fn react_retries_on_sqlite_busy_load_error_then_succeeds() {
+        react_retries_load_busy_then_succeeds("5").await;
+    }
+
+    #[tokio::test]
+    async fn react_retries_on_sqlite_busy_snapshot_load_error_then_succeeds() {
+        react_retries_load_busy_then_succeeds("517").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn react_gives_up_after_sqlite_busy_load_conflict_persists() {
+        // 11 load-busy failures exceeds the max of 10 retries (attempts 0..=10)
+        let repo: Arc<CounterBusyRepo> = Arc::new(
+            BusyRepo::new_with_load_failures(11, "5")
+                .with_view("id-1", Lifecycle::Live(Counter { value: 0 })),
+        );
+        let projection: CounterBusyProjection = Projection::new(Arc::clone(&repo));
+
+        let event: OneOf<(String, CounterEvent), Never> =
+            OneOf::Here(("id-1".to_string(), CounterEvent::Incremented));
+
+        // Should not panic -- react swallows the error
+        projection.react(event).await.unwrap();
+
+        // All 11 attempts were made (counter decremented from 11 to 0)
+        assert_eq!(repo.remaining_load_busy_failures.load(Ordering::SeqCst), 0);
+
+        // View should still have the original value (update never succeeded)
+        let result = projection.load(&"id-1".to_string()).await.unwrap();
+        assert_eq!(result, Some(Counter { value: 0 }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn react_gives_up_after_sqlite_busy_conflict_persists() {
+        // 11 busy failures exceeds the max of 10 retries (attempts 0..=10)
+        let entity = TestEntity {
+            name: "original".to_string(),
+        };
+        let repo: Arc<TestBusyRepo> =
+            Arc::new(BusyRepo::new(11, "5").with_view("id-1", Lifecycle::Live(entity.clone())));
+        let projection: TestBusyProjection = Projection::new(Arc::clone(&repo));
+
+        let event: OneOf<(String, TestEvent), Never> = OneOf::Here(("id-1".to_string(), TestEvent));
+
+        // Should not panic -- react swallows the error
+        projection.react(event).await.unwrap();
+
+        // All 11 attempts were made (counter decremented from 11 to 0)
+        assert_eq!(repo.remaining_busy_failures.load(Ordering::SeqCst), 0);
+
+        // View should still have the original entity (update never succeeded)
+        let result = projection.load(&"id-1".to_string()).await.unwrap();
+        assert_eq!(result, Some(entity));
     }
 
     #[tokio::test]

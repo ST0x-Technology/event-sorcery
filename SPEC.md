@@ -135,8 +135,19 @@ state. Operations:
 ### `Reactor`
 
 Side-effect handler keyed off events. Used for cross-aggregate orchestration
-(e.g., one aggregate's event triggers a command on another). Has automatic
-retry-with-backoff on optimistic-lock conflicts.
+(e.g., one aggregate's event triggers a command on another). Automatic
+retry-with-backoff is a property of `Projection` specifically (its own internal
+retry loop, covering both optimistic-lock conflicts and transient SQLite
+busy/busy-snapshot errors), not of reactors in general. A bespoke `Reactor` that
+never opts in still logs and drops its update on a transient SQLite busy error,
+exactly as it always has. A reactor can opt into an equivalent
+retry-with-backoff for transient SQLite busy/busy-snapshot errors two ways: wrap
+it in `RetryOnBusy` (retries the whole `react()` call, gated by implementing the
+`IdempotentReactor` marker trait, which is a declaration that `react()` performs
+solely idempotent SQLite writes with no side effect that would double-fire on
+retry), or call `retry_with_backoff` / `is_retryable_sqlite_busy` directly
+around just the write, leaving any prior side effects outside the retry
+boundary.
 
 ### `SchemaRegistry`
 
