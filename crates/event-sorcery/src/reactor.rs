@@ -329,7 +329,7 @@ mod tests {
     use cqrs_es::DomainEvent;
     use serde::{Deserialize, Serialize};
     use sqlx::Connection;
-    use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqliteJournalMode};
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use super::*;
@@ -446,6 +446,107 @@ mod tests {
         assert!(is_retryable_sqlite_busy(&downstream_error));
 
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// Removes a SQLite db file and its WAL-mode sidecars (`-wal`/`-shm`).
+    ///
+    /// A plain `std::fs::remove_file` on the main db path (as the
+    /// rollback-journal-mode test above uses) doesn't touch these -- WAL mode
+    /// creates them alongside the main file, and a panic mid-test could leave
+    /// them orphaned to bleed into the next run of the same fixed path.
+    ///
+    /// The suffixes are *appended* to the full path, not swapped in as a file
+    /// extension: SQLite names its sidecars by appending `-wal`/`-shm` to the
+    /// whole db path whatever its extension, so `foo.db`'s sidecar is
+    /// `foo.db-wal`. `Path::with_extension` would instead replace the final
+    /// extension, which happens to be right only for callers whose filenames
+    /// end in exactly `.sqlite3`.
+    fn remove_sqlite_file_and_wal_sidecars(db_path: &std::path::Path) {
+        let _ = std::fs::remove_file(db_path);
+
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = db_path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(sidecar));
+        }
+    }
+
+    /// Provokes a genuine `SQLITE_BUSY_SNAPSHOT` (extended code `"517"`) from
+    /// real sqlx/SQLite -- the WAL write-write conflict, distinct from the
+    /// plain lock-wait `SQLITE_BUSY` (`"5"`) the test above provokes.
+    /// `reader_connection` fixes its WAL read snapshot with a `SELECT`;
+    /// `writer_connection` commits a write past that snapshot;
+    /// `reader_connection`'s next write in the same transaction is rejected
+    /// because its snapshot is now stale -- SQLite returns 517, not 5, and
+    /// `busy_timeout` does not apply to this path (see `docs/sqlx.md`). Every
+    /// step is sequentially awaited on one task, so this is deterministic.
+    #[tokio::test]
+    async fn is_retryable_sqlite_busy_true_for_real_busy_snapshot() {
+        let db_path = std::env::temp_dir().join(format!(
+            "event_sorcery_reactor_real_busy_snapshot_test_{}.sqlite3",
+            REAL_BUSY_TEST_DB_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        remove_sqlite_file_and_wal_sidecars(&db_path);
+
+        let connect_options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(0));
+
+        let mut reader_connection = SqliteConnection::connect_with(&connect_options)
+            .await
+            .unwrap();
+        let mut writer_connection = SqliteConnection::connect_with(&connect_options)
+            .await
+            .unwrap();
+
+        sqlx::query("CREATE TABLE busy_snapshot_probe (value INTEGER NOT NULL)")
+            .execute(&mut writer_connection)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO busy_snapshot_probe (value) VALUES (1)")
+            .execute(&mut writer_connection)
+            .await
+            .unwrap();
+
+        sqlx::query("BEGIN")
+            .execute(&mut reader_connection)
+            .await
+            .unwrap();
+        sqlx::query("SELECT value FROM busy_snapshot_probe")
+            .fetch_one(&mut reader_connection)
+            .await
+            .unwrap();
+
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut writer_connection)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE busy_snapshot_probe SET value = value + 1")
+            .execute(&mut writer_connection)
+            .await
+            .unwrap();
+        sqlx::query("COMMIT")
+            .execute(&mut writer_connection)
+            .await
+            .unwrap();
+
+        let real_busy_snapshot_error =
+            sqlx::query("UPDATE busy_snapshot_probe SET value = value + 1")
+                .execute(&mut reader_connection)
+                .await
+                .unwrap_err();
+
+        let sqlx::Error::Database(database_error) = &real_busy_snapshot_error else {
+            panic!("expected sqlx::Error::Database, got {real_busy_snapshot_error:?}");
+        };
+        assert_eq!(database_error.code().as_deref(), Some("517"));
+
+        let downstream_error = DownstreamTransparentError::from(real_busy_snapshot_error);
+        assert!(is_retryable_sqlite_busy(&downstream_error));
+
+        remove_sqlite_file_and_wal_sidecars(&db_path);
     }
 
     #[derive(Debug, thiserror::Error)]
