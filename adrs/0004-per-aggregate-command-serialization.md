@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted.
+Accepted. Amended by [ADR-0005](0005-bounded-per-aggregate-lock-table.md): the
+"No eviction" tradeoff below is superseded -- the lock table now evicts entries
+once no in-flight command holds them.
 
 ## Context
 
@@ -66,6 +68,13 @@ the map holds one `Arc` and any in-flight caller holds another, so a correct
 eviction threshold is `== 2`, not `<= 1` -- subtle, and adds release-race
 surface for no benefit at this cardinality. Revisit with a dedicated design if
 growth ever becomes real.
+
+> **Superseded by [ADR-0005](0005-bounded-per-aggregate-lock-table.md).** Growth
+> became real: the bounded-cardinality premise is false for both production
+> consumers, which key their highest-volume aggregates per fill, per order, and
+> per API request. The lock table now holds `Weak` handles and evicts dead
+> entries. The `strong_count` cleanup was rejected rightly -- the adopted design
+> tests lock interest directly and needs no threshold at all.
 
 ## Alternatives considered
 
@@ -164,4 +173,5 @@ growth ever becomes real.
   the _same_ aggregate to finish its whole `execute`, including slow reactor
   retries (worst case ~4.3s per reacted event under sustained `SQLITE_BUSY`).
   Different aggregates are unaffected.
-- **Unbounded lock-table growth**, accepted per above.
+- **Unbounded lock-table growth**, accepted per above -- retracted by
+  [ADR-0005](0005-bounded-per-aggregate-lock-table.md), which bounds the table.
