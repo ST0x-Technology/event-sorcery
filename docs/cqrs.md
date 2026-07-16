@@ -243,6 +243,83 @@ receives `(error, id, event)` and can reprocess the event from the errored state
 
 Wire reactors via `Unwired` + `StoreBuilder::wire()`.
 
+### Same-aggregate ordering guarantee and the reentrancy rule
+
+`Store::send` serializes commands per aggregate ID: the whole load -> handle ->
+commit -> reactor/projection-dispatch cycle of one command completes before the
+next command on the _same_ aggregate begins, so `RebalancingTrigger`-style
+reactors and `Projection` observe events in commit order even when a reactor's
+dispatch is slow (e.g. retrying under `RetryOnBusy`). See ADR-0004 for the full
+rationale.
+
+**Reentrancy rule: a reactor calling `Store::send()` back onto the same
+`(entity type, aggregate ID)` it is currently reacting to -- directly, or
+transitively through a chain of other reactors' inline-awaited dispatches within
+the same inline await-chain -- would deadlock against the held per-aggregate
+lock.** `Store::send` detects this via a task-local set of in-flight aggregate
+keys, inherited down that await-chain, and fails fast with
+`LifecycleError::ReentrantCommand` instead of hanging. Commanding a _different_
+aggregate ID -- or a different entity type entirely, as `RebalancingTrigger`
+above does -- is the normal reactor-orchestration pattern and is what the guard
+is designed to leave alone.
+
+**The guard tracks inline await-chain ancestry, not task identity.** A `send()`
+rejects `id` only if a call somewhere up its own chain of awaiters already holds
+it. This means two sibling `send()` calls to the same aggregate -- e.g. issued
+via `tokio::join!`/`select!` from inside a reactor -- each inherit the same
+ancestor snapshot and so neither sees the other's in-flight key: as long as that
+aggregate is absent from the snapshot they inherited, they queue on the
+per-aggregate lock normally, exactly like two unrelated calls would, rather than
+one spuriously failing as reentrant.
+
+Siblings aimed at the aggregate the reactor is _currently reacting to_ are a
+different story. That key is already in the inherited snapshot, so `Store::send`
+sees it held and rejects each with `LifecycleError::ReentrantCommand` -- they do
+not queue. Being siblings buys them nothing: each is an ancestor self-cycle in
+its own right, which is exactly what the guard exists to catch.
+
+Two failure modes fall outside the guard entirely:
+
+- **Cross-aggregate cycles.** Two _separate_, concurrently in-flight command
+  chains that reference each other -- e.g. aggregate A's reactor commands B
+  while, concurrently, B's reactor commands A -- can still deadlock: each chain
+  holds its own aggregate's lock while blocking on the other's. This applies
+  whether the two chains run on separate tasks or as sibling futures
+  joined/selected within one task -- the guard only ever sees a single chain's
+  own ancestry, never a sibling's.
+- **Same-aggregate commands moved off-task.** A reactor that spawns a task for a
+  _same_-aggregate `send()` and awaits it (e.g.
+  `tokio::spawn(async move {
+  store.send(&id, cmd).await }).await`) also
+  escapes the guard: the spawned task starts with an empty task-local scope of
+  its own, so it blocks on the per-aggregate mutex the outer task is still
+  holding across the spawn-and-await -- the exact same deadlock class as the
+  cross-aggregate cycle above.
+
+Both are inherent to holding a lock across dispatch at all, not a gap the guard
+can close from inside a single `Store::send` call. Avoid bidirectional
+cross-aggregate command cycles between reactors, and never move a same-aggregate
+command onto a different task from within a reactor -- defer either kind of
+follow-up `send()` (e.g. via a channel/queue drained outside the reacting
+command) until after `react()` returns, so it no longer runs under the held
+lock.
+
+**Latency:** a command to an aggregate now waits for any in-flight command on
+the _same_ aggregate to finish its whole `execute`, including slow reactor
+retries (worst case ~4.3s per reacted event under sustained `SQLITE_BUSY`, see
+below). Commands on _different_ aggregates are not serialized by this lock --
+though they can still be delayed by the shared SQLite busy contention described
+below, so "not serialized" is not the same as "unaffected". In exchange,
+concurrent same-aggregate commands queue instead of one spuriously failing with
+an optimistic-lock error.
+
+**A reactor's nested `send()` is its own to handle.** `ReactorBridge::dispatch`
+only logs when `react()` itself returns `Err`, so a reactor that ignores the
+`Result` of an inner `send()` swallows a `ReentrantCommand` rejection silently:
+the outer command still reports success while the orchestrated command never
+ran. Propagate the `Result` (or handle it explicitly) -- outer success does not
+imply the nested send happened.
+
 ### Retrying on transient SQLite busy errors
 
 `ReactorBridge::dispatch` logs and swallows any `react()` error -- it does not
@@ -353,6 +430,11 @@ file, not just writes to the aggregate the command touched. A single command
 that emits multiple events dispatches the reactor once per event, so the
 worst-case block for that command is the per-event cost multiplied by the event
 count.
+
+Since `Store::send` serializes commands per aggregate ID (see "Same-aggregate
+ordering guarantee" above), the block is not confined to the caller that
+triggered it: any other command queued behind it on the _same_ aggregate also
+waits it out before it can even begin.
 
 The per-event cost is **the sleep budget plus up to one `busy_timeout` per
 attempt**:

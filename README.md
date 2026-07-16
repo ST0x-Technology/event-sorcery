@@ -15,6 +15,13 @@ Event-sourcing primitives in Rust. A thin, opinionated layer on top of
 `event-sorcery` is the recommended entry point. Use `sqlite-es` directly only if
 you need lower-level control.
 
+`Store::send()` serializes commands per aggregate ID, so reactors and
+projections always observe events for a given aggregate in commit order. This
+comes with a reentrancy rule (a reactor commanding the same aggregate it is
+reacting to fails fast instead of deadlocking) and a cross-aggregate cycle
+caveat — see [`docs/cqrs.md`](docs/cqrs.md) and
+[ADR-0004](adrs/0004-per-aggregate-command-serialization.md) for details.
+
 ## Status
 
 Extracted from internal services
