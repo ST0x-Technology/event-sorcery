@@ -374,6 +374,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use sqlx::Connection;
     use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqliteJournalMode};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use super::*;
@@ -877,7 +878,9 @@ mod tests {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    struct TestEvent;
+    struct TestEvent {
+        marker: u32,
+    }
 
     impl DomainEvent for TestEvent {
         fn event_type(&self) -> String {
@@ -942,6 +945,7 @@ mod tests {
         calls: AtomicU32,
         applied: AtomicBool,
         busy_code: &'static str,
+        received_events: Mutex<Vec<(String, TestEvent)>>,
     }
 
     impl Dependent for FlakyReactor {
@@ -958,6 +962,9 @@ mod tests {
         ) -> Result<(), Self::Error> {
             self.calls.fetch_add(1, Ordering::SeqCst);
 
+            let (id, event) = event.into_inner();
+            self.received_events.lock().unwrap().push((id, event));
+
             if self.permanent_failure {
                 return Err(FlakyReactorError::Permanent);
             }
@@ -971,7 +978,6 @@ mod tests {
                 )));
             }
 
-            let _ = event.into_inner();
             self.applied.store(true, Ordering::SeqCst);
             Ok(())
         }
@@ -989,10 +995,13 @@ mod tests {
                 calls: AtomicU32::new(0),
                 applied: AtomicBool::new(false),
                 busy_code,
+                received_events: Mutex::new(Vec::new()),
             },
         };
 
-        let event: OneOf<(String, TestEvent), Never> = OneOf::Here(("id-1".to_string(), TestEvent));
+        let original_event = TestEvent { marker: 42 };
+        let event: OneOf<(String, TestEvent), Never> =
+            OneOf::Here(("id-1".to_string(), original_event.clone()));
 
         wrapped.react(event).await.unwrap();
 
@@ -1001,6 +1010,15 @@ mod tests {
             "the write must actually land after retrying code {busy_code}"
         );
         assert_eq!(wrapped.inner.calls.load(Ordering::SeqCst), 3);
+
+        // Every retry attempt must receive the identical (id, event) pair as the
+        // original dispatch, proving `RetryOnBusy` re-dispatches the same event
+        // rather than a stale or reconstructed one.
+        let received_events = wrapped.inner.received_events.lock().unwrap().clone();
+        assert_eq!(
+            received_events,
+            vec![("id-1".to_string(), original_event); 3]
+        );
     }
 
     #[tokio::test]
@@ -1025,10 +1043,12 @@ mod tests {
                 calls: AtomicU32::new(0),
                 applied: AtomicBool::new(false),
                 busy_code: "5",
+                received_events: Mutex::new(Vec::new()),
             },
         };
 
-        let event: OneOf<(String, TestEvent), Never> = OneOf::Here(("id-1".to_string(), TestEvent));
+        let event: OneOf<(String, TestEvent), Never> =
+            OneOf::Here(("id-1".to_string(), TestEvent { marker: 42 }));
 
         let error = wrapped.react(event).await.unwrap_err();
 
