@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "event-sorcery"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "cqrs-es",
@@ -1126,7 +1126,7 @@ dependencies = [
 
 [[package]]
 name = "sqlite-es"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "cqrs-es",
