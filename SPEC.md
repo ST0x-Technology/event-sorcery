@@ -217,9 +217,14 @@ projection becomes a type error, not silent data staleness.
 
 ### Read path
 
-Consumers query via `Projection::load(...)`, never by replaying events
-themselves. Projections are kept up to date in the same transaction as event
-persistence (where possible) or asynchronously via a reactor.
+Consumers normally query via `Projection::load(...)` rather than replaying
+events themselves. Projections are kept up to date in the same transaction as
+event persistence (where possible) or asynchronously via a reactor. The one
+sanctioned exception is a checkpointed read-model ingester consuming the typed
+event stream (`events_since` / `head_rowid`): it reads events in global
+`events.rowid` order under a caller-owned durable watermark, rather than
+replaying per query. Compacted aggregates yield only retained events, and
+upcasters are not applied on this path.
 
 ### Schema drift
 
