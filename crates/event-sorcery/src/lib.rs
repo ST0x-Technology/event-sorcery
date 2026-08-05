@@ -1119,6 +1119,13 @@ pub enum EventsSinceError {
 /// their global `events.rowid`; a page shorter than `limit` means the bound
 /// was reached.
 ///
+/// Durability of the pass is the caller's side of the contract: persist
+/// `head` only after every page has been processed successfully, atomically
+/// with the read-model state where possible -- persisting it earlier skips
+/// the unprocessed remainder forever. If a page or the run fails, keep the
+/// old checkpoint and retry the whole pass from it; see [`head_rowid`] for
+/// the idempotency requirement that retry implies.
+///
 /// Caveats:
 /// - Aggregates with [`CompactionPolicy::CompactAfterSnapshot`] may have
 ///   pruned events; the stream contains only retained rows.
@@ -1195,7 +1202,10 @@ where
 ///
 /// Pass it as `through_rowid` to [`events_since`] to bound a catch-up pass to
 /// a consistent snapshot of the log: ingest `(checkpoint, head]`, then persist
-/// `head` as the new checkpoint.
+/// `head` as the new checkpoint -- atomically with the derived state when the
+/// read model lives in the same database. Where atomic checkpointing is
+/// unavailable, a crash between applying effects and persisting `head`
+/// replays the pass, so the effects must be idempotent.
 pub async fn head_rowid(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
     let (max_rowid,): (Option<i64>,) = sqlx::query_as("SELECT MAX(rowid) FROM events")
         .fetch_one(pool)
