@@ -217,9 +217,23 @@ projection becomes a type error, not silent data staleness.
 
 ### Read path
 
-Consumers query via `Projection::load(...)`, never by replaying events
-themselves. Projections are kept up to date in the same transaction as event
-persistence (where possible) or asynchronously via a reactor.
+Consumers normally query via `Projection::load(...)` rather than replaying
+events themselves. Projections are kept up to date in the same transaction as
+event persistence (where possible) or asynchronously via a reactor. The one
+sanctioned exception is a checkpointed read-model ingester consuming the typed
+event stream (`events_since` / `head_rowid`): it captures the log head once,
+reads events in global `events.rowid` order within `(checkpoint, head]`, then
+persists `head` as its caller-owned durable watermark, rather than replaying per
+query. The upper bound is what makes a pass consistent -- events committed after
+the head was captured wait for the next pass instead of leaking into a later
+page of the current one. The bound does not make the pass durable, though; that
+part of the contract is on the caller: persist `head` only after every page of
+the pass has been processed successfully -- atomically with the read-model
+state, in the same transaction, where possible. Persisting it earlier skips the
+unprocessed remainder forever. Where atomic checkpointing is unavailable, a
+crash after effects but before the checkpoint replays the pass, so the
+read-model effects must be idempotent. Compacted aggregates yield only retained
+events, and upcasters are not applied on this path.
 
 ### Schema drift
 

@@ -107,6 +107,7 @@ use sqlx::SqlitePool;
 use std::any::TypeId;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
+use std::num::NonZeroU32;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex as SyncMutex, PoisonError, Weak};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -1053,6 +1054,166 @@ pub async fn count_aggregates<Entity: EventSourced>(
     Ok(usize::try_from(row.0)?)
 }
 
+/// One persisted event of `Entity`, tagged with its global position in the
+/// shared event log.
+///
+/// `rowid` is the SQLite rowid of the row in the `events` table -- the only
+/// total order across aggregates. Checkpointed consumers persist it as a
+/// durable watermark and stamp derived rows with their provenance.
+#[derive(Debug, Clone)]
+pub struct Sequenced<Entity: EventSourced> {
+    /// Global position in the shared event log (`events.rowid`).
+    pub rowid: i64,
+    /// The aggregate instance this event belongs to.
+    pub id: Entity::Id,
+    /// Per-aggregate sequence number of the event.
+    pub sequence: i64,
+    /// The typed domain event.
+    pub event: Entity::Event,
+}
+
+/// A persisted aggregate ID exactly as stored in the `events` table, before
+/// parsing into the entity's typed [`EventSourced::Id`].
+///
+/// Surfaces in errors when the stored TEXT fails to parse -- the raw form is
+/// all that exists at that point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawAggregateId(pub String);
+
+impl Display for RawAggregateId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self(raw) = self;
+        write!(formatter, "{raw}")
+    }
+}
+
+/// Errors from [`events_since`].
+#[derive(Debug, thiserror::Error)]
+pub enum EventsSinceError {
+    #[error("Database error: {0}")]
+    Sql(#[from] sqlx::Error),
+    #[error("Unparseable aggregate ID '{id}' for {aggregate_type} at events rowid {rowid}")]
+    InvalidId {
+        aggregate_type: &'static str,
+        rowid: i64,
+        id: RawAggregateId,
+    },
+    #[error("Undeserializable {aggregate_type} event payload at events rowid {rowid}")]
+    Deserialize {
+        aggregate_type: &'static str,
+        rowid: i64,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+/// Loads a typed slice of `Entity`'s event stream in global commit order,
+/// within the half-open interval `(after_rowid, through_rowid]`, at most
+/// `limit` rows.
+///
+/// The sanctioned way for checkpointed read-model ingesters to consume the
+/// event log: capture [`head_rowid`] once, page `(checkpoint, head]` with this
+/// function, then persist `head` as the new checkpoint. The upper bound keeps
+/// the pass consistent -- rows committed after the head was captured cannot
+/// leak into a later page and be re-processed on the next pass. Rows carry
+/// their global `events.rowid`; a page shorter than `limit` means the bound
+/// was reached.
+///
+/// Durability of the pass is the caller's side of the contract: persist
+/// `head` only after every page has been processed successfully, atomically
+/// with the read-model state where possible -- persisting it earlier skips
+/// the unprocessed remainder forever. If a page or the run fails, keep the
+/// old checkpoint and retry the whole pass from it; see [`head_rowid`] for
+/// the idempotency requirement that retry implies.
+///
+/// Caveats:
+/// - Aggregates with [`CompactionPolicy::CompactAfterSnapshot`] may have
+///   pruned events; the stream contains only retained rows.
+/// - Payloads deserialize directly via the event type's serde; event
+///   upcasters are not applied.
+pub async fn events_since<Entity: EventSourced>(
+    pool: &SqlitePool,
+    after_rowid: i64,
+    through_rowid: i64,
+    limit: NonZeroU32,
+) -> Result<Vec<Sequenced<Entity>>, EventsSinceError>
+where
+    <Entity::Id as FromStr>::Err: Debug,
+{
+    let rows: Vec<(i64, String, i64, String)> = sqlx::query_as(
+        "SELECT rowid, aggregate_id, sequence, payload FROM events \
+         WHERE aggregate_type = ?1 AND rowid > ?2 AND rowid <= ?3 \
+         ORDER BY rowid ASC \
+         LIMIT ?4",
+    )
+    .bind(Entity::AGGREGATE_TYPE)
+    .bind(after_rowid)
+    .bind(through_rowid)
+    .bind(i64::from(limit.get()))
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|(rowid, id_str, sequence, payload)| {
+            let id = id_str.parse::<Entity::Id>().map_err(|parse_error| {
+                warn!(
+                    target: "cqrs",
+                    aggregate_id = id_str,
+                    aggregate_type = Entity::AGGREGATE_TYPE,
+                    rowid,
+                    ?parse_error,
+                    "Failed to parse aggregate ID in event stream"
+                );
+                EventsSinceError::InvalidId {
+                    aggregate_type: Entity::AGGREGATE_TYPE,
+                    rowid,
+                    id: RawAggregateId(id_str.clone()),
+                }
+            })?;
+            let event =
+                serde_json::from_str::<Entity::Event>(&payload).map_err(|deserialize_error| {
+                    warn!(
+                        target: "cqrs",
+                        aggregate_id = id_str,
+                        aggregate_type = Entity::AGGREGATE_TYPE,
+                        rowid,
+                        ?deserialize_error,
+                        "Failed to deserialize event payload in event stream"
+                    );
+                    EventsSinceError::Deserialize {
+                        aggregate_type: Entity::AGGREGATE_TYPE,
+                        rowid,
+                        source: deserialize_error,
+                    }
+                })?;
+
+            Ok(Sequenced {
+                rowid,
+                id,
+                sequence,
+                event,
+            })
+        })
+        .collect()
+}
+
+/// Current head of the shared event log: the maximum `events.rowid`, or 0
+/// when the log is empty.
+///
+/// Pass it as `through_rowid` to [`events_since`] to bound a catch-up pass to
+/// a consistent snapshot of the log: ingest `(checkpoint, head]`, then persist
+/// `head` as the new checkpoint -- atomically with the derived state when the
+/// read model lives in the same database. Where atomic checkpointing is
+/// unavailable, a crash between applying effects and persisting `head`
+/// replays the pass, so the effects must be idempotent.
+pub async fn head_rowid(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
+    let (max_rowid,): (Option<i64>,) = sqlx::query_as("SELECT MAX(rowid) FROM events")
+        .fetch_one(pool)
+        .await?;
+
+    Ok(max_rowid.unwrap_or(0))
+}
+
 /// Errors that can occur when loading all aggregate IDs.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadAllIdsError {
@@ -1076,6 +1237,7 @@ mod tests {
     use cqrs_es::DomainEvent;
     use serde::{Deserialize, Serialize};
     use sqlx::SqlitePool;
+    use std::num::NonZeroU32;
     use std::time::Duration;
     use tokio::sync::{Notify, OnceCell, oneshot};
     use tokio::time::{Instant, sleep, timeout};
@@ -1203,6 +1365,286 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn events_since_returns_typed_events_with_global_rowids_in_commit_order() {
+        let pool = test_pool().await;
+        let store = testing::test_store::<Widget>(pool.clone(), ());
+        for (id, command) in [
+            (
+                1,
+                WidgetCommand::Create {
+                    name: "one".to_string(),
+                },
+            ),
+            (
+                2,
+                WidgetCommand::Create {
+                    name: "two".to_string(),
+                },
+            ),
+            (
+                1,
+                WidgetCommand::Rename {
+                    name: "one-renamed".to_string(),
+                },
+            ),
+        ] {
+            store.send(&NumericId(id), command).await.unwrap();
+        }
+
+        let head = head_rowid(&pool).await.unwrap();
+        let events = events_since::<Widget>(&pool, 0, head, NonZeroU32::new(100).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 3);
+        assert!(
+            events.windows(2).all(|pair| pair[0].rowid < pair[1].rowid),
+            "rowids must be strictly increasing in commit order"
+        );
+        assert_eq!(events[0].id, NumericId(1));
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(
+            events[0].event,
+            WidgetEvent::Created {
+                name: "one".to_string()
+            }
+        );
+        assert_eq!(events[1].id, NumericId(2));
+        assert_eq!(events[1].sequence, 1);
+        assert_eq!(events[2].id, NumericId(1));
+        assert_eq!(events[2].sequence, 2);
+        assert_eq!(
+            events[2].event,
+            WidgetEvent::Renamed {
+                name: "one-renamed".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn events_since_starts_strictly_after_the_given_rowid() {
+        let pool = test_pool().await;
+        let store = testing::test_store::<Widget>(pool.clone(), ());
+        store
+            .send(
+                &NumericId(1),
+                WidgetCommand::Create {
+                    name: "one".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &NumericId(1),
+                WidgetCommand::Rename {
+                    name: "two".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let head = head_rowid(&pool).await.unwrap();
+        let all = events_since::<Widget>(&pool, 0, head, NonZeroU32::new(100).unwrap())
+            .await
+            .unwrap();
+        let tail = events_since::<Widget>(&pool, all[0].rowid, head, NonZeroU32::new(100).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(tail.len(), all.len() - 1);
+        assert_eq!(tail[0].rowid, all[1].rowid);
+
+        let past_head = events_since::<Widget>(&pool, head, head, NonZeroU32::new(100).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(past_head.len(), 0);
+    }
+
+    /// A pass bounded by a previously captured head must not see events
+    /// committed after that head -- otherwise a caller persisting `head` as
+    /// its checkpoint would re-process those events on the next pass.
+    #[tokio::test]
+    async fn events_since_excludes_events_committed_after_the_bound() {
+        let pool = test_pool().await;
+        let store = testing::test_store::<Widget>(pool.clone(), ());
+        store
+            .send(
+                &NumericId(1),
+                WidgetCommand::Create {
+                    name: "one".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let head = head_rowid(&pool).await.unwrap();
+
+        store
+            .send(
+                &NumericId(1),
+                WidgetCommand::Rename {
+                    name: "two".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let bounded = events_since::<Widget>(&pool, 0, head, NonZeroU32::new(100).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(
+            bounded[0].event,
+            WidgetEvent::Created {
+                name: "one".to_string()
+            }
+        );
+    }
+
+    /// A short page means the head was reached; a full page means resume from
+    /// the last returned rowid -- the paging contract batch ingestion relies
+    /// on.
+    #[tokio::test]
+    async fn events_since_pages_through_history_with_the_limit() {
+        let pool = test_pool().await;
+        let store = testing::test_store::<Widget>(pool.clone(), ());
+        store
+            .send(
+                &NumericId(1),
+                WidgetCommand::Create {
+                    name: "one".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        for name in ["two", "three"] {
+            store
+                .send(
+                    &NumericId(1),
+                    WidgetCommand::Rename {
+                        name: name.to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let head = head_rowid(&pool).await.unwrap();
+        let first_page = events_since::<Widget>(&pool, 0, head, NonZeroU32::new(2).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(first_page.len(), 2);
+
+        let second_page = events_since::<Widget>(
+            &pool,
+            first_page[1].rowid,
+            head,
+            NonZeroU32::new(2).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second_page.len(), 1);
+        assert_eq!(
+            second_page[0].event,
+            WidgetEvent::Renamed {
+                name: "three".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn events_since_filters_by_aggregate_type() {
+        let pool = test_pool().await;
+        let store = testing::test_store::<Widget>(pool.clone(), ());
+        store
+            .send(
+                &NumericId(1),
+                WidgetCommand::Create {
+                    name: "one".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        insert_event(&pool, "Gadget", "7").await;
+
+        let head = head_rowid(&pool).await.unwrap();
+        let events = events_since::<Widget>(&pool, 0, head, NonZeroU32::new(100).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, NumericId(1));
+    }
+
+    #[tokio::test]
+    async fn events_since_surfaces_unparseable_aggregate_ids() {
+        let pool = test_pool().await;
+        insert_event(&pool, "Widget", "not-numeric").await;
+
+        let head = head_rowid(&pool).await.unwrap();
+        let error = events_since::<Widget>(&pool, 0, head, NonZeroU32::new(100).unwrap())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            EventsSinceError::InvalidId {
+                aggregate_type: "Widget",
+                id: RawAggregateId(raw),
+                ..
+            } if raw == "not-numeric"
+        ));
+    }
+
+    #[tokio::test]
+    async fn events_since_surfaces_undeserializable_payloads() {
+        let pool = test_pool().await;
+        insert_event(&pool, "Widget", "1").await;
+        sqlx::query("UPDATE events SET payload = '{\"Nonsense\":{}}' WHERE aggregate_id = '1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let head = head_rowid(&pool).await.unwrap();
+        let error = events_since::<Widget>(&pool, 0, head, NonZeroU32::new(100).unwrap())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            EventsSinceError::Deserialize {
+                aggregate_type: "Widget",
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn head_rowid_is_zero_on_an_empty_log_and_tracks_the_newest_event() {
+        let pool = test_pool().await;
+        assert_eq!(head_rowid(&pool).await.unwrap(), 0);
+
+        let store = testing::test_store::<Widget>(pool.clone(), ());
+        store
+            .send(
+                &NumericId(1),
+                WidgetCommand::Create {
+                    name: "one".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let head = head_rowid(&pool).await.unwrap();
+        let events = events_since::<Widget>(&pool, 0, head, NonZeroU32::new(100).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(head, events.last().unwrap().rowid);
     }
 
     #[tokio::test]
