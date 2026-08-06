@@ -355,6 +355,8 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use std::fmt::{self, Display};
 
+    use sqlite_es::testing::create_test_pool;
+
     use super::*;
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -410,9 +412,7 @@ mod tests {
     }
 
     async fn test_pool() -> SqlitePool {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
-        pool
+        create_test_pool().await.unwrap()
     }
 
     fn covering_events(aggregate_id: &str, through: usize) -> Vec<SerializedEvent> {
