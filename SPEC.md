@@ -70,10 +70,17 @@ Two crates, no application binaries:
   `cqrs-es`, the typed `Store`, projections, the schema registry, the reactor,
   and the `ViewBackend` GAT.
 
-The canonical SQLite schema for the event/snapshot tables lives at
-`migrations/20251016210348_init.sql` at the workspace root. Tests apply it
-in-memory via `sqlite_es::testing::create_test_pool()`. Consumers apply the same
-migration in their application database.
+The canonical SQLite schema for the event/snapshot tables is the `migrations/`
+directory at the workspace root, applied in order. Tests apply it in-memory via
+`sqlite_es::testing::create_test_pool()`. Consumers apply the same migrations in
+their application database.
+
+The `events` table declares `id INTEGER PRIMARY KEY AUTOINCREMENT`: the global
+position of the shared event log (aliasing SQLite's rowid, so `rowid` queries
+read it). Declaring it makes positions durable public API -- `AUTOINCREMENT`
+forbids reuse after deletes (event compaction), and an explicit key survives
+`VACUUM`, which may renumber implicit rowids. Checkpoints and provenance stamped
+with a position stay valid for the lifetime of the database.
 
 ## Components
 

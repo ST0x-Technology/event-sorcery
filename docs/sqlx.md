@@ -55,6 +55,30 @@ let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM my_table")
 Note the type annotation on the `let` binding -- the runtime function doesn't
 infer return types like the macro does.
 
+## `sqlx::migrate!` embeds migrations at compile time
+
+`sqlite_es::testing::create_test_pool` runs
+`sqlx::migrate!("../../migrations")`, which embeds the migration files into the
+compiled crate at macro-expansion time. Cargo tracks each embedded file, so
+_editing_ or _deleting_ one triggers a rebuild -- but _restoring_ a previously
+deleted file does not: the artifact built while the file was absent tracks only
+the files it saw, so the returned file (and the directory itself) is invisible
+to change detection. `touch`ing the restored file does nothing either, because
+no artifact references it.
+
+Symptom: remove a migration, run tests, restore the migration, run tests again
+-- the second run silently reuses the no-migration binary, and tests depending
+on the restored migration keep failing.
+
+Fix: force the embedding crate to rebuild --
+`touch crates/sqlite-es/src/testing.rs` or `cargo clean -p sqlite-es`.
+
+Related trap: different feature sets are different artifacts.
+`cargo nextest run -p event-sorcery` and
+`cargo nextest run --workspace --all-features` compile sqlite-es separately, so
+one can be stale while the other is fresh, making the same test pass in one
+invocation and fail in the other.
+
 ## `SQLITE_BUSY` vs `SQLITE_BUSY_SNAPSHOT`
 
 `sqlx-sqlite` surfaces both as the _extended_ result code via
