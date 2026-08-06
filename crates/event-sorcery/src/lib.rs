@@ -1242,6 +1242,8 @@ mod tests {
     use tokio::sync::{Notify, OnceCell, oneshot};
     use tokio::time::{Instant, sleep, timeout};
 
+    use sqlite_es::testing::create_test_pool;
+
     use super::*;
     use crate::deps;
 
@@ -1348,9 +1350,7 @@ mod tests {
     }
 
     async fn test_pool() -> SqlitePool {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
-        pool
+        create_test_pool().await.unwrap()
     }
 
     async fn insert_event(pool: &SqlitePool, aggregate_type: &str, aggregate_id: &str) {
@@ -1696,64 +1696,67 @@ mod tests {
         );
     }
 
+    /// Retain-policy twin of [`Widget`]: same events and commands, but its
+    /// rows survive compaction, giving position-durability tests a survivor
+    /// above the gaps compaction leaves.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct DurableWidget {
+        name: String,
+    }
+
+    #[async_trait]
+    impl EventSourced for DurableWidget {
+        type Id = NumericId;
+        type Event = WidgetEvent;
+        type Command = WidgetCommand;
+        type Error = WidgetError;
+        type Services = ();
+        type Materialized = Nil;
+
+        const AGGREGATE_TYPE: &'static str = "DurableWidget";
+        const PROJECTION: Nil = Nil;
+        const SCHEMA_VERSION: u64 = 1;
+
+        fn originate(event: &WidgetEvent) -> Option<Self> {
+            match event {
+                WidgetEvent::Created { name } => Some(Self { name: name.clone() }),
+                WidgetEvent::Renamed { .. } => None,
+            }
+        }
+
+        fn evolve(_entity: &Self, event: &WidgetEvent) -> Result<Option<Self>, WidgetError> {
+            match event {
+                WidgetEvent::Created { .. } => Ok(None),
+                WidgetEvent::Renamed { name } => Ok(Some(Self { name: name.clone() })),
+            }
+        }
+
+        async fn initialize(
+            command: WidgetCommand,
+            _services: &(),
+        ) -> Result<Vec<WidgetEvent>, WidgetError> {
+            match command {
+                WidgetCommand::Create { name } => Ok(vec![WidgetEvent::Created { name }]),
+                WidgetCommand::Rename { name } => Ok(vec![WidgetEvent::Renamed { name }]),
+            }
+        }
+
+        async fn transition(
+            &self,
+            command: WidgetCommand,
+            _services: &(),
+        ) -> Result<Vec<WidgetEvent>, WidgetError> {
+            match command {
+                WidgetCommand::Create { .. } => Ok(vec![]),
+                WidgetCommand::Rename { name } => Ok(vec![WidgetEvent::Renamed { name }]),
+            }
+        }
+    }
+
     /// Full `VACUUM` may renumber the implicit rowid of tables without a
     /// declared `INTEGER PRIMARY KEY`. Persisted positions must survive it.
     #[tokio::test]
     async fn positions_survive_vacuum_after_compaction_leaves_gaps() {
-        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-        struct DurableWidget {
-            name: String,
-        }
-
-        #[async_trait]
-        impl EventSourced for DurableWidget {
-            type Id = NumericId;
-            type Event = WidgetEvent;
-            type Command = WidgetCommand;
-            type Error = WidgetError;
-            type Services = ();
-            type Materialized = Nil;
-
-            const AGGREGATE_TYPE: &'static str = "DurableWidget";
-            const PROJECTION: Nil = Nil;
-            const SCHEMA_VERSION: u64 = 1;
-
-            fn originate(event: &WidgetEvent) -> Option<Self> {
-                match event {
-                    WidgetEvent::Created { name } => Some(Self { name: name.clone() }),
-                    WidgetEvent::Renamed { .. } => None,
-                }
-            }
-
-            fn evolve(_entity: &Self, event: &WidgetEvent) -> Result<Option<Self>, WidgetError> {
-                match event {
-                    WidgetEvent::Created { .. } => Ok(None),
-                    WidgetEvent::Renamed { name } => Ok(Some(Self { name: name.clone() })),
-                }
-            }
-
-            async fn initialize(
-                command: WidgetCommand,
-                _services: &(),
-            ) -> Result<Vec<WidgetEvent>, WidgetError> {
-                match command {
-                    WidgetCommand::Create { name } => Ok(vec![WidgetEvent::Created { name }]),
-                    WidgetCommand::Rename { name } => Ok(vec![WidgetEvent::Renamed { name }]),
-                }
-            }
-
-            async fn transition(
-                &self,
-                command: WidgetCommand,
-                _services: &(),
-            ) -> Result<Vec<WidgetEvent>, WidgetError> {
-                match command {
-                    WidgetCommand::Create { .. } => Ok(vec![]),
-                    WidgetCommand::Rename { name } => Ok(vec![WidgetEvent::Renamed { name }]),
-                }
-            }
-        }
-
         let pool = test_pool().await;
         let widgets = testing::test_store::<Widget>(pool.clone(), ());
         widgets
@@ -1799,6 +1802,85 @@ mod tests {
                 .unwrap();
         assert_eq!(survivors.len(), 1);
         assert_eq!(survivors[0].rowid, head);
+    }
+
+    /// Upgrade path for databases created on the pre-ADR-0006 schema: the
+    /// `declare_rowid` rebuild must carry every surviving position over
+    /// verbatim -- gaps included -- and hand out strictly greater positions
+    /// afterwards.
+    #[tokio::test]
+    async fn migration_preserves_positions_from_the_previous_schema() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::raw_sql(include_str!("../../../migrations/20251016210348_init.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let widgets = testing::test_store::<Widget>(pool.clone(), ());
+        widgets
+            .send(
+                &NumericId(1),
+                WidgetCommand::Create {
+                    name: "one".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        widgets
+            .send(
+                &NumericId(1),
+                WidgetCommand::Rename {
+                    name: "two".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let durables = testing::test_store::<DurableWidget>(pool.clone(), ());
+        durables
+            .send(
+                &NumericId(7),
+                WidgetCommand::Create {
+                    name: "kept".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let deleted = compact_events::<Widget>(&pool).await.unwrap();
+        assert_eq!(deleted, 2);
+        let head_before = head_rowid(&pool).await.unwrap();
+        assert_eq!(head_before, 3, "survivor sits above the compaction gap");
+
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/20260806105250_declare_rowid.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(head_rowid(&pool).await.unwrap(), head_before);
+        let survivors =
+            events_since::<DurableWidget>(&pool, 0, head_before, NonZeroU32::new(100).unwrap())
+                .await
+                .unwrap();
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].rowid, head_before);
+        assert_eq!(survivors[0].sequence, 1);
+
+        durables
+            .send(
+                &NumericId(7),
+                WidgetCommand::Rename {
+                    name: "still kept".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            head_rowid(&pool).await.unwrap(),
+            4,
+            "the first post-migration insert must take a position above \
+             every historical one, including the compacted 1 and 2"
+        );
     }
 
     #[tokio::test]

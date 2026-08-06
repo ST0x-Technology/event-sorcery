@@ -57,21 +57,27 @@ infer return types like the macro does.
 
 ## `sqlx::migrate!` embeds migrations at compile time
 
-`sqlite_es::testing::create_test_pool` runs
-`sqlx::migrate!("../../migrations")`, which embeds the migration files into the
-compiled crate at macro-expansion time. Cargo tracks each embedded file, so
-_editing_ or _deleting_ one triggers a rebuild -- but _restoring_ a previously
-deleted file does not: the artifact built while the file was absent tracks only
-the files it saw, so the returned file (and the directory itself) is invisible
-to change detection. `touch`ing the restored file does nothing either, because
-no artifact references it.
+`sqlx::migrate!("<dir>")` embeds the migration files into the compiled crate at
+macro-expansion time. On stable Rust the macro can only register the _files it
+saw_ with cargo's change detection -- never the directory. So editing or
+deleting an embedded file triggers a rebuild, but a file the current artifact
+has not seen is invisible: a newly _added_ migration, or a previously deleted
+one _restored_, does not trigger recompilation, and `touch`ing the new file does
+nothing either. The stale artifact silently keeps running with the smaller
+migration set.
 
-Symptom: remove a migration, run tests, restore the migration, run tests again
--- the second run silently reuses the no-migration binary, and tests depending
-on the restored migration keep failing.
+Repo fix: both crates whose artifacts invoke `sqlx::migrate!` on the workspace
+migrations (`sqlite-es` via `testing::create_test_pool`, `event-sorcery` via its
+test modules) carry a `build.rs` emitting
+`cargo:rerun-if-changed=../../migrations`, which tracks the directory itself --
+adds, removals, and restores all rebuild. (`sqlx migrate build-script` generates
+the same thing.) Any new crate that calls `sqlx::migrate!` must add the same
+build script for its migration directory; the `examples/` crates embed their own
+`./migrations` copies and need their own tracking.
 
-Fix: force the embedding crate to rebuild --
-`touch crates/sqlite-es/src/testing.rs` or `cargo clean -p sqlite-es`.
+Manual fallback where no build script covers the directory: force the crate
+whose artifact contains the `sqlx::migrate!` call to rebuild -- `touch` the
+source file with the invocation, or `cargo clean -p <that-crate>`.
 
 Related trap: different feature sets are different artifacts.
 `cargo nextest run -p event-sorcery` and
