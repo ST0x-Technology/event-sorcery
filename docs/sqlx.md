@@ -55,6 +55,36 @@ let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM my_table")
 Note the type annotation on the `let` binding -- the runtime function doesn't
 infer return types like the macro does.
 
+## `sqlx::migrate!` embeds migrations at compile time
+
+`sqlx::migrate!("<dir>")` embeds the migration files into the compiled crate at
+macro-expansion time. On stable Rust the macro can only register the _files it
+saw_ with cargo's change detection -- never the directory. So editing or
+deleting an embedded file triggers a rebuild, but a file the current artifact
+has not seen is invisible: a newly _added_ migration, or a previously deleted
+one _restored_, does not trigger recompilation, and `touch`ing the new file does
+nothing either. The stale artifact silently keeps running with the smaller
+migration set.
+
+Repo fix: both crates whose artifacts invoke `sqlx::migrate!` on the workspace
+migrations (`sqlite-es` via `testing::create_test_pool`, `event-sorcery` via its
+test modules) carry a `build.rs` emitting
+`cargo:rerun-if-changed=../../migrations`, which tracks the directory itself --
+adds, removals, and restores all rebuild. (`sqlx migrate build-script` generates
+the same thing.) Any new crate that calls `sqlx::migrate!` must add the same
+build script for its migration directory; the `examples/` crates embed their own
+`./migrations` copies and need their own tracking.
+
+Manual fallback where no build script covers the directory: force the crate
+whose artifact contains the `sqlx::migrate!` call to rebuild -- `touch` the
+source file with the invocation, or `cargo clean -p <that-crate>`.
+
+Related trap: different feature sets are different artifacts.
+`cargo nextest run -p event-sorcery` and
+`cargo nextest run --workspace --all-features` compile sqlite-es separately, so
+one can be stale while the other is fresh, making the same test pass in one
+invocation and fail in the other.
+
 ## `SQLITE_BUSY` vs `SQLITE_BUSY_SNAPSHOT`
 
 `sqlx-sqlite` surfaces both as the _extended_ result code via
