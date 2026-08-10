@@ -30,6 +30,8 @@ jobs:
             command: cargo clippy --workspace --all-targets --all-features
           - name: fmt
             command: cargo fmt --all -- --check
+          - name: doc
+            command: cargo doc --workspace --no-deps --all-features
           - name: examples
             command: nu scripts/check-examples.nu
 
