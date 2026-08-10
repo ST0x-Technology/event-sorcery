@@ -198,8 +198,8 @@ impl<R: Reactor> ReactorHarness<R> {
     /// harness.receive::<EquityRedemption>(id, event).await?;
     /// ```
     ///
-    /// Requires [`register_entities!`] to be called for the
-    /// reactor's entity list.
+    /// Requires [`register_entities!`](crate::register_entities) to be
+    /// called for the reactor's entity list.
     pub async fn receive<Entity: EventSourced>(
         &self,
         id: Entity::Id,
