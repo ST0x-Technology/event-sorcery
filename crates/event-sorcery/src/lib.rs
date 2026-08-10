@@ -37,7 +37,7 @@
 //! # Design
 //!
 //! [`EventSourced`] replaces direct `Aggregate` usage. Domain
-//! types implement `EventSourced`, and [`Lifecycle`] provides a
+//! types implement `EventSourced`, and `Lifecycle` provides a
 //! blanket `Aggregate` impl that bridges to cqrs-es. Consumers
 //! interact through [`Store`], which enforces typed IDs and hides
 //! cqrs-es internals.
@@ -150,7 +150,7 @@ pub enum CompactionPolicy {
 ///
 /// Implement this trait on your domain type (e.g., `Position`,
 /// `OffchainOrder`) to get a complete event-sourcing setup:
-/// [`Lifecycle`] provides a blanket `Aggregate` impl, and
+/// `Lifecycle` provides a blanket `Aggregate` impl, and
 /// [`Store`] provides type-safe command dispatch.
 ///
 /// # Associated types
@@ -183,7 +183,7 @@ pub enum CompactionPolicy {
 ///
 /// These reconstruct state from the event log during replay.
 /// They are called by the blanket `Aggregate::apply` impl on
-/// [`Lifecycle`], never by application code directly.
+/// `Lifecycle`, never by application code directly.
 ///
 /// - `originate`: Attempt to create initial state from an
 ///   event. Returns `Some(state)` for genesis events, `None`
@@ -197,7 +197,7 @@ pub enum CompactionPolicy {
 /// # Command-side methods
 ///
 /// These process commands to produce events. They are called by
-/// the blanket `Aggregate::handle` impl on [`Lifecycle`], which
+/// the blanket `Aggregate::handle` impl on `Lifecycle`, which
 /// routes commands based on lifecycle state.
 ///
 /// - `initialize`: Handle a command when the entity doesn't
@@ -260,7 +260,7 @@ pub trait EventSourced:
     ///
     /// Returns `Some(state)` if this event creates the entity,
     /// `None` if it requires existing state. Returning `None`
-    /// causes [`Lifecycle`] to enter a `Failed` state with a
+    /// causes `Lifecycle` to enter a `Failed` state with a
     /// [`LifecycleError::EventCantOriginate`].
     fn originate(event: &Self::Event) -> Option<Self>;
 
@@ -318,7 +318,7 @@ pub trait EventSourced:
 /// ready-to-use `Store`.
 ///
 /// `send` serializes commands per aggregate ID (see
-/// [`PerAggregateLocks`]): the whole load -> handle -> commit ->
+/// `PerAggregateLocks`): the whole load -> handle -> commit ->
 /// reactor/projection-dispatch cycle of one command completes
 /// before the next command on the *same* aggregate begins, so
 /// reactors and projections observe events in commit order.
@@ -343,7 +343,7 @@ pub trait EventSourced:
 /// inside a reactor -- each inherit the same ancestor snapshot and so
 /// neither sees the other's in-flight key. Provided that aggregate is
 /// not itself in the snapshot they inherited, they queue on
-/// [`PerAggregateLocks`] normally, exactly like two unrelated calls
+/// `PerAggregateLocks` normally, exactly like two unrelated calls
 /// would, rather than one spuriously failing as reentrant. Siblings
 /// aimed at the aggregate the reactor is *currently reacting to* are
 /// the other case entirely: that key is already in the inherited
@@ -586,7 +586,7 @@ task_local! {
     /// true descendants (an inline-awaited reactor this call's command
     /// dispatches) but not to a sibling `send()` joined/selected alongside
     /// this one, which still only sees what it itself inherited. `Store::send`
-    /// checks the inherited snapshot before acquiring [`PerAggregateLocks`] so
+    /// checks the inherited snapshot before acquiring `PerAggregateLocks` so
     /// a same-aggregate self-command -- direct or transitive -- fails fast
     /// with [`LifecycleError::ReentrantCommand`] instead of deadlocking on a
     /// lock an ancestor call already holds. It does not, and cannot, catch a

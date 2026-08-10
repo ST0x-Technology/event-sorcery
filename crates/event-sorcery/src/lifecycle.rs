@@ -75,7 +75,7 @@ impl<Entity: EventSourced> Lifecycle<Entity> {
 /// Errors from lifecycle state management.
 ///
 /// These are infrastructure-level errors produced by
-/// [`Lifecycle`]'s blanket `Aggregate` impl, not by domain
+/// `Lifecycle`'s blanket `Aggregate` impl, not by domain
 /// code directly. Domain errors are wrapped in the [`Apply`]
 /// variant.
 ///
