@@ -146,6 +146,66 @@ impl SqliteEventRepository {
         Ok(())
     }
 
+    /// IDs of `A` aggregates whose stream reaches `min_sequence` and that
+    /// have no snapshot, in ID order.
+    pub(crate) async fn aggregates_missing_snapshot<A: Aggregate>(
+        &self,
+        min_sequence: usize,
+    ) -> Result<Vec<String>, PersistenceError> {
+        let min_sequence = i64::try_from(min_sequence).map_err(SqliteEventRepositoryError::from)?;
+
+        let aggregate_ids = sqlx::query_scalar(
+            "SELECT events.aggregate_id FROM events \
+             WHERE events.aggregate_type = ?1 \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM snapshots \
+                   WHERE snapshots.aggregate_type = events.aggregate_type \
+                     AND snapshots.aggregate_id = events.aggregate_id \
+               ) \
+             GROUP BY events.aggregate_id \
+             HAVING MAX(events.sequence) >= ?2 \
+             ORDER BY events.aggregate_id",
+        )
+        .bind(A::TYPE)
+        .bind(min_sequence)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(SqliteEventRepositoryError::from)?;
+
+        Ok(aggregate_ids)
+    }
+
+    /// Stores a rebuilt snapshot unless the aggregate already has one, so a
+    /// rebuild never replaces a snapshot that a command wrote.
+    pub(crate) async fn insert_snapshot_if_absent<A: Aggregate>(
+        &self,
+        aggregate_id: &str,
+        last_sequence: usize,
+        snapshot_version: usize,
+        payload: Value,
+    ) -> Result<(), PersistenceError> {
+        let last_sequence =
+            i64::try_from(last_sequence).map_err(SqliteEventRepositoryError::from)?;
+        let snapshot_version =
+            i64::try_from(snapshot_version).map_err(SqliteEventRepositoryError::from)?;
+
+        sqlx::query(
+            "INSERT OR IGNORE INTO snapshots \
+             (aggregate_type, aggregate_id, last_sequence, snapshot_version, payload, timestamp) \
+             VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(A::TYPE)
+        .bind(aggregate_id)
+        .bind(last_sequence)
+        .bind(snapshot_version)
+        .bind(payload)
+        .execute(&self.pool)
+        .await
+        .map_err(SqliteEventRepositoryError::from)?;
+
+        Ok(())
+    }
+
     /// Stream events from the `events` table for replay.
     ///
     /// **Compaction caveat:** This only queries the `events` table.

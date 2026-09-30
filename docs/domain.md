@@ -113,7 +113,8 @@ to `SqliteViewRepository`. Tests use bespoke in-memory backends. See
 A periodic checkpoint of an aggregate's state, stored separately from the event
 log so reload doesn't always replay every event. Snapshots are serialized with a
 `snapshot_version` so a schema bump can invalidate them without touching the
-event log.
+event log. Startup rebuilds a missing snapshot for every retained aggregate
+whose stream reaches `SNAPSHOT_SIZE` events.
 
 ### Compaction
 

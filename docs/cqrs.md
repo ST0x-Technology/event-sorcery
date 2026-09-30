@@ -488,6 +488,13 @@ Bump `SCHEMA_VERSION` when the entity's state, event, or projection schema
 changes. On startup, the wiring infrastructure (via `StoreBuilder::build()`)
 detects version mismatches and automatically clears stale snapshots.
 
+After that, on every startup, `StoreBuilder::build()` writes a snapshot for each
+`Retain` aggregate whose stream reaches `SNAPSHOT_SIZE` events and has no
+snapshot. Commits only write a snapshot when they cross a `SNAPSHOT_SIZE`
+boundary, so without this rebuild an aggregate that receives no commands would
+replay its full stream on every load after a schema bump. Expect the first
+startup after a bump to take longer: it replays each large aggregate once.
+
 ### Adding Optional Fields to Events
 
 When adding a new field to an existing event variant that has a sensible default

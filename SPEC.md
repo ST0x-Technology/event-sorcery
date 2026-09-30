@@ -190,7 +190,8 @@ boundary.
 Tracks `(aggregate_type, schema_version)` tuples in a `schema_registry` table.
 On startup, the wiring layer compares the persisted version against the current
 `SCHEMA_VERSION` constant and, on mismatch, clears stale snapshots and replays
-projections from events. No manual database intervention.
+projections from events. It then rebuilds missing snapshots (see
+[Schema drift](#schema-drift)). No manual database intervention.
 
 ### `ViewBackend` (GAT)
 
@@ -249,8 +250,19 @@ On startup, `SchemaRegistry::reconcile()` compares the persisted
 `SCHEMA_VERSION` constant:
 
 - **Match**: nothing to do.
-- **Mismatch**: snapshots are cleared (forces full event replay) and projection
-  tables are truncated (rebuilt from events on first read or via `catch_up`).
+- **Mismatch**: snapshots are cleared and projection tables are rebuilt from
+  events.
+
+On every startup, whether the version matched or not, `StoreBuilder::build()`
+then writes a snapshot for each `Retain` aggregate whose stream reaches
+`SNAPSHOT_SIZE` events and that has no snapshot. Without this, an aggregate that
+receives no commands would replay its full stream on every load, because commits
+only write a snapshot when they cross a `SNAPSHOT_SIZE` boundary. The rebuild
+runs before the store accepts commands, one aggregate at a time, and never
+replaces an existing snapshot. Rebuilding on every startup, not only on a
+mismatch, also heals snapshots cleared by an earlier release and a rebuild
+interrupted by a crash. `CompactAfterSnapshot` aggregates are skipped, because
+their pre-snapshot events may be gone.
 
 ### Compaction
 
