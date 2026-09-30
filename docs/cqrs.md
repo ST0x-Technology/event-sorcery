@@ -490,12 +490,12 @@ detects version mismatches and automatically clears stale snapshots.
 
 After that, on every startup, `StoreBuilder::build()` writes a snapshot for each
 `Retain` aggregate whose stream reaches `SNAPSHOT_SIZE` events and has no
-snapshot. Commits only write a snapshot when they cross a `SNAPSHOT_SIZE`
-boundary, so without this rebuild an aggregate that receives no commands would
-replay its full stream on every load after a schema bump. Expect the first
-startup after a bump to take longer: the rebuild replays each large aggregate
-once, and for a projected entity the view rebuild has already replayed it once
-more.
+snapshot, unless it replays to a failed lifecycle. Commits only write a snapshot
+when they cross a `SNAPSHOT_SIZE` boundary, so without this rebuild an aggregate
+that receives no commands would replay its full stream on every load after a
+schema bump. Expect the first startup after a bump to take longer: the rebuild
+replays each large aggregate once, and for a projected entity the view rebuild
+has already replayed it once more.
 
 ### Adding Optional Fields to Events
 

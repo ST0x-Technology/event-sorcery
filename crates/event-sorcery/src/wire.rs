@@ -39,7 +39,7 @@ use cqrs_es::persist::PersistedEventStore;
 use cqrs_es::persist::PersistenceError;
 use cqrs_es::{AggregateError, CqrsFramework, EventStore, Query};
 use sqlx::SqlitePool;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::Nil;
 use crate::dependency::HasEntity;
@@ -147,11 +147,26 @@ async fn rebuild_missing_snapshots<Entity: EventSourced>(
         Entity::SNAPSHOT_SIZE,
     );
 
+    let mut rebuilt = 0_usize;
     for aggregate_id in &aggregate_ids {
         let context = store
             .load_aggregate(aggregate_id)
             .await
             .map_err(|error| snapshot_rebuild_error::<Entity>(aggregate_id, error))?;
+
+        // A snapshot would freeze the failure: later loads would start from it,
+        // so a code fix to `evolve` could no longer heal the aggregate by
+        // replaying its events.
+        if matches!(&context.aggregate, Lifecycle::Failed { .. }) {
+            warn!(
+                target: "cqrs",
+                aggregate = Entity::AGGREGATE_TYPE,
+                aggregate_id,
+                "Skipping snapshot rebuild for a failed lifecycle"
+            );
+            continue;
+        }
+
         let snapshot_version = context.current_snapshot.map_or(1, |version| version + 1);
 
         repo.insert_snapshot_if_absent::<Lifecycle<Entity>>(
@@ -161,12 +176,13 @@ async fn rebuild_missing_snapshots<Entity: EventSourced>(
             serde_json::to_value(&context.aggregate)?,
         )
         .await?;
+        rebuilt += 1;
     }
 
     info!(
         target: "cqrs",
         aggregate = Entity::AGGREGATE_TYPE,
-        rebuilt = aggregate_ids.len(),
+        rebuilt,
         "Rebuilt missing snapshots"
     );
 
@@ -910,10 +926,11 @@ mod tests {
         assert_eq!(payload, r#"{"Live":{"count":10}}"#);
     }
 
-    /// A stream that ends in a failed lifecycle is snapshotted too, so it
-    /// stops replaying its full stream on every load.
+    /// A stream that replays to a failed lifecycle gets no rebuilt snapshot:
+    /// it would freeze the failure, so a code fix to `evolve` could no longer
+    /// heal the aggregate by replaying its events. The build still succeeds.
     #[tokio::test]
-    async fn failed_lifecycle_is_snapshotted_at_latest_sequence() {
+    async fn failed_lifecycle_gets_no_rebuilt_snapshot() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
         let payload = serde_json::to_string(&EventA).unwrap();
@@ -924,10 +941,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (last_sequence, _, payload) = stored_snapshot(&pool, "Brittle", "b-1").await.unwrap();
-        assert_eq!(last_sequence, 10);
-        let lifecycle: Lifecycle<Brittle> = serde_json::from_str(&payload).unwrap();
-        assert!(matches!(lifecycle, Lifecycle::Failed { .. }));
+        assert_eq!(stored_snapshot(&pool, "Brittle", "b-1").await, None);
     }
 
     /// A rebuild that fails must not record the schema version: the recorded

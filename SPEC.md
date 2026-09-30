@@ -262,7 +262,9 @@ runs before the store accepts commands, one aggregate at a time, and never
 replaces an existing snapshot. Rebuilding on every startup, not only on a
 mismatch, also heals snapshots cleared by an earlier release and a rebuild
 interrupted by a crash. `CompactAfterSnapshot` aggregates are skipped, because
-their pre-snapshot events may be gone.
+their pre-snapshot events may be gone. An aggregate that replays to a failed
+lifecycle gets no snapshot, so a code fix to `evolve` can still heal it by
+replaying its events.
 
 ### Compaction
 
