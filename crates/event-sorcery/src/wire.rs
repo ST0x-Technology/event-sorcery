@@ -966,7 +966,8 @@ mod tests {
     async fn recorded_schema_versions(pool: &SqlitePool, aggregate_type: &str) -> i64 {
         sqlx::query_scalar(
             "SELECT COUNT(*) FROM events \
-             WHERE aggregate_type = 'SchemaRegistry' AND payload LIKE '%\"' || ?1 || '\"%'",
+             WHERE aggregate_type = 'SchemaRegistry' \
+               AND json_extract(payload, '$.VersionUpdated.name') = ?1",
         )
         .bind(aggregate_type)
         .fetch_one(pool)
