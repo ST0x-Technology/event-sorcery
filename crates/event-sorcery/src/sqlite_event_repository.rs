@@ -148,6 +148,9 @@ impl SqliteEventRepository {
 
     /// IDs of `A` aggregates whose stream reaches `min_sequence` and that
     /// have no snapshot, in ID order.
+    ///
+    /// Streams are grouped first, so the snapshot lookup runs once per
+    /// aggregate instead of once per event.
     pub(crate) async fn aggregates_missing_snapshot<A: Aggregate>(
         &self,
         min_sequence: usize,
@@ -155,16 +158,19 @@ impl SqliteEventRepository {
         let min_sequence = i64::try_from(min_sequence).map_err(SqliteEventRepositoryError::from)?;
 
         let aggregate_ids = sqlx::query_scalar(
-            "SELECT events.aggregate_id FROM events \
-             WHERE events.aggregate_type = ?1 \
+            "WITH streams AS ( \
+                 SELECT aggregate_id, MAX(sequence) AS last_sequence FROM events \
+                 WHERE aggregate_type = ?1 \
+                 GROUP BY aggregate_id \
+             ) \
+             SELECT streams.aggregate_id FROM streams \
+             WHERE streams.last_sequence >= ?2 \
                AND NOT EXISTS ( \
                    SELECT 1 FROM snapshots \
-                   WHERE snapshots.aggregate_type = events.aggregate_type \
-                     AND snapshots.aggregate_id = events.aggregate_id \
+                   WHERE snapshots.aggregate_type = ?1 \
+                     AND snapshots.aggregate_id = streams.aggregate_id \
                ) \
-             GROUP BY events.aggregate_id \
-             HAVING MAX(events.sequence) >= ?2 \
-             ORDER BY events.aggregate_id",
+             ORDER BY streams.aggregate_id",
         )
         .bind(A::TYPE)
         .bind(min_sequence)
@@ -623,5 +629,45 @@ mod tests {
             result,
             Err(AggregateError::DeserializationError(_))
         ));
+    }
+
+    /// A snapshot rebuild must never replace a snapshot that already exists,
+    /// for example one a command wrote after the rebuild listed its targets.
+    #[tokio::test]
+    async fn insert_snapshot_if_absent_keeps_existing_snapshot() {
+        let pool = test_pool().await;
+        let repo = SqliteEventRepository::new(pool.clone(), CompactionPolicy::Retain);
+
+        repo.persist::<TestAggregate>(
+            &covering_events("agg-existing", 20),
+            Some((
+                "agg-existing".to_string(),
+                serde_json::json!({"events": ["committed"]}),
+                2,
+            )),
+        )
+        .await
+        .unwrap();
+
+        repo.insert_snapshot_if_absent::<TestAggregate>(
+            "agg-existing",
+            12,
+            1,
+            serde_json::json!({"events": ["rebuilt"]}),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = repo
+            .get_snapshot::<TestAggregate>("agg-existing")
+            .await
+            .unwrap()
+            .expect("the committed snapshot stays");
+        assert_eq!(snapshot.current_sequence, 20);
+        assert_eq!(snapshot.current_snapshot, 2);
+        assert_eq!(
+            snapshot.aggregate,
+            serde_json::json!({"events": ["committed"]})
+        );
     }
 }
