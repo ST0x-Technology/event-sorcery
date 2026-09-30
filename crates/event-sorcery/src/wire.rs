@@ -118,20 +118,21 @@ fn sqlite_snapshot_cqrs<Entity: EventSourced>(
 /// aggregate that receives no commands would replay its full stream on every
 /// load. Running on every build, not only after a version change, also heals
 /// snapshots cleared by an earlier release and a rebuild interrupted by a
-/// crash.
+/// crash. Callers run it after `record_version`, so an interrupted rebuild
+/// resumes instead of having its snapshots cleared again.
 ///
 /// Runs before the store accepts commands, so no commit races it. Aggregates
 /// are rebuilt one at a time so startup does not contend with itself on
 /// SQLite. Compactable entities are skipped: the events behind their snapshot
-/// may be gone, so replaying what remains would build wrong state.
+/// may be gone, so replaying what remains would build wrong state. A stream
+/// that does not deserialize or replays to a failed lifecycle is skipped with a
+/// warning, so one bad stream cannot stop the whole store from starting.
 async fn rebuild_missing_snapshots<Entity: EventSourced>(
     pool: &SqlitePool,
 ) -> Result<(), ReconcileError> {
-    if matches!(
-        Entity::COMPACTION_POLICY,
-        CompactionPolicy::CompactAfterSnapshot
-    ) {
-        return Ok(());
+    match Entity::COMPACTION_POLICY {
+        CompactionPolicy::Retain => {}
+        CompactionPolicy::CompactAfterSnapshot => return Ok(()),
     }
 
     let repo = SqliteEventRepository::new(pool.clone(), Entity::COMPACTION_POLICY);
@@ -149,22 +150,39 @@ async fn rebuild_missing_snapshots<Entity: EventSourced>(
 
     let mut rebuilt = 0_usize;
     for aggregate_id in &aggregate_ids {
-        let context = store
-            .load_aggregate(aggregate_id)
-            .await
-            .map_err(|error| snapshot_rebuild_error::<Entity>(aggregate_id, error))?;
+        let context = match store.load_aggregate(aggregate_id).await {
+            Ok(context) => context,
+            // Only loads of this aggregate fail without a rebuild, so the
+            // rebuild must not turn one bad stream into a store that cannot
+            // start.
+            Err(AggregateError::DeserializationError(source)) => {
+                warn!(
+                    target: "cqrs",
+                    aggregate = Entity::AGGREGATE_TYPE,
+                    aggregate_id,
+                    %source,
+                    "Skipping snapshot rebuild for a stream that does not deserialize"
+                );
+                continue;
+            }
+            Err(error) => return Err(snapshot_rebuild_error::<Entity>(aggregate_id, error).into()),
+        };
 
-        // A snapshot would freeze the failure: later loads would start from it,
-        // so a code fix to `evolve` could no longer heal the aggregate by
-        // replaying its events.
-        if matches!(&context.aggregate, Lifecycle::Failed { .. }) {
-            warn!(
-                target: "cqrs",
-                aggregate = Entity::AGGREGATE_TYPE,
-                aggregate_id,
-                "Skipping snapshot rebuild for a failed lifecycle"
-            );
-            continue;
+        match &context.aggregate {
+            Lifecycle::Live(_) => {}
+            Lifecycle::Uninitialized => continue,
+            // A snapshot would freeze the failure: later loads would start
+            // from it, so a code fix to `evolve` could no longer heal the
+            // aggregate by replaying its events.
+            Lifecycle::Failed { .. } => {
+                warn!(
+                    target: "cqrs",
+                    aggregate = Entity::AGGREGATE_TYPE,
+                    aggregate_id,
+                    "Skipping snapshot rebuild for a failed lifecycle"
+                );
+                continue;
+            }
         }
 
         let snapshot_version = context.current_snapshot.map_or(1, |version| version + 1);
@@ -198,8 +216,8 @@ struct SnapshotRebuildError {
     source: Box<dyn std::error::Error + Send + Sync>,
 }
 
-/// Keeps the connection and deserialization classes of a replay failure, so
-/// callers can still tell a transient read failure from a malformed event.
+/// Keeps the connection class of a replay failure, so callers can still tell a
+/// transient read failure from other errors.
 fn snapshot_rebuild_error<Entity: EventSourced>(
     aggregate_id: &str,
     error: AggregateError<LifecycleError<Entity>>,
@@ -215,9 +233,6 @@ fn snapshot_rebuild_error<Entity: EventSourced>(
     match error {
         AggregateError::DatabaseConnectionError(source) => {
             PersistenceError::ConnectionError(context(source))
-        }
-        AggregateError::DeserializationError(source) => {
-            PersistenceError::DeserializationError(context(source))
         }
         other => PersistenceError::UnknownError(context(Box::new(other))),
     }
@@ -276,14 +291,17 @@ where
             other => ReconcileError::Persistence(PersistenceError::UnknownError(Box::new(other))),
         })?;
 
-        rebuild_missing_snapshots::<Entity>(&self.pool).await?;
-
         // Mark the schema version reconciled only after the snapshot clear and
         // view recovery above have durably completed. A crash before this point
         // leaves the version unadvanced, so the next startup re-runs the whole
         // reconcile -- including rebuild_all -- instead of recording a version
         // whose view rebuild never finished.
         reconciler.record_version::<Entity>().await?;
+
+        // After record_version: the rebuild is idempotent and not gated on the
+        // version, so an interrupted rebuild resumes on the next startup
+        // instead of having its snapshots cleared by another reconcile.
+        rebuild_missing_snapshots::<Entity>(&self.pool).await?;
 
         self.queries.push(Box::new(ReactorBridge {
             reactor: projection.clone(),
@@ -302,12 +320,13 @@ impl<Entity: EventSourced<Materialized = Nil>> StoreBuilder<Entity, Nil> {
     ) -> Result<Arc<Store<Entity>>, ReconcileError> {
         // A non-projected entity has no views to rebuild, so the reconciliation
         // outcome does not change recovery; reconcile still clears stale
-        // snapshots, the rebuild replaces them, and record_version marks the
-        // version handled.
+        // snapshots and record_version marks the version handled. The snapshot
+        // rebuild runs after record_version so an interrupted rebuild resumes
+        // on the next startup.
         let reconciler = Reconciler::new(self.pool.clone());
         let _ = reconciler.reconcile::<Entity>().await?;
-        rebuild_missing_snapshots::<Entity>(&self.pool).await?;
         reconciler.record_version::<Entity>().await?;
+        rebuild_missing_snapshots::<Entity>(&self.pool).await?;
 
         let cqrs = sqlite_snapshot_cqrs(self.pool.clone(), self.queries, services);
         Ok(Arc::new(Store::new(cqrs, self.pool)))
@@ -944,11 +963,23 @@ mod tests {
         assert_eq!(stored_snapshot(&pool, "Brittle", "b-1").await, None);
     }
 
-    /// A rebuild that fails must not record the schema version: the recorded
-    /// version is the marker that startup recovery finished. The error names
-    /// the stream that failed and keeps the deserialization class.
+    async fn recorded_schema_versions(pool: &SqlitePool, aggregate_type: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events \
+             WHERE aggregate_type = 'SchemaRegistry' AND payload LIKE '%\"' || ?1 || '\"%'",
+        )
+        .bind(aggregate_type)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A stream that no longer deserializes only fails loads of that one
+    /// aggregate without a rebuild, so the rebuild skips it instead of
+    /// stopping the whole store from starting. The next stream is still
+    /// rebuilt.
     #[tokio::test]
-    async fn failed_rebuild_does_not_record_schema_version() {
+    async fn undeserializable_stream_is_skipped_and_build_succeeds() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
         let payload = serde_json::to_string(&EventA).unwrap();
@@ -962,28 +993,54 @@ mod tests {
             10..=10,
         )
         .await;
+        insert_events(&pool, "AggregateA", "a-2", "EventA", &payload, 1..=10).await;
+
+        let _store = StoreBuilder::<AggregateA>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        assert_eq!(stored_snapshot(&pool, "AggregateA", "a-1").await, None);
+        let (last_sequence, _, _) = stored_snapshot(&pool, "AggregateA", "a-2").await.unwrap();
+        assert_eq!(last_sequence, 10);
+        assert_eq!(recorded_schema_versions(&pool, "AggregateA").await, 1);
+    }
+
+    /// A read failure still stops the build, naming the stream and keeping the
+    /// connection class. The schema version is already recorded by then, so
+    /// the next startup does not clear the snapshots an interrupted rebuild
+    /// wrote and resumes where it stopped.
+    #[tokio::test]
+    async fn read_failure_stops_build_after_recording_schema_version() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+        let payload = serde_json::to_string(&EventA).unwrap();
+        insert_events(&pool, "AggregateA", "a-1", "EventA", &payload, 1..=9).await;
+        // A text sequence fails column decoding, which surfaces as a
+        // connection error from the repository.
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, \
+             event_version, payload, metadata) \
+             VALUES ('AggregateA', 'a-1', 'not a number', 'EventA', '1.0', ?1, '{}')",
+        )
+        .bind(&payload)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let Err(error) = StoreBuilder::<AggregateA>::new(pool.clone())
             .build(())
             .await
         else {
-            panic!("build must fail when a snapshot rebuild fails");
+            panic!("build must fail when a stream cannot be read");
         };
 
         assert!(matches!(
             error,
-            ReconcileError::Persistence(PersistenceError::DeserializationError(_))
+            ReconcileError::Persistence(PersistenceError::ConnectionError(_))
         ));
         assert!(error.to_string().contains("AggregateA snapshot for a-1"));
-
-        let recorded: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM events \
-             WHERE aggregate_type = 'SchemaRegistry' AND payload LIKE '%\"AggregateA\"%'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(recorded, 0);
+        assert_eq!(recorded_schema_versions(&pool, "AggregateA").await, 1);
     }
 
     /// A stream shorter than `SNAPSHOT_SIZE` would not have a snapshot through
