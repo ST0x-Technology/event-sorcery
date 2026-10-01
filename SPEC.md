@@ -190,7 +190,8 @@ boundary.
 Tracks `(aggregate_type, schema_version)` tuples in a `schema_registry` table.
 On startup, the wiring layer compares the persisted version against the current
 `SCHEMA_VERSION` constant and, on mismatch, clears stale snapshots and replays
-projections from events. No manual database intervention.
+projections from events. It then rebuilds missing snapshots (see
+[Schema drift](#schema-drift)). No manual database intervention.
 
 ### `ViewBackend` (GAT)
 
@@ -249,8 +250,24 @@ On startup, `SchemaRegistry::reconcile()` compares the persisted
 `SCHEMA_VERSION` constant:
 
 - **Match**: nothing to do.
-- **Mismatch**: snapshots are cleared (forces full event replay) and projection
-  tables are truncated (rebuilt from events on first read or via `catch_up`).
+- **Mismatch**: snapshots are cleared and projection tables are rebuilt from
+  events.
+
+On every startup, whether the version matched or not, `StoreBuilder::build()`
+records the version and then writes a snapshot for each `Retain` aggregate whose
+stream reaches `SNAPSHOT_SIZE` events and that has no snapshot. Without this, an
+aggregate that receives no commands would replay its full stream on every load,
+because commits only write a snapshot when they cross a `SNAPSHOT_SIZE`
+boundary. The rebuild runs before the store accepts commands, one aggregate at a
+time, and never replaces an existing snapshot. Rebuilding on every startup, not
+only on a mismatch, also heals snapshots cleared by an earlier release. Because
+the version is recorded first, a rebuild interrupted by a crash resumes on the
+next startup instead of having its snapshots cleared again.
+`CompactAfterSnapshot` aggregates are skipped, because the events behind their
+snapshot may be gone. A stream that does not deserialize is skipped with a
+warning, so one bad stream does not stop the store from starting; a read failure
+still stops it. An aggregate that replays to a failed lifecycle gets no
+snapshot, so a code fix to `evolve` can still heal it by replaying its events.
 
 ### Compaction
 

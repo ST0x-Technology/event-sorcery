@@ -146,6 +146,72 @@ impl SqliteEventRepository {
         Ok(())
     }
 
+    /// IDs of `A` aggregates whose stream reaches `min_sequence` and that
+    /// have no snapshot, in ID order.
+    ///
+    /// Streams are grouped first, so the snapshot lookup runs once per
+    /// aggregate instead of once per event.
+    pub(crate) async fn aggregates_missing_snapshot<A: Aggregate>(
+        &self,
+        min_sequence: usize,
+    ) -> Result<Vec<String>, PersistenceError> {
+        let min_sequence = i64::try_from(min_sequence).map_err(SqliteEventRepositoryError::from)?;
+
+        let aggregate_ids = sqlx::query_scalar(
+            "WITH streams AS ( \
+                 SELECT aggregate_id, MAX(sequence) AS last_sequence FROM events \
+                 WHERE aggregate_type = ?1 \
+                 GROUP BY aggregate_id \
+             ) \
+             SELECT streams.aggregate_id FROM streams \
+             WHERE streams.last_sequence >= ?2 \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM snapshots \
+                   WHERE snapshots.aggregate_type = ?1 \
+                     AND snapshots.aggregate_id = streams.aggregate_id \
+               ) \
+             ORDER BY streams.aggregate_id",
+        )
+        .bind(A::TYPE)
+        .bind(min_sequence)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(SqliteEventRepositoryError::from)?;
+
+        Ok(aggregate_ids)
+    }
+
+    /// Stores a rebuilt snapshot unless the aggregate already has one, so a
+    /// rebuild never replaces a snapshot that a command wrote.
+    pub(crate) async fn insert_snapshot_if_absent<A: Aggregate>(
+        &self,
+        aggregate_id: &str,
+        last_sequence: usize,
+        snapshot_version: usize,
+        payload: Value,
+    ) -> Result<(), PersistenceError> {
+        let last_sequence =
+            i64::try_from(last_sequence).map_err(SqliteEventRepositoryError::from)?;
+        let snapshot_version =
+            i64::try_from(snapshot_version).map_err(SqliteEventRepositoryError::from)?;
+
+        sqlx::query(
+            "INSERT OR IGNORE INTO snapshots \
+             (aggregate_type, aggregate_id, last_sequence, snapshot_version, payload, timestamp) \
+             VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(A::TYPE)
+        .bind(aggregate_id)
+        .bind(last_sequence)
+        .bind(snapshot_version)
+        .bind(payload)
+        .execute(&self.pool)
+        .await
+        .map_err(SqliteEventRepositoryError::from)?;
+
+        Ok(())
+    }
+
     /// Stream events from the `events` table for replay.
     ///
     /// **Compaction caveat:** This only queries the `events` table.
@@ -563,5 +629,45 @@ mod tests {
             result,
             Err(AggregateError::DeserializationError(_))
         ));
+    }
+
+    /// A snapshot rebuild must never replace a snapshot that already exists,
+    /// for example one a command wrote after the rebuild listed its targets.
+    #[tokio::test]
+    async fn insert_snapshot_if_absent_keeps_existing_snapshot() {
+        let pool = test_pool().await;
+        let repo = SqliteEventRepository::new(pool.clone(), CompactionPolicy::Retain);
+
+        repo.persist::<TestAggregate>(
+            &covering_events("agg-existing", 20),
+            Some((
+                "agg-existing".to_string(),
+                serde_json::json!({"events": ["committed"]}),
+                2,
+            )),
+        )
+        .await
+        .unwrap();
+
+        repo.insert_snapshot_if_absent::<TestAggregate>(
+            "agg-existing",
+            12,
+            1,
+            serde_json::json!({"events": ["rebuilt"]}),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = repo
+            .get_snapshot::<TestAggregate>("agg-existing")
+            .await
+            .unwrap()
+            .expect("the committed snapshot stays");
+        assert_eq!(snapshot.current_sequence, 20);
+        assert_eq!(snapshot.current_snapshot, 2);
+        assert_eq!(
+            snapshot.aggregate,
+            serde_json::json!({"events": ["committed"]})
+        );
     }
 }

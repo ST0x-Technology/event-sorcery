@@ -20,7 +20,8 @@
 //!   change, a stale `SCHEMA_VERSION` leaves snapshots and views
 //!   in the old shape. Bumping it is the operator's responsibility;
 //!   [`EventSourced::SCHEMA_VERSION`] plus startup reconciliation
-//!   clears version-mismatched snapshots and rebuilds views. On load,
+//!   clears version-mismatched snapshots, rebuilds missing snapshots
+//!   for retained aggregates, and rebuilds views. On load,
 //!   an incompatible snapshot for a [`CompactionPolicy::Retain`]
 //!   aggregate is ignored and the entity rebuilt from its
 //!   always-present event history; for a
@@ -177,7 +178,8 @@ pub enum CompactionPolicy {
 /// - `SCHEMA_VERSION`: Bump when the entity's state, event, or
 ///   view schema changes. On startup, the wiring infrastructure
 ///   detects version mismatches and automatically clears stale
-///   snapshots and replays views.
+///   snapshots, rebuilds them for retained aggregates, and replays
+///   views.
 ///
 /// # Event-side methods
 ///
