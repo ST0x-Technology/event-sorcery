@@ -833,10 +833,9 @@ mod tests {
         .unwrap()
     }
 
-    /// RAI-2766: a schema version bump clears every snapshot. Without a
-    /// rebuild, an aggregate that receives no commands replays its full
-    /// stream on every load. `build()` must leave it with a snapshot at its
-    /// latest sequence.
+    /// A schema version bump clears every snapshot. Without a rebuild, an
+    /// aggregate that receives no commands replays its full stream on every
+    /// load. `build()` must leave it with a snapshot at its latest sequence.
     #[tokio::test]
     async fn schema_version_bump_rebuilds_cleared_snapshot_at_latest_sequence() {
         let pool = migrated_pool_with_tally_view().await;
