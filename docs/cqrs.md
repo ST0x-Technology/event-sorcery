@@ -243,6 +243,52 @@ receives `(error, id, event)` and can reprocess the event from the errored state
 
 Wire reactors via `Unwired` + `StoreBuilder::wire()`.
 
+### Reading the committed sequence
+
+After a commit, `ReactorBridge` calls
+`Reactor::react_committed(event,
+committed)`, not `react`, once per persisted
+event. `committed.sequence` is the event's sequence number in its aggregate's
+stream, as the event store assigned it.
+`(aggregate type, aggregate id, sequence)` therefore names the event, and the
+name stays the same across restarts. Use it as a dedupe key, for example an
+`event_id` on a log line or an outbound message.
+
+The default `react_committed` ignores `committed` and calls `react`, so a
+reactor that does not need the sequence implements only `react`. To read it,
+override `react_committed` and capture `committed` in the `.on()` handlers:
+
+```rust
+async fn react_committed(
+    &self,
+    event: <Self::Dependencies as EntityList>::Event,
+    committed: Committed,
+) -> Result<(), Self::Error> {
+    event
+        .on(|id, event| async move {
+            self.on_mint(id, event, committed.sequence).await
+        })
+        .exhaustive()
+        .await
+}
+```
+
+`react_committed` runs only on commit dispatch. Loading an entity, rebuilding
+snapshots, and catching up or rebuilding a projection replay events through
+`evolve` and the view, never through a reactor. So a reactor does not see old
+events again when the process restarts. `send_command()` bypasses reactors as
+before.
+
+Rules for wrappers and tests:
+
+- `Arc<R>` and `RetryOnBusy` forward `react_committed` to the inner reactor.
+  `RetryOnBusy` retries it with the same `committed` value.
+- A hand-written wrapper that implements `Reactor` by forwarding to an inner
+  reactor must forward `react_committed` too. Otherwise the default calls the
+  inner `react`, and the inner override never runs.
+- `ReactorHarness::receive` calls `react`. Use
+  `ReactorHarness::receive_committed(id, event, sequence)` to test an override.
+
 ### Same-aggregate ordering guarantee and the reentrancy rule
 
 `Store::send` serializes commands per aggregate ID: the whole load -> handle ->
@@ -330,9 +376,10 @@ contention, a `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` failure logs and drops the
 reactor's update unless it opts in.
 
 Opt in by wrapping the reactor in `RetryOnBusy` and implementing the
-`IdempotentReactor` marker trait, which declares that `react()` performs solely
-SQLite writes with no side effect (HTTP/RPC call, `Store::send` to another
-aggregate, message-queue publish) that would double-fire on retry:
+`IdempotentReactor` marker trait, which declares that `react()` (and any
+`react_committed()` override) performs solely SQLite writes with no side effect
+(HTTP/RPC call, `Store::send` to another aggregate, message-queue publish) that
+would double-fire on retry:
 
 ```rust
 impl IdempotentReactor for MyReactor {}

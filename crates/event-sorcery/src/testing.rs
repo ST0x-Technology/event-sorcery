@@ -19,7 +19,7 @@ use tokio::sync::Mutex;
 
 use crate::dependency::HasEntity;
 use crate::lifecycle::{Lifecycle, LifecycleError, ReactorBridge};
-use crate::reactor::Reactor;
+use crate::reactor::{Committed, Reactor};
 use crate::sqlite_event_repository::SqliteEventRepository;
 use crate::{EventSourced, Store};
 
@@ -210,6 +210,27 @@ impl<R: Reactor> ReactorHarness<R> {
     {
         let injected = <R::Dependencies as HasEntity<Entity>>::inject(id, event);
         self.reactor.react(injected).await
+    }
+
+    /// Send an entity event to the reactor as the store does after a commit,
+    /// through [`Reactor::react_committed`], with the event stored at
+    /// `sequence`.
+    ///
+    /// Use this to test a reactor that overrides `react_committed`.
+    /// [`receive`](Self::receive) calls `react` and skips the override.
+    pub async fn receive_committed<Entity: EventSourced>(
+        &self,
+        id: Entity::Id,
+        event: Entity::Event,
+        sequence: usize,
+    ) -> Result<(), R::Error>
+    where
+        R::Dependencies: HasEntity<Entity>,
+    {
+        let injected = <R::Dependencies as HasEntity<Entity>>::inject(id, event);
+        self.reactor
+            .react_committed(injected, Committed::new(sequence))
+            .await
     }
 
     /// Access the inner reactor for inspecting state.
@@ -729,5 +750,58 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].0, "test-id");
         assert_eq!(captured[0].1, CounterEvent::Created { initial: 7 });
+    }
+
+    /// Records each sequence that `react_committed` receives, or `None` for
+    /// plain `react`.
+    #[derive(Default)]
+    struct SequenceSpy {
+        sequences: Mutex<Vec<Option<usize>>>,
+    }
+
+    impl crate::Dependent for SequenceSpy {
+        type Dependencies = crate::deps![Counter];
+    }
+
+    #[async_trait]
+    impl Reactor for SequenceSpy {
+        type Error = crate::lifecycle::Never;
+
+        async fn react(
+            &self,
+            _event: <Self::Dependencies as crate::EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            self.sequences.lock().await.push(None);
+            Ok(())
+        }
+
+        async fn react_committed(
+            &self,
+            _event: <Self::Dependencies as crate::EntityList>::Event,
+            committed: Committed,
+        ) -> Result<(), Self::Error> {
+            self.sequences.lock().await.push(Some(committed.sequence));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn reactor_harness_receive_committed_reaches_the_override() {
+        let harness = ReactorHarness::new(SequenceSpy::default());
+
+        harness
+            .receive_committed::<Counter>(
+                "test-id".to_string(),
+                CounterEvent::Created { initial: 7 },
+                9,
+            )
+            .await
+            .unwrap();
+        harness
+            .receive::<Counter>("test-id".to_string(), CounterEvent::Incremented)
+            .await
+            .unwrap();
+
+        assert_eq!(*harness.inner().sequences.lock().await, vec![Some(9), None]);
     }
 }
