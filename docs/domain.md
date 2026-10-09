@@ -135,6 +135,10 @@ equivalent retry for transient SQLite busy errors via
 [docs/cqrs.md](cqrs.md#reactors)); one that does neither still logs and drops
 its update on a busy error.
 
+A reactor that needs the committed event's sequence overrides `react_committed`,
+which receives a `Committed` (see
+[docs/cqrs.md](cqrs.md#reading-the-committed-sequence)).
+
 Reactors run inside the per-aggregate lock `Store::send` holds for the duration
 of a command (see the Aggregate entry above and ADR-0004). A reactor that calls
 `Store::send()` back onto the same `(entity type, aggregate ID)` it is currently
@@ -180,6 +184,12 @@ only logs when `react()` itself returns `Err`, so a reactor that ignores the
 `Result` of an inner `send()` swallows a `ReentrantCommand` rejection silently
 and the outer command still reports success. Outer success does not imply the
 nested command ran -- propagate the `Result` or handle it explicitly.
+
+### Committed
+
+The facts about a persisted event that its payload does not carry. Today that is
+the event's `sequence` in its aggregate's stream. The store hands one to
+`Reactor::react_committed` on commit dispatch only, never on replay.
 
 ### Schema Version
 

@@ -19,7 +19,7 @@ use tracing::{error, warn};
 
 use crate::EventSourced;
 use crate::dependency::HasEntity;
-use crate::reactor::Reactor;
+use crate::reactor::{Committed, Reactor};
 
 /// Adapter that bridges [`EventSourced`] to cqrs-es `Aggregate`.
 ///
@@ -344,12 +344,15 @@ where
             // No retry here by design -- wrap the reactor in `RetryOnBusy`
             // (gated by `IdempotentReactor`) to retry on transient SQLite
             // busy errors. See `docs/cqrs.md`'s "Reactors" section.
-            if let Err(error) = self.reactor.react(injected).await {
+            let committed = Committed::new(envelope.sequence);
+
+            if let Err(error) = self.reactor.react_committed(injected, committed).await {
                 error!(
                     target: "cqrs",
                     ?error,
                     aggregate_id = aggregate_id,
                     aggregate_type = Entity::AGGREGATE_TYPE,
+                    sequence = envelope.sequence,
                     "Reactor failed to handle event"
                 );
             }
@@ -364,6 +367,7 @@ mod tests {
     use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use super::*;
@@ -848,6 +852,76 @@ mod tests {
         assert_eq!(
             reactor.inner.calls.load(Ordering::SeqCst),
             RETRY_MAX_ATTEMPTS + 1
+        );
+    }
+
+    /// Records the sequence of every event dispatched to it, or `None` when
+    /// plain `react` receives it.
+    #[derive(Default)]
+    struct SequenceLog {
+        received: Mutex<Vec<(CounterEvent, Option<usize>)>>,
+    }
+
+    impl Dependent for SequenceLog {
+        type Dependencies = Cons<Counter, Nil>;
+    }
+
+    #[async_trait]
+    impl Reactor for SequenceLog {
+        type Error = Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            let (_id, event) = event.into_inner();
+            self.received.lock().unwrap().push((event, None));
+            Ok(())
+        }
+
+        async fn react_committed(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+            committed: Committed,
+        ) -> Result<(), Self::Error> {
+            let (_id, event) = event.into_inner();
+            self.received
+                .lock()
+                .unwrap()
+                .push((event, Some(committed.sequence)));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_hands_each_envelope_sequence_to_react_committed() {
+        let reactor = Arc::new(SequenceLog::default());
+        let bridge = ReactorBridge {
+            reactor: Arc::clone(&reactor),
+        };
+        let envelopes: Vec<EventEnvelope<Lifecycle<Counter>>> = vec![
+            EventEnvelope {
+                aggregate_id: "counter-1".to_string(),
+                sequence: 4,
+                payload: CounterEvent::Created { initial: 1 },
+                metadata: HashMap::new(),
+            },
+            EventEnvelope {
+                aggregate_id: "counter-1".to_string(),
+                sequence: 5,
+                payload: CounterEvent::Incremented,
+                metadata: HashMap::new(),
+            },
+        ];
+
+        bridge.dispatch("counter-1", &envelopes).await;
+
+        assert_eq!(
+            *reactor.received.lock().unwrap(),
+            vec![
+                (CounterEvent::Created { initial: 1 }, Some(4)),
+                (CounterEvent::Incremented, Some(5)),
+            ]
         );
     }
 }

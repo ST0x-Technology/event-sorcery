@@ -179,11 +179,18 @@ never opts in still logs and drops its update on a transient SQLite busy error,
 exactly as it always has. A reactor can opt into an equivalent
 retry-with-backoff for transient SQLite busy/busy-snapshot errors two ways: wrap
 it in `RetryOnBusy` (retries the whole `react()` call, gated by implementing the
-`IdempotentReactor` marker trait, which is a declaration that `react()` performs
-solely idempotent SQLite writes with no side effect that would double-fire on
-retry), or call `retry_with_backoff` / `is_retryable_sqlite_busy` directly
-around just the write, leaving any prior side effects outside the retry
-boundary.
+`IdempotentReactor` marker trait, which is a declaration that `react()` (and any
+`react_committed()` override) performs solely idempotent SQLite writes with no
+side effect that would double-fire on retry), or call `retry_with_backoff` /
+`is_retryable_sqlite_busy` directly around just the write, leaving any prior
+side effects outside the retry boundary.
+
+After each commit the store calls `Reactor::react_committed(event, committed)`
+once per persisted event. `Committed` carries the event's `sequence` in its
+aggregate's stream, so `(aggregate type, aggregate id, sequence)` is a stable
+event id across restarts. The default forwards to `react`, so reactors that do
+not need the sequence are unchanged. Loading an entity, rebuilding snapshots,
+and catching up or rebuilding projections never dispatch to reactors.
 
 ### `SchemaRegistry`
 
