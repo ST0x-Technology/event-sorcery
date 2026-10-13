@@ -287,7 +287,10 @@ Rules for wrappers and tests:
   reactor must forward `react_committed` too. Otherwise the default calls the
   inner `react`, and the inner override never runs.
 - `ReactorHarness::receive` calls `react`. Use
-  `ReactorHarness::receive_committed(id, event, sequence)` to test an override.
+  `ReactorHarness::receive_committed(id, event, Committed::new(sequence))` to
+  test an override. The store builds `Committed` only when it dispatches a
+  committed event. `Committed::new` is for tests and exists only with the
+  `test-support` feature.
 
 ### Same-aggregate ordering guarantee and the reentrancy rule
 

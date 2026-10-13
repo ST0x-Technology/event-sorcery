@@ -213,8 +213,8 @@ impl<R: Reactor> ReactorHarness<R> {
     }
 
     /// Send an entity event to the reactor as the store does after a commit,
-    /// through [`Reactor::react_committed`], with the event stored at
-    /// `sequence`.
+    /// through [`Reactor::react_committed`], with the given commit facts.
+    /// Build them with [`Committed::new`].
     ///
     /// Use this to test a reactor that overrides `react_committed`.
     /// [`receive`](Self::receive) calls `react` and skips the override.
@@ -222,15 +222,13 @@ impl<R: Reactor> ReactorHarness<R> {
         &self,
         id: Entity::Id,
         event: Entity::Event,
-        sequence: usize,
+        committed: Committed,
     ) -> Result<(), R::Error>
     where
         R::Dependencies: HasEntity<Entity>,
     {
         let injected = <R::Dependencies as HasEntity<Entity>>::inject(id, event);
-        self.reactor
-            .react_committed(injected, Committed::new(sequence))
-            .await
+        self.reactor.react_committed(injected, committed).await
     }
 
     /// Access the inner reactor for inspecting state.
@@ -793,7 +791,7 @@ mod tests {
             .receive_committed::<Counter>(
                 "test-id".to_string(),
                 CounterEvent::Created { initial: 7 },
-                9,
+                Committed::new(9),
             )
             .await
             .unwrap();

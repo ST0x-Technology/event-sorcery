@@ -344,7 +344,9 @@ where
             // No retry here by design -- wrap the reactor in `RetryOnBusy`
             // (gated by `IdempotentReactor`) to retry on transient SQLite
             // busy errors. See `docs/cqrs.md`'s "Reactors" section.
-            let committed = Committed::new(envelope.sequence);
+            let committed = Committed {
+                sequence: envelope.sequence,
+            };
 
             if let Err(error) = self.reactor.react_committed(injected, committed).await {
                 error!(
