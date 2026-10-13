@@ -110,7 +110,9 @@ pub trait Reactor: Dependent {
 ///
 /// [`Reactor::react_committed`] receives one with each event. Marked
 /// `#[non_exhaustive]` so that more commit facts can be added later without
-/// a breaking change; build one with [`Committed::new`].
+/// a breaking change. The store builds one for each event it dispatches after
+/// a commit. `Committed::new` is for tests and exists only with the
+/// `test-support` feature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Committed {
@@ -121,6 +123,7 @@ pub struct Committed {
     pub sequence: usize,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Committed {
     /// Commit facts for the event stored at `sequence`.
     pub const fn new(sequence: usize) -> Self {
