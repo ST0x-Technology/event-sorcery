@@ -65,6 +65,67 @@ pub trait Reactor: Dependent {
         &self,
         event: <Self::Dependencies as EntityList>::Event,
     ) -> Result<(), Self::Error>;
+
+    /// Handle a single event together with where it was committed.
+    ///
+    /// The store calls this, not [`react`](Self::react), once per event
+    /// right after the event is persisted. It never calls it when an entity
+    /// is loaded from its events or snapshot, or when a projection catches
+    /// up or rebuilds, so a reactor sees each committed event once per
+    /// commit, not once per process start.
+    ///
+    /// The default forwards to `react` and ignores `committed`, so a reactor
+    /// that does not need the sequence implements only `react`. Override it
+    /// to read [`Committed::sequence`], for example to give each event an id
+    /// that stays the same across restarts:
+    ///
+    /// ```ignore
+    /// async fn react_committed(
+    ///     &self,
+    ///     event: <Self::Dependencies as EntityList>::Event,
+    ///     committed: Committed,
+    /// ) -> Result<(), Self::Error> {
+    ///     event
+    ///         .on(|id, event| async move {
+    ///             self.on_mint(id, event, committed.sequence).await
+    ///         })
+    ///         .exhaustive()
+    ///         .await
+    /// }
+    /// ```
+    ///
+    /// A wrapper that implements `Reactor` by forwarding to an inner
+    /// reactor must forward this method too. Otherwise the default sends
+    /// commits to the inner `react` and the inner override never runs.
+    async fn react_committed(
+        &self,
+        event: <Self::Dependencies as EntityList>::Event,
+        _committed: Committed,
+    ) -> Result<(), Self::Error> {
+        self.react(event).await
+    }
+}
+
+/// Where a committed event sits in its aggregate's stream.
+///
+/// [`Reactor::react_committed`] receives one with each event. Marked
+/// `#[non_exhaustive]` so that more commit facts can be added later without
+/// a breaking change; build one with [`Committed::new`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Committed {
+    /// The event's sequence number in its aggregate's stream, as the event
+    /// store assigned it. It never changes once committed, so
+    /// `(aggregate type, aggregate id, sequence)` identifies the event
+    /// across restarts.
+    pub sequence: usize,
+}
+
+impl Committed {
+    /// Commit facts for the event stored at `sequence`.
+    pub const fn new(sequence: usize) -> Self {
+        Self { sequence }
+    }
 }
 
 /// Enables sharing a reactor via `Arc`.
@@ -78,12 +139,25 @@ impl<R: Reactor> Reactor for Arc<R> {
     ) -> Result<(), Self::Error> {
         R::react(self, event).await
     }
+
+    async fn react_committed(
+        &self,
+        event: <Self::Dependencies as EntityList>::Event,
+        committed: Committed,
+    ) -> Result<(), Self::Error> {
+        R::react_committed(self, event, committed).await
+    }
 }
 
 /// Marks a [`Reactor`] whose `react()` implementation is safe to retry in
 /// full after a transient SQLite busy error.
 ///
 /// # Safety contract
+///
+/// The contract covers [`Reactor::react_committed`] as well as `react()`:
+/// commit dispatch calls `react_committed`, and [`RetryOnBusy`] retries it in
+/// full. A reactor that overrides `react_committed` must keep that override
+/// to the same rules. Below, `react()` means whichever of the two runs.
 ///
 /// Implement this only for reactors whose `react()` performs exclusively
 /// SQLite writes, with no side effect preceding the write that would double-
@@ -140,15 +214,49 @@ pub trait IdempotentReactor: Reactor {}
 
 /// Wraps an [`IdempotentReactor`] to retry on transient SQLite busy errors.
 ///
-/// Retries `react()` with exponential backoff when it fails with
-/// `SQLITE_BUSY` / `SQLITE_BUSY_SNAPSHOT`. See [`IdempotentReactor`] for the
-/// safety contract that gates this, including the caller-latency tradeoff.
+/// Retries `react()` and `react_committed()` with exponential backoff when they
+/// fail with `SQLITE_BUSY` / `SQLITE_BUSY_SNAPSHOT`. See [`IdempotentReactor`]
+/// for the safety contract that gates this, including the caller-latency tradeoff.
 pub struct RetryOnBusy<R> {
     pub inner: R,
 }
 
 impl<R: Dependent> Dependent for RetryOnBusy<R> {
     type Dependencies = R::Dependencies;
+}
+
+impl<R> RetryOnBusy<R>
+where
+    R: IdempotentReactor,
+    R::Error: 'static,
+{
+    /// Runs `make_attempt` under the busy-retry schedule. Shared by `react`
+    /// and `react_committed`, so both retry the same way.
+    async fn retry_on_busy<MakeAttempt, Attempt>(make_attempt: MakeAttempt) -> Result<(), R::Error>
+    where
+        MakeAttempt: FnMut() -> Attempt,
+        Attempt: Future<Output = Result<(), R::Error>>,
+    {
+        retry_with_backoff(
+            RETRY_MAX_ATTEMPTS,
+            RETRY_SCHEDULE,
+            make_attempt,
+            |error: &R::Error| is_retryable_sqlite_busy(error),
+        )
+        .await
+        .inspect_err(|error| {
+            // `debug`, not `warn`: `ReactorBridge::dispatch` already logs every
+            // reactor failure at `error` and is the single source-of-truth line
+            // for log-based failure metrics. A second high-severity line here
+            // would double the apparent failure count.
+            debug!(
+                target: "cqrs",
+                ?error,
+                "RetryOnBusy giving up: reactor error was not a retryable SQLite busy error, \
+                 or the busy-retry budget was exhausted"
+            );
+        })
+    }
 }
 
 #[async_trait]
@@ -164,28 +272,23 @@ where
         &self,
         event: <Self::Dependencies as EntityList>::Event,
     ) -> Result<(), Self::Error> {
-        retry_with_backoff(
-            RETRY_MAX_ATTEMPTS,
-            RETRY_SCHEDULE,
-            move || {
-                let event = event.clone();
-                async move { self.inner.react(event).await }
-            },
-            |error: &Self::Error| is_retryable_sqlite_busy(error),
-        )
-        .await
-        .inspect_err(|error| {
-            // `debug`, not `warn`: `ReactorBridge::dispatch` already logs every
-            // reactor failure at `error` and is the single source-of-truth line
-            // for log-based failure metrics. A second high-severity line here
-            // would double the apparent failure count.
-            debug!(
-                target: "cqrs",
-                ?error,
-                "RetryOnBusy giving up: reactor error was not a retryable SQLite busy error, \
-                 or the busy-retry budget was exhausted"
-            );
+        Self::retry_on_busy(move || {
+            let event = event.clone();
+            async move { self.inner.react(event).await }
         })
+        .await
+    }
+
+    async fn react_committed(
+        &self,
+        event: <Self::Dependencies as EntityList>::Event,
+        committed: Committed,
+    ) -> Result<(), Self::Error> {
+        Self::retry_on_busy(move || {
+            let event = event.clone();
+            async move { self.inner.react_committed(event, committed).await }
+        })
+        .await
     }
 }
 
@@ -1133,5 +1236,144 @@ mod tests {
         assert!(matches!(error, FlakyReactorError::Permanent));
         assert!(!wrapped.inner.applied.load(Ordering::SeqCst));
         assert_eq!(wrapped.inner.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Records which entry point received each event: `react` or
+    /// `react_committed` with its sequence. Fails its first
+    /// `busy_failures` calls with a busy error.
+    struct SequenceReactor {
+        remaining_busy_failures: AtomicU32,
+        received: Mutex<Vec<(TestEvent, Option<usize>)>>,
+    }
+
+    impl SequenceReactor {
+        fn new(busy_failures: u32) -> Self {
+            Self {
+                remaining_busy_failures: AtomicU32::new(busy_failures),
+                received: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn record(
+            &self,
+            event: TestEvent,
+            sequence: Option<usize>,
+        ) -> Result<(), FlakyReactorError> {
+            self.received.lock().unwrap().push((event, sequence));
+
+            let remaining = self.remaining_busy_failures.load(Ordering::SeqCst);
+            if remaining > 0 {
+                self.remaining_busy_failures
+                    .store(remaining - 1, Ordering::SeqCst);
+                return Err(FlakyReactorError::Busy(sqlx_error_with_code("5")));
+            }
+
+            Ok(())
+        }
+    }
+
+    impl Dependent for SequenceReactor {
+        type Dependencies = Cons<TestEntity, Nil>;
+    }
+
+    #[async_trait]
+    impl Reactor for SequenceReactor {
+        type Error = FlakyReactorError;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            let (_id, event) = event.into_inner();
+            self.record(event, None)
+        }
+
+        async fn react_committed(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+            committed: Committed,
+        ) -> Result<(), Self::Error> {
+            let (_id, event) = event.into_inner();
+            self.record(event, Some(committed.sequence))
+        }
+    }
+
+    impl IdempotentReactor for SequenceReactor {}
+
+    fn test_event(marker: u32) -> OneOf<(String, TestEvent), Never> {
+        OneOf::Here(("id-1".to_string(), TestEvent { marker }))
+    }
+
+    #[tokio::test]
+    async fn default_react_committed_forwards_to_react() {
+        let reactor = FlakyReactor {
+            remaining_busy_failures: AtomicU32::new(0),
+            permanent_failure: false,
+            calls: AtomicU32::new(0),
+            applied: AtomicBool::new(false),
+            busy_code: "5",
+            received_events: Mutex::new(Vec::new()),
+        };
+
+        reactor
+            .react_committed(test_event(7), Committed::new(3))
+            .await
+            .unwrap();
+
+        assert_eq!(reactor.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *reactor.received_events.lock().unwrap(),
+            vec![("id-1".to_string(), TestEvent { marker: 7 })]
+        );
+    }
+
+    #[tokio::test]
+    async fn arc_forwards_react_committed_to_the_override() {
+        let reactor = Arc::new(SequenceReactor::new(0));
+
+        reactor
+            .react_committed(test_event(7), Committed::new(3))
+            .await
+            .unwrap();
+        reactor.react(test_event(8)).await.unwrap();
+
+        assert_eq!(
+            *reactor.received.lock().unwrap(),
+            vec![
+                (TestEvent { marker: 7 }, Some(3)),
+                (TestEvent { marker: 8 }, None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_on_busy_retries_react_committed_with_the_same_sequence() {
+        let wrapped = RetryOnBusy {
+            inner: SequenceReactor::new(2),
+        };
+
+        wrapped
+            .react_committed(test_event(7), Committed::new(3))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *wrapped.inner.received.lock().unwrap(),
+            vec![(TestEvent { marker: 7 }, Some(3)); 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_on_busy_react_still_calls_inner_react() {
+        let wrapped = RetryOnBusy {
+            inner: SequenceReactor::new(1),
+        };
+
+        wrapped.react(test_event(7)).await.unwrap();
+
+        assert_eq!(
+            *wrapped.inner.received.lock().unwrap(),
+            vec![(TestEvent { marker: 7 }, None); 2]
+        );
     }
 }
